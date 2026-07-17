@@ -1,0 +1,14 @@
+{
+  "name": "Remote Agent",
+  "short_name": "RemoteAgent",
+  "description": "Claude / Codex 远程控制",
+  "display": "standalone",
+  "scope": "/s/remotecoding/",
+  "start_url": "/s/remotecoding/",
+  "background_color": "#0d0d0f",
+  "theme_color": "#0d0d0f",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}

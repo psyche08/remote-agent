@@ -1,0 +1,26 @@
+{
+  "device_id": "mac-studio-01",
+  "devices": ["mac-studio-01", "mac-pro-02"],
+  "host": "127.0.0.1",
+  "port": 8765,
+  "uds": "/opt/private-tunnel/state/remote-coding/sockets/backend.sock",
+  "state_dir": "/opt/private-tunnel/state/remote-coding",
+  "push_proxy": "",
+  "push_vapid": null,
+  "default_provider": "claude",
+  "providers": {
+    "claude": {
+      "app_name": "Claude",
+      "command": "claude",
+      "cwd": "~/Developer",
+      "permission_mode": "auto",
+      "turnstate_dir": "~/.claude/remote-coding-turnstate",
+      "kill_grace": 3
+    },
+    "codex": {
+      "app_name": "Codex",
+      "command": "codex",
+      "cwd": "~/Developer"
+    }
+  }
+}

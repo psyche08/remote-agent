@@ -1,0 +1,29 @@
+# Local runtime / secrets. Keep this file self-contained: remote-coding may be
+# published as its own repository, so the parent monorepo ignore rules do not
+# apply.
+.venv/
+config.json
+bin/
+data/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.mobileprovision
+*.log
+*.jsonl
+.DS_Store
+
+# generated screenshots (keep the dir via .gitkeep)
+screenshots/*.png
+!screenshots/.gitkeep
+
+# test/tool caches
+.pytest_cache/
+__pycache__/
+*.pyc

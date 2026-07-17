@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0d0d0f" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  <title>Remote Agent</title>
+  <style>
+    :root { color-scheme:dark; --bg:#0d0d0f; --fg:#ececed; --muted:#92929b; }
+    * { box-sizing:border-box; }
+    html,body { width:100%; height:100%; margin:0; overflow:hidden; background:var(--bg); color:var(--fg); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    #console { position:fixed; inset:0; width:100%; height:100%; border:0; background:var(--bg); }
+    #status { position:fixed; inset:0; z-index:5; display:grid; place-items:center; padding:24px; color:var(--muted); background:var(--bg); font-size:13px; text-align:center; }
+    #status.hidden { display:none; }
+  </style>
+</head>
+<body>
+  <iframe id="console" title="Remote Agent device console"></iframe>
+  <div id="status">正在连接设备…</div>
+  <script>
+    const SERVICE_ROOT = (location.pathname.match(/^(.*\/s\/[^/]+\/)/) || [null, location.pathname.replace(/[^/]*$/, "")])[1];
+    const RELAY_ROOT = SERVICE_ROOT.replace(/s\/[^/]+\/$/, "");
+    const DEVICE_KEY = "remote-coding-shell-device";
+    const frame = document.getElementById("console");
+    const statusBox = document.getElementById("status");
+    let rows = [];
+    let activeDevice = "";
+    let hostDevice = "";
+    let frameReady = false;
+    let frameRetryTimer = 0;
+    let frameRetryDelay = 1000;
+    const FRAME_RETRY_MAX_DELAY = 10000;
+    const rememberedDevice = () => {
+      try { return localStorage.getItem(DEVICE_KEY) || ""; } catch (_) { return ""; }
+    };
+    function rememberDevice(id) {
+      activeDevice = id || "";
+      try {
+        if (activeDevice) localStorage.setItem(DEVICE_KEY, activeDevice);
+        else localStorage.removeItem(DEVICE_KEY);
+      } catch (_) {}
+    }
+    function showStatus(message) {
+      statusBox.textContent = message;
+      statusBox.classList.remove("hidden");
+    }
+    function deviceURL(id, retry = false) {
+      const params = new URLSearchParams(location.search);
+      params.delete("device");
+      params.delete("_rc_retry");
+      if (retry) params.set("_rc_retry", Date.now().toString());
+      const query = params.toString();
+      return SERVICE_ROOT + "d/" + encodeURIComponent(id) + "/" + (query ? "?" + query : "") + location.hash;
+    }
+    function clearFrameRetry() {
+      if (frameRetryTimer) clearTimeout(frameRetryTimer);
+      frameRetryTimer = 0;
+    }
+    function frameHasDeviceUI() {
+      try {
+        const doc = frame.contentDocument;
+        const expectedPath = SERVICE_ROOT + "d/" + encodeURIComponent(hostDevice) + "/";
+        return !!(doc && frame.contentWindow.location.pathname.startsWith(expectedPath) &&
+          doc.getElementById("app") && doc.getElementById("device"));
+      } catch (_) {
+        return false;
+      }
+    }
+    function scheduleFrameRetry(id) {
+      clearFrameRetry();
+      const delay = frameRetryDelay;
+      frameRetryDelay = Math.min(frameRetryDelay * 2, FRAME_RETRY_MAX_DELAY);
+      frameRetryTimer = setTimeout(() => {
+        frameRetryTimer = 0;
+        if (hostDevice === id && !frameReady) loadDevice(id, true, true);
+      }, delay);
+    }
+    function selectInitialDevice() {
+      const requested = new URLSearchParams(location.search).get("device") || "";
+      const remembered = rememberedDevice();
+      if (rows.some(row => row.device === requested)) return requested;
+      if (rows.some(row => row.device === remembered)) return remembered;
+      return rows.length ? rows[0].device : "";
+    }
+    function loadDevice(id, force = false, retry = false) {
+      if (!id) return;
+      rememberDevice(id);
+      if (!force && frameReady && hostDevice === id && frame.getAttribute("src")) return;
+      if (hostDevice !== id || !retry) frameRetryDelay = 1000;
+      clearFrameRetry();
+      hostDevice = id;
+      frameReady = false;
+      showStatus("正在连接 " + id + "…");
+      frame.src = deviceURL(id, retry);
+    }
+    async function refresh() {
+      try {
+        const response = await fetch(RELAY_ROOT + "_pt/devices", { cache:"no-store" });
+        if (!response.ok) throw new Error("HTTP " + response.status);
+        const connected = await response.json();
+        const checked = await Promise.all(connected.map(async row => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 4000);
+          try {
+            const health = await fetch(SERVICE_ROOT + "d/" + encodeURIComponent(row.device) + "/healthz", {
+              cache:"no-store", signal:controller.signal
+            });
+            return health.ok ? row : null;
+          } catch (_) {
+            return null;
+          } finally {
+            clearTimeout(timer);
+          }
+        }));
+        rows = checked.filter(Boolean).sort((a, b) => {
+          const at = Date.parse(a.connected_at || "") || 0;
+          const bt = Date.parse(b.connected_at || "") || 0;
+          return bt - at || (Number(a.uptime_s) || 0) - (Number(b.uptime_s) || 0);
+        });
+        const available = new Set(rows.map(row => row.device));
+        if (!rows.length) {
+          rememberDevice("");
+          hostDevice = "";
+          frameReady = false;
+          frameRetryDelay = 1000;
+          clearFrameRetry();
+          frame.removeAttribute("src");
+          showStatus("当前没有提供 remote-coding 的在线设备。");
+          return;
+        }
+        if (!available.has(activeDevice) || !available.has(hostDevice)) {
+          const target = selectInitialDevice();
+          loadDevice(target, hostDevice !== target);
+        }
+      } catch (error) {
+        if (!hostDevice) showStatus("读取设备失败：" + error.message);
+      }
+    }
+    frame.addEventListener("load", () => {
+      if (frameHasDeviceUI()) {
+        frameReady = true;
+        frameRetryDelay = 1000;
+        clearFrameRetry();
+        statusBox.classList.add("hidden");
+        return;
+      }
+      frameReady = false;
+      if (!hostDevice) return;
+      showStatus(hostDevice + " 暂时无法访问，正在重试…");
+      scheduleFrameRetry(hostDevice);
+    });
+    window.addEventListener("message", event => {
+      if (event.origin !== location.origin || event.source !== frame.contentWindow || !event.data) return;
+      if (event.data.type === "remote-coding-device-selected" && rows.some(row => row.device === event.data.device)) {
+        if (event.data.activate_session) {
+          // The selected session owns both the device UI and its provider state.
+          // Move the iframe to that device; the target UI restores the persisted
+          // active tab/provider from same-origin state after it loads.
+          loadDevice(event.data.device);
+        } else {
+          // Browsing another device's session list should not replace the host
+          // iframe until the user actually opens one of its sessions.
+          rememberDevice(event.data.device);
+        }
+      }
+    });
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.register("sw.js").catch(() => {});
+      navigator.serviceWorker.addEventListener("message", event => {
+        if (event.data && event.data.type === "focus-session" && frame.contentWindow) {
+          frame.contentWindow.postMessage(event.data, location.origin);
+        }
+      });
+    }
+    refresh();
+    if (window.EventSource) {
+      const stream = new EventSource(RELAY_ROOT + "_pt/devices/stream");
+      ["snapshot", "up", "down"].forEach(type => stream.addEventListener(type, refresh));
+    } else setInterval(refresh, 10000);
+  </script>
+</body>
+</html>
