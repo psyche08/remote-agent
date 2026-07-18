@@ -1,11 +1,11 @@
 # remote-agent/CLAUDE.md
 
 Harness for the macOS local agent driving AI coding apps. The production path
-is the Go `bin/remote-coding` service over UDS; it translates web/mobile
+is the Go `bin/remote-agent` service over UDS; it translates web/mobile
 requests into local Claude/Codex session operations.
 
-Repository/module identity is `remote-agent`; runtime identifiers remain
-`remote-coding` for deployment compatibility.
+Repository, executable and supervisor service identity are all `remote-agent`.
+The public relay route `/s/remotecoding/` remains a compatibility URL only.
 
 ## Always On
 
@@ -14,7 +14,7 @@ Repository/module identity is `remote-agent`; runtime identifiers remain
    runs in the device's Apple Container private-edge profile. Deploy remote-agent
    by publishing a release to the relay (`deploy/publish-release.sh`) — devices
    configured with `RC_UPDATE_RELAY_URL` check the relay manifest every 5 minutes. private-edge updates
-   remain git-based and independent of the `remote-coding` binary release.
+   remain git-based and independent of the `remote-agent` binary release.
 3. Treat user-facing Claude/Codex as provider-managed agent sessions, not a tmux
    UI model. The registry exposes canonical `claude` (managed standalone
    stream-json CLI; Desktop is discovery metadata plus an explicit process
@@ -54,7 +54,7 @@ they do not ad-hoc re-sign downloaded binaries. (`spctl --type execute` is not
 a valid acceptance check for a bare CLI Mach-O: it reports “not an app” even
 when notarytool accepted the signed payload.)
 
-It cross-builds `remote-coding-darwin-arm64` with the full device console
+It cross-builds `remote-agent-darwin-arm64` with the full device console
 embedded and uploads it plus `assets/release/manifest.json` (commit + build
 datetime in UTC+8; manifest uploaded last) to the relay release directory.
 Each configured device agent compares the manifest against its `/healthz`

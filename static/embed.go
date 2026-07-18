@@ -29,7 +29,7 @@ func Handler(version string) http.Handler {
 			if strings.TrimSpace(version) == "" {
 				version = "dev"
 			}
-			body = []byte(strings.ReplaceAll(string(body), "__REMOTE_CODING_STATIC_VERSION__", version))
+			body = []byte(strings.ReplaceAll(string(body), "__REMOTE_AGENT_STATIC_VERSION__", version))
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write(body)
 			return

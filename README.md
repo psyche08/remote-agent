@@ -2,7 +2,7 @@
 
 The repository and Go module are named `remote-agent`. The installed command,
 supervisor service, state paths, and browser storage keys remain
-`remote-coding` for backward compatibility with existing deployments.
+`remote-agent` for backward compatibility with existing deployments.
 
 A small **macOS local agent** that lets you drive AI coding/chat agents on a Mac
 from a phone/browser — **without** RDP, VNC, Parsec or any remote-desktop/video
@@ -36,7 +36,7 @@ remote-agent/
 ├── go.mod
 ├── Makefile
 ├── README.md
-├── cmd/remote-coding/           # Go service entrypoint
+├── cmd/remote-agent/           # Go service entrypoint
 ├── internal/                    # Go API/config/state/provider implementation
 ├── config.example.json          # copy to config.json and edit
 ├── data/                         # local runtime state (ignored by Git)
@@ -53,7 +53,7 @@ remote-agent/
 
 ## Architecture: provider / adapter
 
-The production agent is the Go binary `bin/remote-coding`. Its registry exposes
+The production agent is the Go binary `bin/remote-agent`. Its registry exposes
 canonical `claude` and `codex` providers: Claude is a stream-json CLI provider
 with merged Desktop/CLI discovery, and Codex binds each logical session to
 either an app-server or Desktop-IPC delivery route.
@@ -110,12 +110,12 @@ The registered `codex` provider is the Go `provider.Codex`.
 
 * **Desktop owner first for attached threads**. A logical web session maps to a
   native Codex thread id. When that session was attached to an existing Codex
-  UUID thread, remote-coding first asks Codex Desktop over the same-user
+  UUID thread, remote-agent first asks Codex Desktop over the same-user
   owner/follower IPC socket to start/steer/interrupt the turn, so Desktop renders
   the turn live instead of catching up only after refresh. Attach also requests
   a complete Desktop snapshot so approvals or user-input questions that were
   already pending before the web session connected are restored immediately.
-* **Delivery route belongs to the logical session**. New remote-coding-created
+* **Delivery route belongs to the logical session**. New remote-agent-created
   threads are headless app-server sessions. Sending from a native Codex preview
   persists `delivery_route=desktop_ipc`, opens the thread in Desktop if needed,
   and targets its owner client. A Desktop-routed session never falls back to a
@@ -131,7 +131,7 @@ The registered `codex` provider is the Go `provider.Codex`.
   and pending-request changes.
 * **Approvals bridge over Desktop IPC**. Approval requests for a Desktop-owned
   turn are sent by app-server to the turn's *owner* client, not to
-  remote-coding's own app-server child. A persistent follower connection
+  remote-agent's own app-server child. A persistent follower connection
   mirrors each owner's `thread-stream-state-changed` broadcasts (snapshot +
   immer patches); the broadcast conversation state carries the raw pending
   server requests (`requests[]`, including the JSON-RPC request id) plus the
@@ -222,7 +222,7 @@ operation. Screen Recording is only needed if you use the `/screenshot` or
 ### 3. Run
 
 ```bash
-./bin/remote-coding --config config.json
+./bin/remote-agent --config config.json
 # -> unix socket from config.json, or http://127.0.0.1:8765 when no uds is set
 ```
 
@@ -275,7 +275,7 @@ Claude stream-json sessions, Claude/Codex native transcript readers, Codex app-s
 Codex Desktop IPC sync, WebSocket streaming, Web Push VAPID/subscription storage,
 encrypted push delivery, foreground presence suppression, and approval-action
 callbacks.
-The deploy installer builds `bin/remote-coding` and registers that binary with
+The deploy installer builds `bin/remote-agent` and registers that binary with
 private-services.
 
 ```bash

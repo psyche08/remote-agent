@@ -43,14 +43,14 @@ func (s *Server) watchdogLoop() {
 		case <-timer.C:
 			if err := s.selfHealthCheck(timeout); err != nil {
 				failures++
-				fmt.Fprintf(os.Stderr, "remote-coding internal watchdog: health failed failures=%d err=%v\n", failures, err)
+				fmt.Fprintf(os.Stderr, "remote-agent internal watchdog: health failed failures=%d err=%v\n", failures, err)
 				if failures >= maxFailures {
-					fmt.Fprintf(os.Stderr, "remote-coding internal watchdog: exiting for supervisor restart code=%d\n", exitCode)
+					fmt.Fprintf(os.Stderr, "remote-agent internal watchdog: exiting for supervisor restart code=%d\n", exitCode)
 					os.Exit(exitCode)
 				}
 			} else if failures != 0 {
 				failures = 0
-				fmt.Fprintln(os.Stderr, "remote-coding internal watchdog: recovered")
+				fmt.Fprintln(os.Stderr, "remote-agent internal watchdog: recovered")
 			}
 			timer.Reset(interval)
 		}
@@ -80,7 +80,7 @@ func (s *Server) selfHealthCheck(timeout time.Duration) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Remote-Coding-Client-Kind", "watchdog")
+	req.Header.Set("X-Remote-Agent-Client-Kind", "watchdog")
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

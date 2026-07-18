@@ -244,7 +244,7 @@ func TestCodexDesktopBridgePreservesSnapshotBeforeInitializeResponse(t *testing.
 		}
 		done <- writeDesktopFrame(server, map[string]any{
 			"type": "response", "requestId": stringAny(initFrame["requestId"]), "resultType": "success",
-			"method": "initialize", "result": map[string]any{"clientId": "remote-coding-client"},
+			"method": "initialize", "result": map[string]any{"clientId": "remote-agent-client"},
 		})
 	}()
 
@@ -255,7 +255,7 @@ func TestCodexDesktopBridgePreservesSnapshotBeforeInitializeResponse(t *testing.
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if clientID != "remote-coding-client" || len(pending) != 1 {
+	if clientID != "remote-agent-client" || len(pending) != 1 {
 		t.Fatalf("client=%q pending=%d", clientID, len(pending))
 	}
 	b := newCodexDesktopBridge("", "local")

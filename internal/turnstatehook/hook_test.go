@@ -35,13 +35,13 @@ func TestInstallReplacesPythonHookAndPreservesExisting(t *testing.T) {
 	}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := Install(settings, "/repo/bin/remote-coding", "/tmp/turnstate")
+	cfg, err := Install(settings, "/repo/bin/remote-agent", "/tmp/turnstate")
 	if err != nil {
 		t.Fatal(err)
 	}
 	b, _ := json.Marshal(cfg)
 	text := string(b)
-	if !strings.Contains(text, "echo hi") || !strings.Contains(text, "/repo/bin/remote-coding") {
+	if !strings.Contains(text, "echo hi") || !strings.Contains(text, "/repo/bin/remote-agent") {
 		t.Fatalf("settings not preserved/installed: %s", text)
 	}
 	if strings.Contains(text, "turnstate_hook.py") {

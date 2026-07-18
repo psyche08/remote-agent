@@ -31,7 +31,7 @@ func testManifest(t *testing.T, commit string) []byte {
 		Commit:  commit,
 		BuiltAt: "2026-07-03T12:00:00+08:00",
 		Binaries: map[string]Artifact{
-			testPlatform: {Path: "remote-coding-" + testPlatform, SHA256: sha(testBinary)},
+			testPlatform: {Path: "remote-agent-" + testPlatform, SHA256: sha(testBinary)},
 		},
 		UpdateScript: Artifact{Path: "update.sh", SHA256: sha(testScript)},
 	}
@@ -50,10 +50,10 @@ func sha(b []byte) string {
 func fakeFetch(t *testing.T, manifest []byte) func(context.Context, Options, string) ([]byte, error) {
 	t.Helper()
 	files := map[string][]byte{
-		"manifest.json":                 manifest,
-		"remote-coding-" + testPlatform: testBinary,
-		"update.sh":                     testScript,
-		"watchdog.sh":                   testWatchdog,
+		"manifest.json":                manifest,
+		"remote-agent-" + testPlatform: testBinary,
+		"update.sh":                    testScript,
+		"watchdog.sh":                  testWatchdog,
 	}
 	return func(_ context.Context, _ Options, relPath string) ([]byte, error) {
 		b, ok := files[relPath]
@@ -88,7 +88,7 @@ func baseOptions(t *testing.T, r Runner, fetch func(context.Context, Options, st
 	dir := t.TempDir()
 	return Options{
 		DeviceID:      "device-b",
-		TargetPath:    filepath.Join(dir, "bin", "remote-coding"),
+		TargetPath:    filepath.Join(dir, "bin", "remote-agent"),
 		StagingDir:    filepath.Join(dir, "staging"),
 		StatePath:     filepath.Join(dir, "state.json"),
 		Platform:      testPlatform,
@@ -223,7 +223,7 @@ func TestApplyUpdatesWhenManifestDiffers(t *testing.T) {
 		t.Fatalf("res=%#v", res)
 	}
 	wantScript := filepath.Join(opts.StagingDir, "update.sh")
-	wantBinary := filepath.Join(opts.StagingDir, "remote-coding-"+testPlatform)
+	wantBinary := filepath.Join(opts.StagingDir, "remote-agent-"+testPlatform)
 	if r.name != wantScript {
 		t.Fatalf("ran %q, want %q", r.name, wantScript)
 	}
@@ -250,7 +250,7 @@ func TestApplyStagesExtraAssets(t *testing.T) {
 		Commit:  newCommit,
 		BuiltAt: "2026-07-03T12:00:00+08:00",
 		Binaries: map[string]Artifact{
-			testPlatform: {Path: "remote-coding-" + testPlatform, SHA256: sha(testBinary)},
+			testPlatform: {Path: "remote-agent-" + testPlatform, SHA256: sha(testBinary)},
 		},
 		UpdateScript: Artifact{Path: "update.sh", SHA256: sha(testScript)},
 		Assets:       []Artifact{{Path: "watchdog.sh", SHA256: sha(testWatchdog)}},
@@ -301,7 +301,7 @@ func TestApplyErrorsOnShaMismatch(t *testing.T) {
 		Commit:  newCommit,
 		BuiltAt: "2026-07-03T12:00:00+08:00",
 		Binaries: map[string]Artifact{
-			testPlatform: {Path: "remote-coding-" + testPlatform, SHA256: strings.Repeat("0", 64)},
+			testPlatform: {Path: "remote-agent-" + testPlatform, SHA256: strings.Repeat("0", 64)},
 		},
 		UpdateScript: Artifact{Path: "update.sh", SHA256: sha(testScript)},
 	}

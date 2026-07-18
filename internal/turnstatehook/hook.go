@@ -88,7 +88,7 @@ func Install(settingsPath string, binaryPath string, turnstateDir string) (map[s
 	for _, ev := range events {
 		cmd := shellQuote(binaryPath) + " hook turnstate " + ev.state
 		if turnstateDir != "" {
-			cmd = "RC_TURNSTATE_DIR=" + shellQuote(turnstateDir) + " " + cmd
+			cmd = "RA_TURNSTATE_DIR=" + shellQuote(turnstateDir) + " " + cmd
 		}
 		groups := objectList(hooks[ev.name])
 		replaced := false
@@ -122,10 +122,13 @@ func Install(settingsPath string, binaryPath string, turnstateDir string) (map[s
 }
 
 func defaultTurnstateDir() string {
+	if v := os.Getenv("RA_TURNSTATE_DIR"); v != "" {
+		return v
+	}
 	if v := os.Getenv("RC_TURNSTATE_DIR"); v != "" {
 		return v
 	}
-	return filepath.Join("~", ".claude", "remote-coding-turnstate")
+	return filepath.Join("~", ".claude", "remote-agent-turnstate")
 }
 
 func objectMap(v any) map[string]any {

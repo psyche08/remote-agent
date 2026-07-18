@@ -3,8 +3,8 @@
   "devices": ["mac-studio-01", "mac-pro-02"],
   "host": "127.0.0.1",
   "port": 8765,
-  "uds": "/opt/private-tunnel/state/remote-coding/sockets/backend.sock",
-  "state_dir": "/opt/private-tunnel/state/remote-coding",
+  "uds": "/opt/private-tunnel/state/remote-agent/sockets/backend.sock",
+  "state_dir": "/opt/private-tunnel/state/remote-agent",
   "push_proxy": "",
   "push_vapid": null,
   "default_provider": "claude",
@@ -14,7 +14,7 @@
       "command": "claude",
       "cwd": "~/Developer",
       "permission_mode": "auto",
-      "turnstate_dir": "~/.claude/remote-coding-turnstate",
+      "turnstate_dir": "~/.claude/remote-agent-turnstate",
       "kill_grace": 3
     },
     "codex": {

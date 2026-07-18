@@ -83,7 +83,7 @@ func NewClaude(id string, cfg config.ProviderConfig) *Claude {
 		cwd:                   expandUser(firstNonEmpty(cfg.Cwd, "~/Developer")),
 		permissionMode:        stringExtra(cfg.Extra, "permission_mode", "auto"),
 		preferDesktop:         boolExtra(cfg.Extra, "prefer_desktop_claude", false),
-		turnstateDir:          stringExtra(cfg.Extra, "turnstate_dir", "~/.claude/remote-coding-turnstate"),
+		turnstateDir:          stringExtra(cfg.Extra, "turnstate_dir", "~/.claude/remote-agent-turnstate"),
 		resumeWait:            durationExtra(cfg.Extra, "resume_wait_request_cap", 8*time.Second),
 		staleAfter:            durationExtra(cfg.Extra, "turnstate_stale_after", 90*time.Second),
 		killGrace:             durationExtra(cfg.Extra, "kill_grace", 3*time.Second),

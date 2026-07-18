@@ -18,7 +18,7 @@ func TestHandlerServesVersionedDeviceUI(t *testing.T) {
 	if !strings.Contains(body, `const APP_STATIC_VERSION = "abc12345"`) {
 		t.Fatalf("device UI was not stamped: %s", body[:min(len(body), 200)])
 	}
-	if strings.Contains(body, "__REMOTE_CODING_STATIC_VERSION__") {
+	if strings.Contains(body, "__REMOTE_AGENT_STATIC_VERSION__") {
 		t.Fatal("device UI retained the build placeholder")
 	}
 }
@@ -39,7 +39,7 @@ func TestRelayShellOnlyBootstrapsDevices(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
-		"sendPrompt(", "pending_approvals", "session_preview", `id="devices"`, `id="picker"`, "remote-coding-show-devices",
+		"sendPrompt(", "pending_approvals", "session_preview", `id="devices"`, `id="picker"`, "remote-agent-show-devices",
 	} {
 		if strings.Contains(shell, forbidden) {
 			t.Fatalf("relay shell contains device UI behavior %q", forbidden)

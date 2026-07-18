@@ -22,7 +22,7 @@ users:
 
 # ---------------------------------------------------------------------------
 # 2) The edge/container profile maps route port 8765 through its private host
-#    gateway to the host remote-coding UDS adapter.
+#    gateway to the host remote-agent UDS adapter.
 # ---------------------------------------------------------------------------
 # allowed_ports: [8765]
 # tcp_targets:

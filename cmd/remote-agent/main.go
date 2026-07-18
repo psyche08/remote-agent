@@ -43,7 +43,7 @@ func run(args []string) int {
 		fmt.Println(string(b))
 		return 0
 	}
-	fs := flag.NewFlagSet("remote-coding", flag.ContinueOnError)
+	fs := flag.NewFlagSet("remote-agent", flag.ContinueOnError)
 	configPath := fs.String("config", "", "config.json path")
 	listen := fs.String("listen", "", "TCP address for development, e.g. 127.0.0.1:18765")
 	uds := fs.String("uds", "", "Unix socket path")
@@ -91,10 +91,10 @@ func run(args []string) int {
 
 func runUpdate(args []string) int {
 	if len(args) == 0 || args[0] != "apply" {
-		fmt.Fprintln(os.Stderr, "usage: remote-coding update apply --device id --target path [--relay-url url]")
+		fmt.Fprintln(os.Stderr, "usage: remote-agent update apply --device id --target path [--relay-url url]")
 		return 2
 	}
-	fs := flag.NewFlagSet("remote-coding update apply", flag.ContinueOnError)
+	fs := flag.NewFlagSet("remote-agent update apply", flag.ContinueOnError)
 	relayURL := fs.String("relay-url", "", "relay URL publishing the release manifest (required)")
 	service := fs.String("service", "", "relay service name (default "+autoupdate.DefaultService+")")
 	certDir := fs.String("cert-dir", "", "client cert directory for relay mTLS")
@@ -161,10 +161,10 @@ func (r *repeatedString) Set(v string) error {
 
 func runLogs(args []string) int {
 	if len(args) == 0 || args[0] != "upload" {
-		fmt.Fprintln(os.Stderr, "usage: remote-coding logs upload [--once] [--source path]")
+		fmt.Fprintln(os.Stderr, "usage: remote-agent logs upload [--once] [--source path]")
 		return 2
 	}
-	fs := flag.NewFlagSet("remote-coding logs upload", flag.ContinueOnError)
+	fs := flag.NewFlagSet("remote-agent logs upload", flag.ContinueOnError)
 	relayURL := fs.String("relay-url", "", "relay URL, e.g. https://relay.example.com:8443")
 	namespace := fs.String("namespace", "remocoding", "relay log namespace")
 	user := fs.String("user", "", "private-tunnel user id; optional when cert-dir contains an agent cert for this device")
@@ -172,7 +172,7 @@ func runLogs(args []string) int {
 	certDir := fs.String("cert-dir", "/opt/private-tunnel/certs", "directory containing user-*.crt/key or agent-*.crt/key")
 	certFile := fs.String("cert", "", "explicit client cert")
 	keyFile := fs.String("key", "", "explicit client key")
-	statePath := fs.String("state", "/opt/private-tunnel/state/remote-coding/data/log-upload-state.json", "offset state JSON path")
+	statePath := fs.String("state", "/opt/private-tunnel/state/remote-agent/data/log-upload-state.json", "offset state JSON path")
 	interval := fs.Duration("interval", time.Minute, "upload interval")
 	maxChunk := fs.Int64("max-chunk", 1024*1024, "max bytes to send per source per upload")
 	once := fs.Bool("once", false, "upload once and exit")
@@ -211,7 +211,7 @@ func runLogs(args []string) int {
 
 func runHook(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: remote-coding hook <turnstate|install-turnstate>")
+		fmt.Fprintln(os.Stderr, "usage: remote-agent hook <turnstate|install-turnstate>")
 		return 2
 	}
 	switch args[0] {
@@ -223,9 +223,9 @@ func runHook(args []string) int {
 		turnstatehook.Run(state, os.Stdin, "")
 		return 0
 	case "install-turnstate":
-		fs := flag.NewFlagSet("remote-coding hook install-turnstate", flag.ContinueOnError)
+		fs := flag.NewFlagSet("remote-agent hook install-turnstate", flag.ContinueOnError)
 		settings := fs.String("settings", "", "Claude settings.json path")
-		bin := fs.String("binary", "", "remote-coding binary path for hook commands")
+		bin := fs.String("binary", "", "remote-agent binary path for hook commands")
 		dir := fs.String("turnstate-dir", "", "turn-state directory")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
@@ -267,7 +267,7 @@ func serveTCP(srv *http.Server, addr string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Printf("remote-coding listening on http://%s\n", addr)
+	fmt.Printf("remote-agent listening on http://%s\n", addr)
 	return serveListener(srv, ln)
 }
 
@@ -287,7 +287,7 @@ func serveUnix(srv *http.Server, path string) int {
 		_ = os.Remove(path)
 	}()
 	_ = os.Chmod(path, 0o600)
-	fmt.Printf("remote-coding listening on unix://%s\n", path)
+	fmt.Printf("remote-agent listening on unix://%s\n", path)
 	return serveListener(srv, ln)
 }
 

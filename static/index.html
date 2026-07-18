@@ -727,7 +727,7 @@
   </script>
   <script>
     const $ = (id) => document.getElementById(id);
-    const APP_STATIC_VERSION = "__REMOTE_CODING_STATIC_VERSION__";
+    const APP_STATIC_VERSION = "__REMOTE_AGENT_STATIC_VERSION__";
     let NATIVE = [];
     let LIVE_SESSIONS = [];   // currently-driven sessions (device-wide, from /live_sessions)
     let PROVIDERS_META = [];
@@ -757,9 +757,9 @@
     function stateBootstrapHeaders() {
       return {
         "Content-Type": "application/json",
-        "X-Remote-Coding-Web-Version": staticVersion(),
-        "X-Remote-Coding-Client-Kind": "web-bootstrap",
-        "X-Remote-Coding-Client-Visibility": document.visibilityState || "",
+        "X-Remote-Agent-Web-Version": staticVersion(),
+        "X-Remote-Agent-Client-Kind": "web-bootstrap",
+        "X-Remote-Agent-Client-Visibility": document.visibilityState || "",
       };
     }
     function cleanStateID(v) {
@@ -775,7 +775,7 @@
       return m ? cleanStateID(m[1]) : "";
     }
     function makeStateScope(user) {
-      return "remote-coding:v2:" + cleanStateID(user || "ephemeral") + ":" + serviceIDForState();
+      return "remote-agent:v2:" + cleanStateID(user || "ephemeral") + ":" + serviceIDForState();
     }
     function stateKey(key) {
       return STATE_SCOPE + ":" + key;
@@ -796,7 +796,7 @@
       STATE_MEMORY.set(key, v);
     }
     function stateSessionKey(key) {
-      return (STATE_SCOPE || "remote-coding:v2:ephemeral:" + serviceIDForState()) + ":" + key;
+      return (STATE_SCOPE || "remote-agent:v2:ephemeral:" + serviceIDForState()) + ":" + key;
     }
     function applyStateScope(user, persistent) {
       STATE_USER = cleanStateID(user || "");
@@ -852,9 +852,9 @@
     }
     function rememberShellDevice(id, providerId, activateSession) {
       if (!id) return;
-      try { localStorage.setItem("remote-coding-shell-device", id); } catch (e) {}
+      try { localStorage.setItem("remote-agent-shell-device", id); } catch (e) {}
       if (window.parent !== window) {
-        window.parent.postMessage({ type: "remote-coding-device-selected", device: id, provider: providerId || "",
+        window.parent.postMessage({ type: "remote-agent-device-selected", device: id, provider: providerId || "",
           activate_session: !!activateSession }, location.origin);
       }
     }
@@ -891,7 +891,7 @@
           const connected = (Array.isArray(list) ? list : []).filter(d => d && d.device);
           // /_pt/devices is user-wide and can include machines (for example
           // SSH-only relays) that do not expose this service. Only show
-          // devices whose remote-coding health endpoint is actually routed.
+          // devices whose remote-agent health endpoint is actually routed.
           const healthy = (await Promise.all(connected.map(async entry => {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), 4000);
@@ -988,10 +988,10 @@
     function headers(extra = {}) {
       return {
         "Content-Type": "application/json",
-        "X-Remote-Coding-Web-Version": staticVersion(),
-        "X-Remote-Coding-Client-Id": webClientID(),
-        "X-Remote-Coding-Client-Kind": "web",
-        "X-Remote-Coding-Client-Visibility": document.visibilityState || "",
+        "X-Remote-Agent-Web-Version": staticVersion(),
+        "X-Remote-Agent-Client-Id": webClientID(),
+        "X-Remote-Agent-Client-Kind": "web",
+        "X-Remote-Agent-Client-Visibility": document.visibilityState || "",
         ...extra,
       };
     }

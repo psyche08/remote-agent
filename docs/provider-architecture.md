@@ -1,6 +1,6 @@
 # Provider 架构
 
-本文描述 `remote-coding` 当前生产 Go 路径中的 provider 架构。范围包括
+本文描述 `remote-agent` 当前生产 Go 路径中的 provider 架构。范围包括
 provider 注册、会话身份、原生会话发现、发送路由、stream/status 和审批。旧的
 Python provider、Claude Desktop wrapper/broker 和 tmux backend 已从仓库删除。
 
@@ -10,10 +10,10 @@ Python provider、Claude Desktop wrapper/broker 和 tmux backend 已从仓库删
 - `claude_cli`、`claude_desktop` 是旧数据和旧客户端的兼容别名，API 会把它们
   归一化为 `claude`；它们不是独立 provider，也不拥有独立会话命名空间。
 - Claude Desktop 和 CLI 的发现数据按同一个 Claude transcript UUID 合并，但
-  当前所有写操作都由 remote-coding 管理的 standalone Claude CLI
+  当前所有写操作都由 remote-agent 管理的 standalone Claude CLI
   `stream-json` 进程完成。
 - Codex 只有一个 provider id，但内部有两条明确的 delivery route：
-  remote-coding 自己的 headless `codex app-server`，以及 Codex Desktop
+  remote-agent 自己的 headless `codex app-server`，以及 Codex Desktop
   owner/follower IPC。路由属于 logical session，不能在一次发送失败后静默切换。
 - 所有可变状态和控制操作必须至少按 `(provider_id, session_id)` 作用域化；涉及
   native runtime 时再通过持久化映射找到 `transcript_id` / `native_session_id`。
@@ -40,7 +40,7 @@ flowchart LR
     DesktopIPC --> Rollout
 ```
 
-`cmd/remote-coding/main.go` 只负责加载 config/state、调用
+`cmd/remote-agent/main.go` 只负责加载 config/state、调用
 `provider.BuildRegistry`、创建 API server，并把 provider 的 stream publisher 接到
 按 session 分组的 WebSocket fan-out。provider 不直接处理 HTTP，也不保存 PWA
 tab 状态。
@@ -92,12 +92,12 @@ Go `Provider` 接口要求实现：
 |---|---|---|
 | `device_id` | 部署实例 | Mac/账号隔离边界 |
 | `provider_id` | registry | canonical provider：`claude` 或 `codex` |
-| `session_id` | remote-coding | PWA/API 使用的 logical session id，也是任务、附件和控制操作的主键 |
+| `session_id` | remote-agent | PWA/API 使用的 logical session id，也是任务、附件和控制操作的主键 |
 | `native_session_id` | provider runtime | Claude transcript UUID 或 Codex thread UUID；表示可激活的 native handle |
 | `transcript_id` | durable read side | transcript/rollout 的合并键；通常与 native id 相同，但语义上是持久读侧 |
 | `origin` | discovery | `cli` / `desktop` / `both` 等元数据，只说明从哪里发现，不决定发送路由 |
 | `source` | runtime/read side | `claude_cli_stream`、`claude_turnstate`、Codex local/app-server 等观测来源，不决定 owner |
-| `delivery_route` | persisted logical session | 当前只对 Codex Desktop-native 会话显式写 `desktop_ipc`；普通缺省 record 表示 remote-coding-owned app-server，旧 `r0...` / `r-codex-...` logical id 仍有 Desktop-route 兼容识别 |
+| `delivery_route` | persisted logical session | 当前只对 Codex Desktop-native 会话显式写 `desktop_ipc`；普通缺省 record 表示 remote-agent-owned app-server，旧 `r0...` / `r-codex-...` logical id 仍有 Desktop-route 兼容识别 |
 
 `sessions.json` 保存 logical record，核心映射是：
 
@@ -118,7 +118,7 @@ API 查找和所有 mutating control 仍必须带 provider scope，并在调用 
 | 视图 | API | 数据含义 |
 |---|---|---|
 | Native discovery | `/native_sessions?provider_id=...` | provider 原生存储中的历史会话，可只读预览，尚不一定有 logical record |
-| Stored logical sessions | `/sessions` | remote-coding 已创建/激活、可承载任务和附件的 record |
+| Stored logical sessions | `/sessions` | remote-agent 已创建/激活、可承载任务和附件的 record |
 | Runtime/live sessions | `/live_sessions` | provider runtime、stored record 和可选 native row 的合并结果 |
 
 `/live_sessions` 以 `(provider_id, transcript_id)` 去重：runtime 的 live/state/source
@@ -216,7 +216,7 @@ Claude discovery 同时读取：
 
 | 会话来源 | route | 建立方式 | 发送/steer/interrupt owner |
 |---|---|---|---|
-| PWA 新建 | app-server（record 中 `delivery_route` 缺省） | `thread/start` | remote-coding 自己的 app-server child |
+| PWA 新建 | app-server（record 中 `delivery_route` 缺省） | `thread/start` | remote-agent 自己的 app-server child |
 | Codex native preview 直接发送 | `desktop_ipc` | 先持久化 deterministic logical id；不预先 `thread/resume` | 懒加载 `codex://threads/<id>` 后的 Desktop owner client |
 | 显式 resume/fork 兼容路径 | provider `OpenResumeSession` | `thread/resume` 或 `thread/fork`，标记 Desktop-sync candidate 并尝试 attach owner | attach 成功后的 Desktop owner；fork 得到新 thread |
 
@@ -234,7 +234,7 @@ Desktop route 的发送规则是：
 4. owner 缺失、attach 超时或 IPC 结果不确定时返回错误，不能 fallback 到另一个
    app-server owner。这样调用方能明确知道 prompt 没有被安全确认投递。
 
-只有从一开始就由 remote-coding 创建并拥有的 headless session 才走 app-server
+只有从一开始就由 remote-agent 创建并拥有的 headless session 才走 app-server
 `turn/start`、`turn/steer`、`turn/interrupt`。这里的“两条 route”是 session ownership
 模型，不是每次请求的主备切换模型。
 
@@ -252,7 +252,7 @@ Desktop route 的发送规则是：
 先回答后，另一侧晚到的结果返回 `stale`。`auto_review` 已由 guardian 处理的请求
 不会伪装成人工审批。
 
-headless route 的审批直接回复 remote-coding 自己 app-server child 的 JSON-RPC
+headless route 的审批直接回复 remote-agent 自己 app-server child 的 JSON-RPC
 request。两条 route 最终都以 `(thread_id, request_id)` 跟踪，某个 thread idle 不得
 清空其他 thread 的 pending queue。
 

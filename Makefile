@@ -8,7 +8,7 @@ BUILDINFO_PKG := github.com/psyche08/remote-agent/internal/buildinfo
 LDFLAGS := -X $(BUILDINFO_PKG).Version=$(COMMIT) -X $(BUILDINFO_PKG).Commit=$(COMMIT) -X $(BUILDINFO_PKG).BuiltAt=$(BUILT_AT)
 
 go-build:
-	GOCACHE=$(GOCACHE) $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/remote-coding ./cmd/remote-coding
+	GOCACHE=$(GOCACHE) $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/remote-agent ./cmd/remote-agent
 
 go-test:
 	GOCACHE=$(GOCACHE) $(GO) test ./...
@@ -17,7 +17,7 @@ go-vet:
 	GOCACHE=$(GOCACHE) $(GO) vet ./...
 
 go-run:
-	GOCACHE=$(GOCACHE) $(GO) run ./cmd/remote-coding --listen 127.0.0.1:18765
+	GOCACHE=$(GOCACHE) $(GO) run ./cmd/remote-agent --listen 127.0.0.1:18765
 
 go-clean:
 	rm -rf bin

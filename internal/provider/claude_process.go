@@ -101,6 +101,7 @@ func processAlive(pid int) bool {
 func isClaudeDesktopInternalProcess(command string) bool {
 	return strings.Contains(command, "/Library/Application Support/Claude/claude-code/") &&
 		(strings.Contains(command, "/claude.app/Contents/MacOS/claude") ||
+			strings.Contains(command, "/claude.remote-agent-real.app/Contents/MacOS/claude") ||
 			strings.Contains(command, "/claude.remote-coding-real.app/Contents/MacOS/claude"))
 }
 

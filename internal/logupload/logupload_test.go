@@ -12,7 +12,7 @@ import (
 
 func TestUploadOnceUploadsIncrementally(t *testing.T) {
 	dir := t.TempDir()
-	src := filepath.Join(dir, "remote-coding.log")
+	src := filepath.Join(dir, "remote-agent.log")
 	state := filepath.Join(dir, "state.json")
 	if err := os.WriteFile(src, []byte("hello\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -55,7 +55,7 @@ func TestUploadOnceUploadsIncrementally(t *testing.T) {
 
 func TestUploadOnceResetsOffsetAfterTruncate(t *testing.T) {
 	dir := t.TempDir()
-	src := filepath.Join(dir, "remote-coding.log")
+	src := filepath.Join(dir, "remote-agent.log")
 	state := filepath.Join(dir, "state.json")
 	if err := os.WriteFile(state, []byte(`{"offsets":{"`+src+`":99}}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -84,10 +84,6 @@ func TestUploadOnceResetsOffsetAfterTruncate(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
-
-
-
-
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 

@@ -605,7 +605,7 @@ func TestClientVersionsRecordsFetchHeaders(t *testing.T) {
 	req.Header.Set(clientIDHeader, "client-a")
 	req.Header.Set(clientKindHeader, "web")
 	req.Header.Set(clientVisibilityHeader, "visible")
-	req.Header.Set("User-Agent", "remote-coding-test")
+	req.Header.Set("User-Agent", "remote-agent-test")
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
@@ -636,6 +636,22 @@ func TestClientVersionsRecordsFetchHeaders(t *testing.T) {
 	}
 	if _, ok := row["stale"]; ok {
 		t.Fatalf("client web version must not be compared with agent version: %#v", row)
+	}
+}
+
+func TestClientVersionsAcceptsLegacyRemoteCodingHeaders(t *testing.T) {
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	srv := NewServer(cfg, provider.BuildRegistry(cfg), state.New(filepath.Join(t.TempDir(), "data")))
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	req.Header.Set(legacyWebVersionHeader, "legacy-web")
+	req.Header.Set(legacyIDHeader, "legacy-client")
+	req.Header.Set(legacyKindHeader, "legacy")
+	req.Header.Set(legacyVisibilityHeader, "visible")
+	srv.recordClientVersion(req)
+	row := srv.clients["id:legacy-client"]
+	if row == nil || row.WebVersion != "legacy-web" || row.Kind != "legacy" || row.Visibility != "visible" {
+		t.Fatalf("legacy headers not preserved during migration: %#v", row)
 	}
 }
 

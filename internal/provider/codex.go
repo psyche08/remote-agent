@@ -547,7 +547,7 @@ func (c *Codex) BindTranscript(sessionID string, transcriptID string) {
 }
 
 // BindDesktopTranscript marks a persisted native Desktop preview for IPC
-// delivery. Plain BindTranscript intentionally does not: remote-coding-owned
+// delivery. Plain BindTranscript intentionally does not: remote-agent-owned
 // app-server threads use the same UUID format and must remain on app-server.
 func (c *Codex) BindDesktopTranscript(sessionID string, transcriptID string) {
 	c.BindTranscript(sessionID, transcriptID)
@@ -1193,7 +1193,7 @@ func (c *Codex) ensureClient() (codexAppClient, error) {
 	if err := client.Start(); err != nil {
 		return nil, err
 	}
-	if err := client.Initialize("remote-coding"); err != nil {
+	if err := client.Initialize("remote-agent"); err != nil {
 		_ = client.Close()
 		return nil, err
 	}
@@ -1774,7 +1774,7 @@ func (c *Codex) onServerRequest(requestID any, method string, params map[string]
 		client := c.client
 		c.clientMu.Unlock()
 		if client != nil {
-			_ = client.RespondError(requestID, -32601, "method not supported by remote-coding: "+method)
+			_ = client.RespondError(requestID, -32601, "method not supported by remote-agent: "+method)
 		}
 		return
 	}
@@ -1816,7 +1816,7 @@ func (c *Codex) answerDynamicTool(requestID any, params map[string]any) error {
 	}
 	return client.Respond(requestID, map[string]any{
 		"success":      false,
-		"contentItems": []map[string]any{{"type": "inputText", "text": "Unsupported dynamic tool in remote-coding: " + label}},
+		"contentItems": []map[string]any{{"type": "inputText", "text": "Unsupported dynamic tool in remote-agent: " + label}},
 	})
 }
 

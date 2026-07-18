@@ -1,4 +1,4 @@
-// remote-coding service worker.
+// remote-agent service worker.
 //   - Receive Web Push events (waiting_approval / waiting_input) and render them.
 //   - Route notification clicks back to the PWA, focusing the right session.
 //
@@ -11,14 +11,14 @@
 // per-session instead. True foreground suppression needs a server-side
 // presence signal — deferred.
 
-const APP_STATIC_VERSION = "__REMOTE_CODING_STATIC_VERSION__";
+const APP_STATIC_VERSION = "__REMOTE_AGENT_STATIC_VERSION__";
 function versionHeaders(extra = {}) {
   const v = APP_STATIC_VERSION && !APP_STATIC_VERSION.startsWith("__") ? APP_STATIC_VERSION : "dev";
   return {
     "Content-Type": "application/json",
-    "X-Remote-Coding-Web-Version": v,
-    "X-Remote-Coding-Client-Id": "sw:" + self.registration.scope,
-    "X-Remote-Coding-Client-Kind": "service-worker",
+    "X-Remote-Agent-Web-Version": v,
+    "X-Remote-Agent-Client-Id": "sw:" + self.registration.scope,
+    "X-Remote-Agent-Client-Kind": "service-worker",
     ...extra,
   };
 }

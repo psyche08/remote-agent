@@ -40,7 +40,7 @@ func NewCodexDesktopIPCClient(socketPath string, timeout time.Duration, hostID s
 	if hostID == "" {
 		hostID = "local"
 	}
-	return &CodexDesktopIPCClient{SocketPath: socketPath, Timeout: timeout, ClientType: "remote-coding", HostID: hostID, clientID: "initializing-client"}
+	return &CodexDesktopIPCClient{SocketPath: socketPath, Timeout: timeout, ClientType: "remote-agent", HostID: hostID, clientID: "initializing-client"}
 }
 
 func (c *CodexDesktopIPCClient) StartTurn(conversationID string, prompt string, opts map[string]any, timeout time.Duration) (any, error) {

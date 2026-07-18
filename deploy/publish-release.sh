@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# remote-coding 统一发布脚本 —— 每次发布设备二进制都走这里,取代
+# remote-agent 统一发布脚本 —— 每次发布设备二进制都走这里,取代
 # 旧的 publish-static.sh + 设备端 git pull 编译。
 #
 # 做什么:
 #   1. 交叉编译 darwin-arm64 二进制(ldflags 注入 commit + 东八区 built_at)
 #   2. 生成 assets/release/manifest.json(commit / built_at / sha256)
 #   3. 上传到 relay 的 remotecoding release 目录:
-#        assets/release/remote-coding-darwin-arm64
+#        assets/release/remote-agent-darwin-arm64
 #        assets/release/update.sh
 #        assets/release/manifest.json     ←最后上传,设备不会读到半套发布
 #   4. 配置 RC_UPDATE_RELAY_URL 的设备每 5 分钟对比 manifest 并自动更新
@@ -26,8 +26,10 @@
 # RC_ALLOW_DIRTY=1 跳过脏树检查(版本章会失真,慎用)。
 set -euo pipefail
 
-SSH_TARGET="${1:-${RC_RELAY_SSH:-}}"
-USER_ID="${RC_RELAY_USER:-remote-coding}"
+# The public relay namespace remains the compatibility route `remotecoding`;
+# only the executable and host supervisor identity are renamed.
+SSH_TARGET="${1:-${RA_RELAY_SSH:-${RC_RELAY_SSH:-}}}"
+USER_ID="${RA_RELAY_USER:-${RC_RELAY_USER:-remote-coding}}"
 STATIC_DIR="/var/lib/private-tunnel/static/${USER_ID}/remotecoding"
 RELEASE_DIR="${STATIC_DIR}/assets/release"
 SRC_DIR="$(cd "$(dirname "$0")/.." && pwd)"          # .../remote-agent
@@ -35,7 +37,7 @@ REPO_DIR="$SRC_DIR"
 GO="${GO:-go}"
 GOCACHE="${GOCACHE:-/private/tmp/remote-agent-gocache}"
 PLATFORM="darwin-arm64"
-BIN_NAME="remote-coding-${PLATFORM}"
+BIN_NAME="remote-agent-${PLATFORM}"
 NOTARY_TEAM_ID="${NOTARY_TEAM_ID:-}"
 NOTARY_APPLE_ID="${NOTARY_APPLE_ID:-}"
 NOTARY_PASSWORD="${NOTARY_PASSWORD:-}"
@@ -43,7 +45,7 @@ NOTARY_PASSWORD="${NOTARY_PASSWORD:-}"
 die() { echo "error: $*" >&2; exit 1; }
 
 [[ -n "$SSH_TARGET" ]] || die "relay SSH target required: pass user@host or set RC_RELAY_SSH"
-[[ "$(uname -s)" = "Darwin" ]] || die "signed/notarized remote-coding releases must be published on macOS"
+[[ "$(uname -s)" = "Darwin" ]] || die "signed/notarized remote-agent releases must be published on macOS"
 command -v security >/dev/null 2>&1 || die "security is required"
 command -v codesign >/dev/null 2>&1 || die "codesign is required"
 command -v xcrun >/dev/null 2>&1 || die "xcrun is required"
@@ -79,7 +81,7 @@ echo "==> building ${BIN_NAME} commit=${COMMIT} built_at=${BUILT_AT}"
 BUILDINFO_PKG="github.com/psyche08/remote-agent/internal/buildinfo"
 ( cd "$SRC_DIR" && GOCACHE="$GOCACHE" GOOS=darwin GOARCH=arm64 "$GO" build -trimpath \
   -ldflags "-X ${BUILDINFO_PKG}.Version=${COMMIT} -X ${BUILDINFO_PKG}.Commit=${COMMIT} -X ${BUILDINFO_PKG}.BuiltAt=${BUILT_AT}" \
-  -o "$OUT/$BIN_NAME" ./cmd/remote-coding )
+  -o "$OUT/$BIN_NAME" ./cmd/remote-agent )
 
 echo "==> signing Darwin binaries with Developer ID team ${NOTARY_TEAM_ID}"
 codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$OUT/$BIN_NAME"
@@ -96,7 +98,7 @@ xcrun notarytool submit "$OUT/notary-payload.zip" \
   --wait
 verify_team_signature "$OUT/$BIN_NAME"
 
-sed "s/__REMOTE_CODING_TEAM_ID__/${NOTARY_TEAM_ID}/g" "$SRC_DIR/deploy/update.sh" > "$OUT/update.sh"
+sed "s/__REMOTE_AGENT_TEAM_ID__/${NOTARY_TEAM_ID}/g" "$SRC_DIR/deploy/update.sh" > "$OUT/update.sh"
 
 sha() { shasum -a 256 "$1" | awk '{print $1}'; }
 BIN_SHA="$(sha "$OUT/$BIN_NAME")"
@@ -138,8 +140,8 @@ put "$OUT/update.sh"  "${RELEASE_DIR}/update.sh"
 # 2) relay 稳定设备壳。普通设备/UI 发布跳过；只有壳本身变化时才显式更新。
 if [ "${RC_PUBLISH_SHELL:-0}" = "1" ]; then
   SHELL_VERSION="${RC_SHELL_VERSION:-shell-v1}"
-  sed "s/__REMOTE_CODING_SHELL_VERSION__/${SHELL_VERSION}/g" "$SRC_DIR/static/shell.html" > "$OUT/index.html"
-  sed "s/__REMOTE_CODING_STATIC_VERSION__/${SHELL_VERSION}/g" "$SRC_DIR/static/sw.js" > "$OUT/sw.js"
+  sed "s/__REMOTE_AGENT_SHELL_VERSION__/${SHELL_VERSION}/g" "$SRC_DIR/static/shell.html" > "$OUT/index.html"
+  sed "s/__REMOTE_AGENT_STATIC_VERSION__/${SHELL_VERSION}/g" "$SRC_DIR/static/sw.js" > "$OUT/sw.js"
   put "$OUT/index.html" "${STATIC_DIR}/index.html"
   put "$OUT/sw.js" "${STATIC_DIR}/sw.js"
   for f in manifest.webmanifest icon-192.png icon-512.png; do

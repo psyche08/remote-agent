@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	pushVAPIDSub      = "mailto:remote-coding@example.invalid"
+	pushVAPIDSub      = "mailto:remote-agent@example.invalid"
 	pushFailThreshold = 5
 	pushPresenceTTL   = 25 * time.Second
 	pushMonitorEvery  = 2 * time.Second
@@ -203,7 +203,7 @@ func (s *Server) pushApprove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pushTest(w http.ResponseWriter, r *http.Request) {
-	payload := buildPushPayload("test", "waiting_approval", "remote-coding push test")
+	payload := buildPushPayload("test", "waiting_approval", "remote-agent push test")
 	payload["device"] = s.cfg.DeviceID
 	subs, _ := s.loadPushSubs()
 	n := s.sendPushToAll(payload, true)

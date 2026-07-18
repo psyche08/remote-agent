@@ -12,10 +12,14 @@ import (
 )
 
 const (
-	clientWebVersionHeader = "X-Remote-Coding-Web-Version"
-	clientIDHeader         = "X-Remote-Coding-Client-Id"
-	clientKindHeader       = "X-Remote-Coding-Client-Kind"
-	clientVisibilityHeader = "X-Remote-Coding-Client-Visibility"
+	clientWebVersionHeader = "X-Remote-Agent-Web-Version"
+	clientIDHeader         = "X-Remote-Agent-Client-Id"
+	clientKindHeader       = "X-Remote-Agent-Client-Kind"
+	clientVisibilityHeader = "X-Remote-Agent-Client-Visibility"
+	legacyWebVersionHeader = "X-Remote-Coding-Web-Version"
+	legacyIDHeader         = "X-Remote-Coding-Client-Id"
+	legacyKindHeader       = "X-Remote-Coding-Client-Kind"
+	legacyVisibilityHeader = "X-Remote-Coding-Client-Visibility"
 	clientVersionTTL       = 24 * time.Hour
 	maxClientVersionRows   = 512
 )
@@ -45,8 +49,8 @@ func (s *Server) captureClientVersion(next http.Handler) http.Handler {
 }
 
 func (s *Server) recordClientVersion(r *http.Request) {
-	webVersion := cleanClientHeader(firstNonEmpty(r.Header.Get(clientWebVersionHeader), r.URL.Query().Get("web_version")), 80)
-	clientID := cleanClientHeader(firstNonEmpty(r.Header.Get(clientIDHeader), r.URL.Query().Get("client_id")), 120)
+	webVersion := cleanClientHeader(firstNonEmpty(firstNonEmpty(r.Header.Get(clientWebVersionHeader), r.Header.Get(legacyWebVersionHeader)), r.URL.Query().Get("web_version")), 80)
+	clientID := cleanClientHeader(firstNonEmpty(firstNonEmpty(r.Header.Get(clientIDHeader), r.Header.Get(legacyIDHeader)), r.URL.Query().Get("client_id")), 120)
 	if webVersion == "" && clientID == "" {
 		return
 	}
@@ -56,7 +60,7 @@ func (s *Server) recordClientVersion(r *http.Request) {
 	row := clientVersionSeen{
 		Key:          key,
 		ClientID:     publicID,
-		Kind:         cleanClientHeader(firstNonEmpty(firstNonEmpty(r.Header.Get(clientKindHeader), r.URL.Query().Get("client_kind")), "web"), 40),
+		Kind:         cleanClientHeader(firstNonEmpty(firstNonEmpty(firstNonEmpty(r.Header.Get(clientKindHeader), r.Header.Get(legacyKindHeader)), r.URL.Query().Get("client_kind")), "web"), 40),
 		WebVersion:   webVersion,
 		UserAgent:    cleanClientHeader(r.UserAgent(), 180),
 		RemoteHash:   shortClientHash(r.RemoteAddr),
@@ -65,7 +69,7 @@ func (s *Server) recordClientVersion(r *http.Request) {
 		LastPath:     cleanClientHeader(r.URL.Path, 160),
 		LastProvider: cleanClientHeader(r.URL.Query().Get("provider_id"), 80),
 		LastSession:  cleanClientHeader(r.URL.Query().Get("session_id"), 120),
-		Visibility:   cleanClientHeader(r.Header.Get(clientVisibilityHeader), 40),
+		Visibility:   cleanClientHeader(firstNonEmpty(r.Header.Get(clientVisibilityHeader), r.Header.Get(legacyVisibilityHeader)), 40),
 		Count:        1,
 	}
 
