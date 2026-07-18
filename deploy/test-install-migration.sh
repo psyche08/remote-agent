@@ -78,7 +78,7 @@ jq -e --arg uds "$new_state/sockets/backend.sock" --arg state "$new_state" '
   .providers.claude.turnstate_dir == "~/.claude/remote-agent-turnstate"
 ' "$new_config" >/dev/null
 grep -q '^stop remote-coding$' "$supervisor_log"
-grep -q '^restart remote-agent$' "$supervisor_log"
+grep -q '^start remote-agent$' "$supervisor_log"
 
 # A failed health check must restore the backed-up legacy drop-in/service.
 fake_bin="$TMP_ROOT/fake-bin"

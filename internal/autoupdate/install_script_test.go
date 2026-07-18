@@ -26,7 +26,7 @@ func TestInstallerMigratesRuntimeIdentity(t *testing.T) {
 		`echo "  remote-agent-log-upload:"`,
 		`LEGACY_DROPIN="$ETC_DIR/services.d/remote-coding.yaml"`,
 		`rm -f "$LEGACY_DROPIN"`,
-		`"$SUPERVISOR" restart remote-agent`,
+		`"$SUPERVISOR" start remote-agent`,
 		`"~/.claude/remote-coding-turnstate"`,
 		`claude["turnstate_dir"] = "~/.claude/remote-agent-turnstate"`,
 	} {

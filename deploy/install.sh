@@ -321,13 +321,20 @@ fi
 
 # 6) reload supervisor + restart remote-agent (never the container agent) ----
 if [ -x "$SUPERVISOR" ]; then
-  "$SUPERVISOR" reload-config >/dev/null 2>&1 || true
-  "$SUPERVISOR" restart remote-agent >/dev/null 2>&1 || "$SUPERVISOR" start remote-agent >/dev/null 2>&1 || true
+  start_ok=1
+  "$SUPERVISOR" reload-config >/dev/null 2>&1 || start_ok=0
+  # reload-config auto-starts newly added always-on services. `start` is
+  # idempotent for that case and also starts an unchanged stopped service;
+  # `restart` here would kill the just-spawned process and introduce a
+  # backoff/health-check race during identity migration.
+  "$SUPERVISOR" start remote-agent >/dev/null 2>&1 || start_ok=0
   if [ "$LOG_UPLOAD" = "1" ]; then
-    "$SUPERVISOR" restart remote-agent-log-upload >/dev/null 2>&1 || "$SUPERVISOR" start remote-agent-log-upload >/dev/null 2>&1 || true
+    "$SUPERVISOR" start remote-agent-log-upload >/dev/null 2>&1 || start_ok=0
   fi
   echo "==> supervisor reloaded + remote-agent (re)started"
-  if [ "${RA_SKIP_HEALTH_CHECK:-0}" != "1" ] && command -v curl >/dev/null 2>&1; then
+  if [ "$start_ok" != "1" ]; then
+    ready=0
+  elif [ "${RA_SKIP_HEALTH_CHECK:-0}" != "1" ] && command -v curl >/dev/null 2>&1; then
     ready=0
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       if curl --silent --fail --unix-socket "$UDS" http://localhost/healthz >/dev/null; then
@@ -336,16 +343,18 @@ if [ -x "$SUPERVISOR" ]; then
       fi
       sleep 1
     done
-    if [ "$ready" != "1" ]; then
-      echo "remote-agent health check failed: $UDS; restoring legacy service" >&2
-      rm -f "$DROPIN"
-      if [ -f "$LEGACY_DROPIN_BACKUP" ]; then
-        cp -p "$LEGACY_DROPIN_BACKUP" "$LEGACY_DROPIN"
-        "$SUPERVISOR" reload-config >/dev/null 2>&1 || true
-        "$SUPERVISOR" restart remote-coding >/dev/null 2>&1 || "$SUPERVISOR" start remote-coding >/dev/null 2>&1 || true
-      fi
-      exit 1
+  else
+    ready=1
+  fi
+  if [ "$ready" != "1" ]; then
+    echo "remote-agent health check failed: $UDS; restoring legacy service" >&2
+    rm -f "$DROPIN"
+    if [ -f "$LEGACY_DROPIN_BACKUP" ]; then
+      cp -p "$LEGACY_DROPIN_BACKUP" "$LEGACY_DROPIN"
+      "$SUPERVISOR" reload-config >/dev/null 2>&1 || true
+      "$SUPERVISOR" restart remote-coding >/dev/null 2>&1 || "$SUPERVISOR" start remote-coding >/dev/null 2>&1 || true
     fi
+    exit 1
   fi
 else
   echo "==> NOTE: supervisor not found at $SUPERVISOR; start remote-agent manually"
