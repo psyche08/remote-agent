@@ -41,6 +41,18 @@ find_tool() {
   echo "$name"
 }
 
+ensure_runtime_dir() {
+  local dir="$1"
+  if [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null; then
+    return 0
+  fi
+  command -v sudo >/dev/null 2>&1 || {
+    echo "cannot create runtime directory $dir (sudo unavailable)" >&2
+    return 1
+  }
+  sudo -n install -d -o "$(id -un)" -g staff -m 0755 "$dir"
+}
+
 DEVICE_ID="${1:?usage: install.sh DEVICE_ID [--devices a,b] [--uds path] [--agent-config path]}"
 shift || true
 
@@ -118,7 +130,7 @@ fi
 
 # Install an immutable runtime copy. Active supervisor drop-ins must never
 # reference a Git checkout or a temporary deployment worktree.
-mkdir -p "$LIBEXEC_DIR"
+ensure_runtime_dir "$LIBEXEC_DIR"
 install -m 0755 "$REPO_REMOTE_AGENT/bin/remote-agent" "$RUNTIME_BIN.new"
 mv -f "$RUNTIME_BIN.new" "$RUNTIME_BIN"
 echo "==> installed runtime binary $RUNTIME_BIN"

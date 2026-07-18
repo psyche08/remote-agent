@@ -18,6 +18,7 @@ func TestInstallerMigratesRuntimeIdentity(t *testing.T) {
 		`STATE_DIR="${RA_STATE_DIR:-/opt/private-tunnel/state/remote-agent}"`,
 		`LIBEXEC_DIR="${RA_LIBEXEC_DIR:-/opt/private-tunnel/libexec/remote-agent}"`,
 		`RUNTIME_BIN="$LIBEXEC_DIR/remote-agent"`,
+		`sudo -n install -d -o "$(id -un)" -g staff -m 0755 "$dir"`,
 		`install -m 0755 "$REPO_REMOTE_AGENT/bin/remote-agent" "$RUNTIME_BIN.new"`,
 		`LEGACY_STATE_DIR="${RA_LEGACY_STATE_DIR:-/opt/private-tunnel/state/remote-coding}"`,
 		`mv "$LEGACY_STATE_DIR" "$STATE_DIR"`,
