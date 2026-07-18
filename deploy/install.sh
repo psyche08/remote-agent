@@ -48,6 +48,8 @@ REPO_REMOTE_AGENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # .../rem
 REPO_PARENT="$(dirname "$REPO_REMOTE_AGENT")"
 ETC_DIR="${RA_ETC_DIR:-${RC_ETC_DIR:-/opt/private-tunnel/etc}}"
 BIN_DIR="${RA_BIN_DIR:-${RC_BIN_DIR:-/opt/private-tunnel/bin}}"
+LIBEXEC_DIR="${RA_LIBEXEC_DIR:-/opt/private-tunnel/libexec/remote-agent}"
+RUNTIME_BIN="$LIBEXEC_DIR/remote-agent"
 STATE_DIR="${RA_STATE_DIR:-/opt/private-tunnel/state/remote-agent}"
 LEGACY_STATE_DIR="${RA_LEGACY_STATE_DIR:-/opt/private-tunnel/state/remote-coding}"
 UDS="$STATE_DIR/sockets/backend.sock"
@@ -114,6 +116,13 @@ else
   echo "==> built $REPO_REMOTE_AGENT/bin/remote-agent"
 fi
 
+# Install an immutable runtime copy. Active supervisor drop-ins must never
+# reference a Git checkout or a temporary deployment worktree.
+mkdir -p "$LIBEXEC_DIR"
+install -m 0755 "$REPO_REMOTE_AGENT/bin/remote-agent" "$RUNTIME_BIN.new"
+mv -f "$RUNTIME_BIN.new" "$RUNTIME_BIN"
+echo "==> installed runtime binary $RUNTIME_BIN"
+
 # Reject an ambiguous state layout before stopping the currently healthy
 # service. This keeps a preflight failure from causing an outage.
 if [ -e "$STATE_DIR" ] && [ -d "$LEGACY_STATE_DIR" ] && [ ! -L "$LEGACY_STATE_DIR" ]; then
@@ -161,9 +170,14 @@ rm -f \
   "$BIN_DIR/watch-claude-wrapper"
 
 # 3) config.json (preserve values, migrate only old identity defaults) -------
-CFG="${RA_CONFIG:-$REPO_REMOTE_AGENT/config.json}"
+CFG="${RA_CONFIG:-$ETC_DIR/remote-agent/config.json}"
+SOURCE_CFG="${RA_CONFIG_SOURCE:-$REPO_REMOTE_AGENT/config.json}"
 LEGACY_CFG="${RA_LEGACY_CONFIG:-$REPO_PARENT/remote-coding/config.json}"
-if [ ! -f "$CFG" ] && [ -f "$LEGACY_CFG" ]; then
+mkdir -p "$(dirname "$CFG")"
+if [ ! -f "$CFG" ] && [ -f "$SOURCE_CFG" ]; then
+  cp -p "$SOURCE_CFG" "$CFG"
+  echo "==> installed config $SOURCE_CFG -> $CFG"
+elif [ ! -f "$CFG" ] && [ -f "$LEGACY_CFG" ]; then
   cp -p "$LEGACY_CFG" "$CFG"
   echo "==> migrated config $LEGACY_CFG -> $CFG"
 fi
@@ -260,14 +274,14 @@ fi
   echo "services:"
   echo "  remote-agent:"
   echo "    cmd:"
-  echo "      - $REPO_REMOTE_AGENT/bin/remote-agent"
+  echo "      - $RUNTIME_BIN"
   echo "      - --config"
   echo "      - $CFG"
-  echo "    cwd: $REPO_REMOTE_AGENT"
+  echo "    cwd: $LIBEXEC_DIR"
   if [ "$LOG_UPLOAD" = "1" ]; then
     echo "  remote-agent-log-upload:"
     echo "    cmd:"
-    echo "      - $REPO_REMOTE_AGENT/bin/remote-agent"
+    echo "      - $RUNTIME_BIN"
     echo "      - logs"
     echo "      - upload"
     echo "      - --relay-url"
@@ -290,7 +304,7 @@ fi
     echo "      - $LOG_MAX_CHUNK"
     echo "      - --source"
     echo "      - $LOG_SOURCE"
-    echo "    cwd: $REPO_REMOTE_AGENT"
+    echo "    cwd: $LIBEXEC_DIR"
   fi
 } > "$DROPIN"
 echo "==> wrote drop-in $DROPIN"
@@ -301,7 +315,7 @@ echo "==> retired legacy drop-in $LEGACY_DROPIN"
 RA_TURNSTATE_DIR="${RA_TURNSTATE_DIR:-${RC_TURNSTATE_DIR:-$HOME/.claude/remote-agent-turnstate}}"
 mkdir -p "$RA_TURNSTATE_DIR"
 if [ "${RA_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
-  ( cd "$REPO_REMOTE_AGENT" && "$REPO_REMOTE_AGENT/bin/remote-agent" hook install-turnstate --binary "$REPO_REMOTE_AGENT/bin/remote-agent" --turnstate-dir "$RA_TURNSTATE_DIR" ) \
+  ( cd "$LIBEXEC_DIR" && "$RUNTIME_BIN" hook install-turnstate --binary "$RUNTIME_BIN" --turnstate-dir "$RA_TURNSTATE_DIR" ) \
     && echo "==> installed turn-state hooks (RA_TURNSTATE_DIR=$RA_TURNSTATE_DIR)"
 fi
 

@@ -275,7 +275,8 @@ Claude stream-json sessions, Claude/Codex native transcript readers, Codex app-s
 Codex Desktop IPC sync, WebSocket streaming, Web Push VAPID/subscription storage,
 encrypted push delivery, foreground presence suppression, and approval-action
 callbacks.
-The deploy installer builds `bin/remote-agent` and registers that binary with
+The deploy installer builds `bin/remote-agent`, installs an immutable runtime
+copy at `/opt/private-tunnel/libexec/remote-agent/remote-agent`, and registers it with
 private-services.
 
 ```bash

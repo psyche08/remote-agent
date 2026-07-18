@@ -10,6 +10,7 @@ legacy_state="$TMP_ROOT/state/remote-coding"
 new_state="$TMP_ROOT/state/remote-agent"
 etc_dir="$TMP_ROOT/etc"
 bin_dir="$TMP_ROOT/opt-bin"
+libexec_dir="$TMP_ROOT/libexec/remote-agent"
 home_dir="$TMP_ROOT/home"
 supervisor="$TMP_ROOT/private-services"
 supervisor_log="$TMP_ROOT/supervisor.log"
@@ -48,6 +49,7 @@ SUPERVISOR_LOG="$supervisor_log" \
 RA_SUPERVISOR="$supervisor" \
 RA_ETC_DIR="$etc_dir" \
 RA_BIN_DIR="$bin_dir" \
+RA_LIBEXEC_DIR="$libexec_dir" \
 RA_STATE_DIR="$new_state" \
 RA_LEGACY_STATE_DIR="$legacy_state" \
 RA_CONFIG="$new_config" \
@@ -64,7 +66,12 @@ test "$(readlink "$legacy_state")" = "$new_state"
 test ! -e "$etc_dir/services.d/remote-coding.yaml"
 test -f "$etc_dir/services.d/remote-coding.yaml.remote-agent-migration"
 grep -q '^  remote-agent:$' "$etc_dir/services.d/remote-agent.yaml"
-grep -q '/bin/remote-agent' "$etc_dir/services.d/remote-agent.yaml"
+grep -q "$libexec_dir/remote-agent" "$etc_dir/services.d/remote-agent.yaml"
+test -x "$libexec_dir/remote-agent"
+if grep -q "$REPO_ROOT/bin/remote-agent" "$etc_dir/services.d/remote-agent.yaml"; then
+  echo "active drop-in references the Git checkout" >&2
+  exit 1
+fi
 jq -e --arg uds "$new_state/sockets/backend.sock" --arg state "$new_state" '
   .uds == $uds and .state_dir == $state and
   .providers.claude.command == "claude" and
@@ -88,6 +95,7 @@ SUPERVISOR_LOG="$supervisor_log" \
 RA_SUPERVISOR="$supervisor" \
 RA_ETC_DIR="$etc_dir" \
 RA_BIN_DIR="$bin_dir" \
+RA_LIBEXEC_DIR="$libexec_dir" \
 RA_STATE_DIR="$new_state" \
 RA_LEGACY_STATE_DIR="$legacy_state" \
 RA_CONFIG="$new_config" \

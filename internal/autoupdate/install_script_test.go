@@ -16,6 +16,9 @@ func TestInstallerMigratesRuntimeIdentity(t *testing.T) {
 	for _, required := range []string{
 		`-o bin/remote-agent ./cmd/remote-agent`,
 		`STATE_DIR="${RA_STATE_DIR:-/opt/private-tunnel/state/remote-agent}"`,
+		`LIBEXEC_DIR="${RA_LIBEXEC_DIR:-/opt/private-tunnel/libexec/remote-agent}"`,
+		`RUNTIME_BIN="$LIBEXEC_DIR/remote-agent"`,
+		`install -m 0755 "$REPO_REMOTE_AGENT/bin/remote-agent" "$RUNTIME_BIN.new"`,
 		`LEGACY_STATE_DIR="${RA_LEGACY_STATE_DIR:-/opt/private-tunnel/state/remote-coding}"`,
 		`mv "$LEGACY_STATE_DIR" "$STATE_DIR"`,
 		`ln -s "$STATE_DIR" "$LEGACY_STATE_DIR"`,
@@ -33,5 +36,8 @@ func TestInstallerMigratesRuntimeIdentity(t *testing.T) {
 	}
 	if strings.Contains(script, `echo "  remote-coding:"`) || strings.Contains(script, `-o bin/remote-coding`) {
 		t.Fatal("installer still registers or builds the legacy runtime identity")
+	}
+	if strings.Contains(script, `echo "      - $REPO_REMOTE_AGENT/bin/remote-agent"`) {
+		t.Fatal("installer still registers a Git checkout binary")
 	}
 }
