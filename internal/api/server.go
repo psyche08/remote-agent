@@ -33,7 +33,7 @@ type Server struct {
 	resumeMu        sync.Mutex
 	resumeInFlight  map[string]bool
 	sendMu          sync.Mutex
-	sendInFlight    map[string]bool
+	sendInFlight    map[string]string
 	streamMu        sync.Mutex
 	streamSubs      map[string]map[chan []byte]bool
 	presenceMu      sync.Mutex
@@ -84,7 +84,7 @@ func NewServer(cfg *config.Config, registry provider.Registry, store *state.Stor
 	}
 	s := &Server{
 		cfg: cfg, registry: registry, store: store, activeProvider: active,
-		resumeInFlight: map[string]bool{}, sendInFlight: map[string]bool{},
+		resumeInFlight: map[string]bool{}, sendInFlight: map[string]string{},
 		streamSubs: map[string]map[chan []byte]bool{}, presence: map[string]time.Time{},
 		pushLast: map[string]string{}, pushStop: make(chan struct{}), nativeCache: map[string]*nativeSessionCacheEntry{},
 		clients: map[string]*clientVersionSeen{}, pricing: pricing.New(store.DataDir()),
@@ -229,8 +229,10 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	if sidView != "" && s.isSendInFlight(providerID, sidView) {
-		stateValue = "delivering"
+	if sidView != "" {
+		if sendState := s.sendState(providerID, sidView); sendState != "" {
+			stateValue = sendState
+		}
 	}
 	var approvalRequest map[string]any
 	// Query the request itself even when DetectState raced an IPC update. A
@@ -508,38 +510,48 @@ func (s *Server) sendPrompt(w http.ResponseWriter, r *http.Request) {
 	s.activeSessionID = stringPtr(body.SessionID)
 	s.mu.Unlock()
 
+	deliveryState := "delivering"
+	if codexDesktopDeliveryRecord(session) {
+		deliveryState = "attaching"
+	}
 	task := newTaskRecord(s.cfg.DeviceID, body.SessionID, providerID, body.Prompt)
-	task["status"] = "sent"
+	if deliveryState == "attaching" {
+		task["status"] = "attaching"
+	} else {
+		task["status"] = "sent"
+	}
 	if err := s.store.AppendTask(task); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if !s.beginSend(providerID, body.SessionID) {
-		_, _, _ = s.store.UpdateTask(recordString(task, "task_id"), state.Record{
+	if !s.beginSend(providerID, body.SessionID, deliveryState) {
+		updatedTask, _, _ := s.store.UpdateTask(recordString(task, "task_id"), state.Record{
 			"status": "error",
 			"error":  "send already in progress",
 		})
+		s.publishTaskStream(providerID, body.SessionID, updatedTask)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"ok": false, "task_id": recordString(task, "task_id"), "session_id": body.SessionID,
-			"provider_id": providerID, "state": "delivering", "error": "send already in progress",
+			"provider_id": providerID, "state": firstNonEmpty(s.sendState(providerID, body.SessionID), deliveryState), "error": "send already in progress",
 		})
 		return
 	}
+	s.publishTaskStream(providerID, body.SessionID, task)
 	session["last_prompt"] = body.Prompt
 	// Accepted only means the background provider call has started. Do not
 	// expose the session as running until the provider returns a native turn id;
 	// otherwise the PWA presents Queue/Insert/Stop for a prompt that Desktop has
 	// not received yet.
-	session["state"] = "delivering"
+	session["state"] = deliveryState
 	session["updated_at"] = nowISO()
 	session["last_error"] = ""
 	_ = s.store.UpsertSession(session)
 	go s.finishSend(providerID, body.SessionID, body.Prompt, attachments, recordString(task, "task_id"), p)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "accepted": true, "task_id": recordString(task, "task_id"), "session_id": body.SessionID,
-		"provider_id": providerID, "state": "delivering", "native_session_id": recordString(session, "native_session_id"),
+		"provider_id": providerID, "state": deliveryState, "native_session_id": recordString(session, "native_session_id"),
 		"title": recordString(session, "title"), "cwd": recordString(session, "cwd"),
-		"result": provider.SendResult{OK: true, State: "delivering", Message: "prompt accepted"},
+		"result": provider.SendResult{OK: true, State: deliveryState, Message: "prompt accepted"},
 	})
 }
 
@@ -547,14 +559,14 @@ func sendKey(providerID string, sessionID string) string {
 	return providerID + "\x00" + sessionID
 }
 
-func (s *Server) beginSend(providerID string, sessionID string) bool {
+func (s *Server) beginSend(providerID string, sessionID string, stateValue string) bool {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	key := sendKey(providerID, sessionID)
-	if s.sendInFlight[key] {
+	if s.sendInFlight[key] != "" {
 		return false
 	}
-	s.sendInFlight[key] = true
+	s.sendInFlight[key] = stateValue
 	return true
 }
 
@@ -565,13 +577,16 @@ func (s *Server) endSend(providerID string, sessionID string) {
 }
 
 func (s *Server) isSendInFlight(providerID string, sessionID string) bool {
+	return s.sendState(providerID, sessionID) != ""
+}
+
+func (s *Server) sendState(providerID string, sessionID string) string {
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	return s.sendInFlight[sendKey(providerID, sessionID)]
 }
 
 func (s *Server) finishSend(providerID string, sessionID string, prompt string, attachments []provider.Attachment, taskID string, p provider.Provider) {
-	defer s.endSend(providerID, sessionID)
 	var result provider.SendResult
 	if len(attachments) > 0 {
 		if sender, ok := p.(provider.AttachmentSender); ok {
@@ -593,24 +608,25 @@ func (s *Server) finishSend(providerID string, sessionID string, prompt string, 
 	if result.Error != nil {
 		errText = *result.Error
 	}
-	_, _, _ = s.store.UpdateTask(taskID, state.Record{
+	updatedTask, _, _ := s.store.UpdateTask(taskID, state.Record{
 		"status":         status,
 		"native_task_id": result.NativeTaskID,
 		"error":          errText,
 	})
 	session, ok, err := s.findSessionForProviderAny(providerID, sessionID)
-	if err != nil || !ok {
-		return
+	if err == nil && ok {
+		session["last_prompt"] = prompt
+		session["state"] = stateValue
+		session["updated_at"] = nowISO()
+		if result.OK {
+			session["last_error"] = ""
+		} else {
+			session["last_error"] = firstNonEmpty(errText, "send failed")
+		}
+		_ = s.store.UpsertSession(session)
 	}
-	session["last_prompt"] = prompt
-	session["state"] = stateValue
-	session["updated_at"] = nowISO()
-	if result.OK {
-		session["last_error"] = ""
-	} else {
-		session["last_error"] = firstNonEmpty(errText, "send failed")
-	}
-	_ = s.store.UpsertSession(session)
+	s.endSend(providerID, sessionID)
+	s.publishTaskStream(providerID, sessionID, updatedTask)
 }
 
 type rewindUserMessageIn struct {
@@ -1448,7 +1464,7 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request) {
 func (s *Server) reconcileTaskRecords(records []state.Record) {
 	for _, rec := range records {
 		status := recordString(rec, "status")
-		if status != "running" && status != "sent" && status != "waiting_approval" && status != "waiting_input" {
+		if status != "running" && status != "sent" && status != "attaching" && status != "waiting_approval" && status != "waiting_input" {
 			continue
 		}
 		providerID := canonicalProviderID(recordString(rec, "provider_id"))
@@ -1488,7 +1504,8 @@ func (s *Server) reconcileTaskRecords(records []state.Record) {
 		}
 		if newStatus != status {
 			rec["status"] = newStatus
-			_, _, _ = s.store.UpdateTask(recordString(rec, "task_id"), state.Record{"status": newStatus})
+			updatedTask, _, _ := s.store.UpdateTask(recordString(rec, "task_id"), state.Record{"status": newStatus})
+			s.publishTaskStream(providerID, sessionID, updatedTask)
 		}
 	}
 }
@@ -1798,6 +1815,38 @@ func (s *Server) publishProviderStream(providerID string, target string, frame m
 		}
 	}
 	s.streamMu.Unlock()
+}
+
+// publishTaskStream emits only delivery metadata, never the prompt body. A
+// Desktop-backed Codex tab may subscribe by either its logical session id or
+// native transcript id, so fan the same lifecycle update out to both aliases.
+func (s *Server) publishTaskStream(providerID string, sessionID string, task state.Record) {
+	if task == nil {
+		return
+	}
+	frame := map[string]any{
+		"type": "task",
+		"task": map[string]any{
+			"task_id":        recordString(task, "task_id"),
+			"session_id":     recordString(task, "session_id"),
+			"provider_id":    canonicalProviderID(recordString(task, "provider_id")),
+			"status":         recordString(task, "status"),
+			"native_task_id": task["native_task_id"],
+			"error":          recordString(task, "error"),
+			"updated_at":     recordString(task, "updated_at"),
+		},
+	}
+	targets := map[string]bool{sessionID: true}
+	if session, ok, err := s.findSessionForProviderAny(providerID, sessionID); err == nil && ok {
+		for _, field := range []string{"session_id", "native_session_id", "transcript_id"} {
+			if target := recordString(session, field); target != "" {
+				targets[target] = true
+			}
+		}
+	}
+	for target := range targets {
+		s.publishProviderStream(providerID, target, frame)
+	}
 }
 
 func (s *Server) subscribeStream(providerID string, sessionID string) chan []byte {

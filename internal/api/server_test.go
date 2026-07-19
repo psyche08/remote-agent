@@ -383,6 +383,122 @@ func TestSendPromptReturnsBeforeProviderDelivery(t *testing.T) {
 	t.Fatalf("task was not completed by background send: %#v", tasks)
 }
 
+func TestDesktopSendAttachesInBackgroundAndStreamsResult(t *testing.T) {
+	ownerErr := "codex thread has no active Desktop IPC owner; reattach the thread in Codex Desktop"
+	tests := []struct {
+		name       string
+		result     provider.SendResult
+		wantStatus string
+	}{
+		{
+			name:       "owner attaches",
+			result:     provider.SendResult{OK: true, State: "running", NativeTaskID: "turn-1"},
+			wantStatus: "running",
+		},
+		{
+			name:       "owner attach times out",
+			result:     provider.SendResult{OK: false, State: "error", Error: &ownerErr},
+			wantStatus: "error",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			st := state.New(filepath.Join(dir, "data"))
+			if err := st.SaveSessions([]state.Record{{
+				"session_id": "logical-1", "provider_id": "codex", "title": "Desktop",
+				"native_session_id": "thread-1", "transcript_id": "thread-1", "delivery_route": "desktop_ipc",
+			}}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
+			config.ApplyDefaults(cfg)
+			fp := &blockingSendProvider{
+				started: make(chan struct{}, 1),
+				release: make(chan struct{}),
+				result:  tc.result,
+			}
+			released := false
+			defer func() {
+				if !released {
+					close(fp.release)
+				}
+			}()
+			srv := NewServer(cfg, provider.Registry{"codex": fp}, st)
+			// The PWA subscribes native Codex previews by transcript id, not by
+			// the logical remote-agent session id.
+			stream := srv.subscribeStream("codex", "thread-1")
+			defer srv.unsubscribeStream("codex", "thread-1", stream)
+
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(`{"provider_id":"codex","session_id":"logical-1","prompt":"wait for desktop"}`))
+			start := time.Now()
+			srv.Handler().ServeHTTP(rr, req)
+			if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+				t.Fatalf("send_prompt waited for Desktop owner: %s", elapsed)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if rr.Code != http.StatusOK || body["accepted"] != true || body["state"] != "attaching" {
+				t.Fatalf("status=%d body=%#v", rr.Code, body)
+			}
+			attaching := readTaskStreamStatus(t, stream, "attaching")
+			if _, leaked := attaching["prompt"]; leaked {
+				t.Fatalf("task stream leaked prompt: %#v", attaching)
+			}
+			select {
+			case <-fp.started:
+			case <-time.After(time.Second):
+				t.Fatal("background Desktop delivery did not start")
+			}
+			// Model an owner attach that is much slower than the HTTP response.
+			time.Sleep(350 * time.Millisecond)
+			if got := srv.sendState("codex", "logical-1"); got != "attaching" {
+				t.Fatalf("in-flight state=%q, want attaching", got)
+			}
+			tasks, err := st.Tasks()
+			if err != nil || len(tasks) != 1 || recordString(tasks[0], "status") != "attaching" {
+				t.Fatalf("tasks=%#v err=%v", tasks, err)
+			}
+
+			close(fp.release)
+			released = true
+			finalTask := readTaskStreamStatus(t, stream, tc.wantStatus)
+			if tc.wantStatus == "error" && finalTask["error"] != ownerErr {
+				t.Fatalf("error task=%#v", finalTask)
+			}
+			if got := srv.sendState("codex", "logical-1"); got != "" {
+				t.Fatalf("send remained in flight after final event: %q", got)
+			}
+		})
+	}
+}
+
+func readTaskStreamStatus(t *testing.T, stream <-chan []byte, wantStatus string) map[string]any {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case payload := <-stream:
+			var frame map[string]any
+			if err := json.Unmarshal(payload, &frame); err != nil {
+				t.Fatal(err)
+			}
+			if frame["type"] != "task" {
+				continue
+			}
+			task, _ := frame["task"].(map[string]any)
+			if task["status"] == wantStatus {
+				return task
+			}
+		case <-deadline:
+			t.Fatalf("no task WebSocket event with status %q", wantStatus)
+		}
+	}
+}
+
 func TestSendPromptDirectlyBindsNativeCodexSession(t *testing.T) {
 	const threadID = "019f608d-a673-7e70-b276-4734639df599"
 	dir := t.TempDir()

@@ -38,6 +38,7 @@
     .dot.on { background:var(--ok); }
     .badge { display:inline-block; padding:3px 9px; border-radius:20px; font-size:11.5px; font-weight:600; letter-spacing:.02em; background:var(--line); }
     .s-idle{background:#2a2a31;color:#c7c7cf;} .s-running{background:#1d3a63;color:#bcd8ff;}
+    .s-attaching{background:#3f3517;color:#ffe08a;} .s-delivering{background:#243851;color:#bcd8ff;}
     .s-completed{background:#16432f;color:#9ef0c6;} .s-error{background:#5a1d1d;color:#ffc7c7;}
     .s-stale{background:#4d3f18;color:#f3d79a;} .s-needs_manual{background:#5a3618;color:#f6c79a;}
     .s-waiting_approval{background:#4a1842;color:#f3b8e6;}
@@ -1092,7 +1093,8 @@
         // in-turn input: the composer stays usable while a turn runs. Track the
         // active tab's running state -> the composer shows 排队/插入/停止; when the
         // turn ends, auto-send any queued prompt.
-        const delivering = s.state === "delivering";
+        const attaching = s.state === "attaching";
+        const delivering = attaching || s.state === "delivering";
         const busy = (s.state === "running" || s.state === "waiting_approval" || s.state === "waiting_input");
         if (s.state === "error" && s.last_error && (LIVE || !asid)) {
           const out = $("send-out");
@@ -1101,6 +1103,7 @@
         if (LIVE) {
           const tab = LIVE;
           tab._delivering = delivering;
+          tab._attaching = attaching;
           tab._running = busy;
           if (!busy && tab.queued && !tab._sendingQueued) {
             const q = tab.queued; tab.queued = null; tab._sendingQueued = true; persistTabs();
@@ -2990,6 +2993,12 @@
       const deadline = Date.now() + timeoutMs;
       let last = null;
       while (Date.now() < deadline) {
+        const streamed = TASK_EVENTS.get(taskId);
+        if (streamed) {
+          last = streamed;
+          const status = String(streamed.status || "");
+          if (status === "error" || status === "running" || status === "completed") return streamed;
+        }
         const body = await (await apiForTab(tab, "/tasks?task_id=" + encodeURIComponent(taskId))).json();
         const task = (body.tasks || [])[0] || null;
         if (task) {
@@ -3117,11 +3126,14 @@
         }
         if (r.accepted && r.task_id) {
           const deliveryName = providerIsCodex(prov) ? "Codex Desktop" : "agent";
-          if (tab) { tab._delivering = true; if (active) renderComposer(); }
-          if (active || !tab) $("send-out").textContent = `已接收，等待 ${deliveryName} 确认…`;
+          const attaching = r.state === "attaching";
+          if (tab) { tab._deliveryTaskID = r.task_id; tab._delivering = true; tab._attaching = attaching; if (active) renderComposer(); }
+          if (active || !tab) $("send-out").textContent = attaching
+            ? "已接收，正在打开 thread 并等待 Codex Desktop owner…"
+            : `已接收，等待 ${deliveryName} 确认…`;
           const task = await waitTaskDelivery(tab, r.task_id);
           if (task && task.status === "error") {
-            if (tab) { tab._delivering = false; if (active) renderComposer(); }
+            if (tab) { tab._deliveryTaskID = null; tab._delivering = false; tab._attaching = false; if (active) renderComposer(); }
             if (active || !tab) {
               $("send-out").textContent = "error: " + taskFailureText(task);
               refreshStatus();
@@ -3129,7 +3141,7 @@
             return false;
           }
           if (task && (task.status === "running" || task.status === "completed")) {
-            if (tab) { tab._delivering = false; tab._running = task.status === "running"; if (active) renderComposer(); }
+            if (tab) { tab._deliveryTaskID = null; tab._delivering = false; tab._attaching = false; tab._running = task.status === "running"; if (active) renderComposer(); }
             clearSentUploads(tab, attachmentIDs);
             if (active || !tab) {
               $("send-out").textContent = "sent — 输出在下方流式显示";
@@ -3233,7 +3245,7 @@
       }
       if (delivering) {
         show("send-btn", true); show("queue-btn", false); show("insert-btn", false); show("stop-btn", false);
-        if (sb) { sb.textContent = "投递中…"; sb.disabled = true; }
+        if (sb) { sb.textContent = (LIVE && LIVE._attaching) ? "连接 Desktop…" : "投递中…"; sb.disabled = true; }
         if (pr) { pr.disabled = false; pr.placeholder = PROMPT_PH; }
         return;
       }
@@ -3375,6 +3387,12 @@
      * turn:completed -> clear the bubble (next poll renders the canonical msg).
      */
     let WS = null, WS_BACKOFF = 1000;
+    const TASK_EVENTS = new Map();
+    function rememberTaskEvent(task) {
+      if (!task || !task.task_id) return;
+      TASK_EVENTS.set(task.task_id, task);
+      if (TASK_EVENTS.size > 100) TASK_EVENTS.delete(TASK_EVENTS.keys().next().value);
+    }
     function wsUrl(tab) {
       if (!tab) return null;
       const streamId = tab.tid || tab.sessionId || tab.resumeId;
@@ -3411,6 +3429,30 @@
     function onStreamFrame(f, tab, ws) {
       if (!f || WS !== ws || !isActiveTab(tab)) return;
       if (f.type === "ping" || f.type === "hello") return;
+      if (f.type === "task" && f.task) {
+        const task = f.task, status = String(task.status || "");
+        rememberTaskEvent(task);
+        // Reconciliation can publish completion for an older task on the same
+        // session. Cache it for waitTaskDelivery, but only let the currently
+        // submitted task drive the composer and status text.
+        if (tab._deliveryTaskID !== task.task_id) return;
+        if (status === "attaching" || status === "sent") {
+          tab._delivering = true;
+          tab._attaching = status === "attaching";
+          $("send-out").textContent = status === "attaching"
+            ? "已接收，正在打开 thread 并等待 Codex Desktop owner…"
+            : "已接收，等待 agent 确认…";
+        } else if (status === "running" || status === "completed") {
+          tab._deliveryTaskID = null; tab._delivering = false; tab._attaching = false; tab._running = status === "running";
+          $("send-out").textContent = "sent — 输出在下方流式显示";
+        } else if (status === "error") {
+          tab._deliveryTaskID = null; tab._delivering = false; tab._attaching = false;
+          $("send-out").textContent = "error: " + taskFailureText(task);
+        }
+        renderComposer();
+        if (status === "running" || status === "completed" || status === "error") refreshStatus();
+        return;
+      }
       if (f.type === "approval_changed") {
         refreshStatus();
         return;
@@ -3473,7 +3515,7 @@
         if (!tab || !sid || !prov) { window.__taskId = null; return; }
         const q = `?provider_id=${encodeURIComponent(prov)}&session_id=${encodeURIComponent(sid)}`;
         const d = await (await apiForTab(tab, "/tasks" + q)).json();
-        const a = ["queued","sent","running","waiting_approval","waiting_input"];
+        const a = ["queued","sent","attaching","running","waiting_approval","waiting_input"];
         const f = d.tasks.slice().reverse().find(t => a.includes(t.status) &&
           t.session_id === sid && t.provider_id === prov);
         window.__taskId = f ? f.task_id : null;
