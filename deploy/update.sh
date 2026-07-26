@@ -87,16 +87,30 @@ cleanup_legacy_watchdog
 cleanup_legacy_claude_wrapper
 
 if [ -x "$SUPERVISOR" ]; then
-  "$SUPERVISOR" reload-config >/dev/null 2>&1 || true
-  if "$SUPERVISOR" restart remote-agent || "$SUPERVISOR" start remote-agent; then
+  # This is a binary-only update. Reloading the global supervisor config can
+  # perturb unrelated services and is unnecessary because the active service
+  # definition has not changed.
+  CURRENT_DROPIN="$ETC_DIR/services.d/remote-agent.yaml"
+  LEGACY_DROPIN="$ETC_DIR/services.d/remote-coding.yaml"
+  if [ -f "$CURRENT_DROPIN" ]; then
+    if ! "$SUPERVISOR" restart remote-agent; then
+      echo "failed to restart configured remote-agent service" >&2
+      exit 1
+    fi
     "$SUPERVISOR" restart remote-agent-log-upload >/dev/null 2>&1 || true
     echo "==> supervisor restarted remote-agent"
-  else
+  elif [ -f "$LEGACY_DROPIN" ]; then
     # A release may reach a device just before its installer migration. Keep
-    # that device available; the installer will rename the service/drop-in.
-    "$SUPERVISOR" restart remote-coding || "$SUPERVISOR" start remote-coding || true
+    # that device available through the configured old service identity.
+    if ! "$SUPERVISOR" restart remote-coding; then
+      echo "failed to restart configured legacy remote-coding service" >&2
+      exit 1
+    fi
     "$SUPERVISOR" restart remote-coding-log-upload >/dev/null 2>&1 || true
     echo "==> supervisor restarted legacy remote-coding; run deploy/install.sh to finish identity migration"
+  else
+    echo "no configured remote-agent or legacy remote-coding service drop-in" >&2
+    exit 1
   fi
 else
   echo "==> supervisor not found at $SUPERVISOR; restart remote-agent manually" >&2

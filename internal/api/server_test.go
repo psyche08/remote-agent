@@ -123,11 +123,21 @@ type directCodexProvider struct {
 	fakePushProvider
 	boundSession    string
 	boundTranscript string
+	boundRoute      string
+	boundCwd        string
 	desktopBound    bool
+	nativeRoute     string
+	appServerRoute  string
 	sentSession     chan string
 }
 
 func (f *directCodexProvider) ID() string { return "codex" }
+func (f *directCodexProvider) NativeDeliveryRoute() string {
+	return firstNonEmpty(f.nativeRoute, "shared_daemon")
+}
+func (f *directCodexProvider) AppServerDeliveryRoute() string {
+	return firstNonEmpty(f.appServerRoute, "shared_daemon")
+}
 func (f *directCodexProvider) BindTranscript(sessionID string, transcriptID string) {
 	f.boundSession, f.boundTranscript = sessionID, transcriptID
 }
@@ -135,9 +145,52 @@ func (f *directCodexProvider) BindDesktopTranscript(sessionID string, transcript
 	f.desktopBound = true
 	f.BindTranscript(sessionID, transcriptID)
 }
+func (f *directCodexProvider) BindSessionRoute(sessionID string, transcriptID string, route string, cwd string) {
+	f.boundSession, f.boundTranscript = sessionID, transcriptID
+	f.boundRoute, f.boundCwd = route, cwd
+	f.desktopBound = route == "desktop_ipc"
+}
 func (f *directCodexProvider) SendPrompt(sessionID string, _ string) provider.SendResult {
 	f.sentSession <- sessionID
 	return provider.SendResult{OK: true, State: "running", NativeTaskID: "turn-1"}
+}
+
+type createCodexProvider struct {
+	directCodexProvider
+	nativeID string
+}
+
+func (f *createCodexProvider) OpenOrCreateSession(string, provider.StartOptions) (string, error) {
+	return f.nativeID, nil
+}
+
+type resumeCodexProvider struct {
+	directCodexProvider
+	resumeSession string
+	resumeID      string
+	resumeCwd     string
+	resumeFork    bool
+}
+
+func (f *resumeCodexProvider) OpenResumeSession(sessionID string, resumeID string, cwd string, fork bool) (string, error) {
+	f.resumeSession, f.resumeID, f.resumeCwd, f.resumeFork = sessionID, resumeID, cwd, fork
+	return resumeID, nil
+}
+
+type desktopOnlyCodexProvider struct {
+	fakePushProvider
+	boundSession    string
+	boundTranscript string
+	desktopBound    bool
+}
+
+func (f *desktopOnlyCodexProvider) ID() string { return "codex" }
+func (f *desktopOnlyCodexProvider) BindTranscript(sessionID string, transcriptID string) {
+	f.boundSession, f.boundTranscript = sessionID, transcriptID
+}
+func (f *desktopOnlyCodexProvider) BindDesktopTranscript(sessionID string, transcriptID string) {
+	f.desktopBound = true
+	f.BindTranscript(sessionID, transcriptID)
 }
 
 type attachmentSendProvider struct {
@@ -655,11 +708,16 @@ func TestSendPromptDirectlyBindsNativeCodexSession(t *testing.T) {
 	if fp.boundSession != logicalID || fp.boundTranscript != threadID {
 		t.Fatalf("binding=(%q,%q), want (%q,%q)", fp.boundSession, fp.boundTranscript, logicalID, threadID)
 	}
-	if !fp.desktopBound {
-		t.Fatal("native Codex preview was not marked for Desktop IPC delivery")
+	if fp.boundRoute != "shared_daemon" || fp.boundCwd != "/tmp/project" {
+		t.Fatalf("route binding=(%q,%q), want shared daemon cwd", fp.boundRoute, fp.boundCwd)
+	}
+	if fp.desktopBound {
+		t.Fatal("native Codex preview unexpectedly used Desktop IPC")
 	}
 	rec, found, err := srv.findSessionForProviderAny("codex", logicalID)
-	if err != nil || !found || recordString(rec, "transcript_id") != threadID || recordString(rec, "delivery_route") != "desktop_ipc" {
+	if err != nil || !found || recordString(rec, "transcript_id") != threadID ||
+		recordString(rec, "delivery_route") != "desktop_ipc" ||
+		recordString(rec, "codex_control_route") != "shared_daemon" {
 		t.Fatalf("persisted session=%#v found=%v err=%v", rec, found, err)
 	}
 
@@ -678,8 +736,8 @@ func TestSendPromptDirectlyBindsNativeCodexSession(t *testing.T) {
 	if stringAny(body["session_id"]) != logicalID {
 		t.Fatalf("repeat send session=%q want=%q", stringAny(body["session_id"]), logicalID)
 	}
-	if !fp.desktopBound {
-		t.Fatal("reopened native preview lost its Desktop IPC route")
+	if fp.desktopBound {
+		t.Fatal("reopened native preview unexpectedly changed to Desktop IPC")
 	}
 	select {
 	case sentID := <-fp.sentSession:
@@ -698,53 +756,138 @@ func TestSendPromptDirectlyBindsNativeCodexSession(t *testing.T) {
 	}
 }
 
-func TestSendPromptNativePreviewUpgradesExistingCodexRouteToDesktop(t *testing.T) {
-	const threadID = "019f6366-d641-7dd1-bc61-7ba28455d147"
-	dir := t.TempDir()
-	st := state.New(filepath.Join(dir, "data"))
-	existing := state.Record{
-		"session_id": "logical-app-server", "provider_id": "codex", "title": "Existing",
-		"native_session_id": threadID, "transcript_id": threadID, "state": "idle",
+func TestSendPromptNativePreviewPreservesExistingAppServerOwner(t *testing.T) {
+	tests := []struct {
+		name         string
+		appRoute     string
+		nativeRoute  string
+		wantRoute    string
+		wantDelivery string
+	}{
+		{name: "shared daemon", wantRoute: "shared_daemon", wantDelivery: "desktop_ipc"},
+		{name: "legacy stdio", appRoute: "stdio", nativeRoute: "desktop_ipc", wantRoute: "stdio"},
 	}
-	if err := st.UpsertSession(existing); err != nil {
-		t.Fatal(err)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const threadID = "019f6366-d641-7dd1-bc61-7ba28455d147"
+			st := state.New(filepath.Join(t.TempDir(), "data"))
+			existing := state.Record{
+				"session_id": "logical-app-server", "provider_id": "codex", "title": "Existing",
+				"native_session_id": threadID, "transcript_id": threadID, "state": "idle",
+			}
+			if err := st.UpsertSession(existing); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
+			config.ApplyDefaults(cfg)
+			fp := &directCodexProvider{
+				fakePushProvider: fakePushProvider{native: []map[string]any{{
+					"native_session_id": threadID, "cli_session_id": threadID, "title": "Existing",
+				}}},
+				appServerRoute: tc.appRoute,
+				nativeRoute:    tc.nativeRoute,
+				sentSession:    make(chan string, 1),
+			}
+			srv := NewServer(cfg, provider.Registry{"codex": fp}, st)
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(`{"provider_id":"codex","session_id":"`+threadID+`","prompt":"direct"}`))
+			srv.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			select {
+			case sentID := <-fp.sentSession:
+				if sentID != "logical-app-server" {
+					t.Fatalf("provider session=%q", sentID)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("native preview send was not delivered")
+			}
+			if fp.desktopBound || fp.boundRoute != tc.wantRoute {
+				t.Fatalf("native preview owner route=%q desktop=%v", fp.boundRoute, fp.desktopBound)
+			}
+			rec, found, err := srv.findSessionForProviderAny("codex", "logical-app-server")
+			if err != nil || !found || recordString(rec, "delivery_route") != tc.wantDelivery ||
+				recordString(rec, "codex_control_route") != tc.wantRoute {
+				t.Fatalf("record=%#v found=%v err=%v", rec, found, err)
+			}
+			deadline := time.Now().Add(time.Second)
+			for srv.isSendInFlight("codex", "logical-app-server") && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if srv.isSendInFlight("codex", "logical-app-server") {
+				t.Fatal("native preview send did not finish")
+			}
+		})
 	}
-	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
-	config.ApplyDefaults(cfg)
-	fp := &directCodexProvider{
-		fakePushProvider: fakePushProvider{native: []map[string]any{{
-			"native_session_id": threadID, "cli_session_id": threadID, "title": "Existing",
-		}}},
-		sentSession: make(chan string, 1),
+}
+
+func TestSendPromptPersistsLegacyDesktopControlRouteBeforeDelivery(t *testing.T) {
+	tests := []struct {
+		name        string
+		nativeRoute string
+		wantRoute   string
+		wantState   string
+		wantDesktop bool
+	}{
+		{name: "migrates to shared daemon", wantRoute: "shared_daemon", wantState: "delivering"},
+		{name: "keeps explicit Desktop compatibility", nativeRoute: "desktop_ipc", wantRoute: "desktop_ipc", wantState: "attaching", wantDesktop: true},
 	}
-	srv := NewServer(cfg, provider.Registry{"codex": fp}, st)
-	rr := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(`{"provider_id":"codex","session_id":"`+threadID+`","prompt":"direct"}`))
-	srv.Handler().ServeHTTP(rr, req)
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
-	select {
-	case sentID := <-fp.sentSession:
-		if sentID != "logical-app-server" {
-			t.Fatalf("provider session=%q", sentID)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("native preview send was not delivered")
-	}
-	if !fp.desktopBound {
-		t.Fatal("existing native preview was not upgraded to Desktop IPC")
-	}
-	rec, found, err := srv.findSessionForProviderAny("codex", "logical-app-server")
-	if err != nil || !found || recordString(rec, "delivery_route") != "desktop_ipc" {
-		t.Fatalf("record=%#v found=%v err=%v", rec, found, err)
-	}
-	deadline := time.Now().Add(time.Second)
-	for srv.isSendInFlight("codex", "logical-app-server") && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	if srv.isSendInFlight("codex", "logical-app-server") {
-		t.Fatal("native preview send did not finish")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const threadID = "019f6366-d641-7dd1-bc61-7ba28455d148"
+			st := state.New(filepath.Join(t.TempDir(), "data"))
+			if err := st.UpsertSession(state.Record{
+				"session_id": "legacy-logical", "provider_id": "codex", "title": "Legacy native",
+				"native_session_id": threadID, "transcript_id": threadID,
+				"delivery_route": "desktop_ipc", "state": "idle",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
+			config.ApplyDefaults(cfg)
+			fp := &directCodexProvider{nativeRoute: tc.nativeRoute, sentSession: make(chan string, 1)}
+			srv := NewServer(cfg, provider.Registry{"codex": fp}, st)
+
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(
+				`{"provider_id":"codex","session_id":"legacy-logical","prompt":"direct"}`,
+			))
+			srv.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if stringAny(body["state"]) != tc.wantState {
+				t.Fatalf("delivery state=%#v, want %q", body, tc.wantState)
+			}
+			select {
+			case sentID := <-fp.sentSession:
+				if sentID != "legacy-logical" {
+					t.Fatalf("provider session=%q", sentID)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("legacy session prompt was not delivered")
+			}
+			rec, found, err := srv.findSessionForProviderAny("codex", "legacy-logical")
+			if err != nil || !found || recordString(rec, "delivery_route") != "desktop_ipc" ||
+				recordString(rec, "codex_control_route") != tc.wantRoute {
+				t.Fatalf("record=%#v found=%v err=%v", rec, found, err)
+			}
+			if fp.desktopBound != tc.wantDesktop || fp.boundRoute != tc.wantRoute {
+				t.Fatalf("provider route=%q desktop=%v", fp.boundRoute, fp.desktopBound)
+			}
+			deadline := time.Now().Add(time.Second)
+			for srv.isSendInFlight("codex", "legacy-logical") && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+			if srv.isSendInFlight("codex", "legacy-logical") {
+				t.Fatal("legacy session send did not finish")
+			}
+		})
 	}
 }
 
@@ -1381,6 +1524,179 @@ func TestCreateAndCloseSession(t *testing.T) {
 	}
 }
 
+func TestCreateCodexSessionPersistsConcreteOwnerRoute(t *testing.T) {
+	tests := []struct {
+		name         string
+		route        string
+		wantDelivery string
+	}{
+		{name: "shared daemon", route: "shared_daemon", wantDelivery: "desktop_ipc"},
+		{name: "legacy stdio", route: "stdio", wantDelivery: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const threadID = "019f608d-a673-7e70-b276-4734639df590"
+			st := state.New(filepath.Join(t.TempDir(), "data"))
+			cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
+			config.ApplyDefaults(cfg)
+			fp := &createCodexProvider{
+				directCodexProvider: directCodexProvider{
+					fakePushProvider: fakePushProvider{id: "codex"},
+					appServerRoute:   tc.route,
+					sentSession:      make(chan string, 1),
+				},
+				nativeID: threadID,
+			}
+			srv := NewServer(cfg, provider.Registry{"codex": fp}, st)
+
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(`{"provider_id":"codex","title":"route test","cwd":"/tmp"}`))
+			srv.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			session, ok := body["session"].(map[string]any)
+			if !ok {
+				t.Fatalf("response session has unexpected type: %#v", body["session"])
+			}
+			if recordString(session, "codex_control_route") != tc.route ||
+				recordString(session, "delivery_route") != tc.wantDelivery {
+				t.Fatalf("response session=%#v", session)
+			}
+			if fp.boundRoute != tc.route || fp.boundTranscript != threadID {
+				t.Fatalf("provider binding route=%q transcript=%q", fp.boundRoute, fp.boundTranscript)
+			}
+			records, err := st.Sessions()
+			if err != nil || len(records) != 1 {
+				t.Fatalf("records=%#v err=%v", records, err)
+			}
+			if recordString(records[0], "codex_control_route") != tc.route ||
+				recordString(records[0], "delivery_route") != tc.wantDelivery {
+				t.Fatalf("stored session=%#v", records[0])
+			}
+		})
+	}
+}
+
+func TestExplicitDesktopControlRouteBindsWithoutLegacyMarker(t *testing.T) {
+	fp := &desktopOnlyCodexProvider{fakePushProvider: fakePushProvider{id: "codex"}}
+	rec := state.Record{
+		"provider_id":         "codex",
+		"codex_control_route": "desktop_ipc",
+	}
+	bindSessionTranscript(fp, rec, "logical", "thread")
+	if !fp.desktopBound || fp.boundSession != "logical" || fp.boundTranscript != "thread" {
+		t.Fatalf("explicit Desktop route was not authoritative: %#v", fp)
+	}
+}
+
+func TestResumeNativeCodexSelectsConcreteStdioOwner(t *testing.T) {
+	tests := []struct {
+		name           string
+		persistedRoute string
+	}{
+		{name: "preserves persisted stdio owner", persistedRoute: "stdio"},
+		{name: "migrates route-less app-server owner", persistedRoute: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			const threadID = "019f608d-a673-7e70-b276-4734639df591"
+			st := state.New(filepath.Join(t.TempDir(), "data"))
+			record := state.Record{
+				"session_id":        "logical-stdio",
+				"provider_id":       "codex",
+				"native_session_id": threadID,
+				"transcript_id":     threadID,
+				"cwd":               "/repo",
+			}
+			if tc.persistedRoute != "" {
+				record["codex_control_route"] = tc.persistedRoute
+			}
+			if err := st.UpsertSession(record); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
+			config.ApplyDefaults(cfg)
+			fp := &resumeCodexProvider{directCodexProvider: directCodexProvider{
+				fakePushProvider: fakePushProvider{id: "codex", native: []map[string]any{{
+					"native_session_id": threadID,
+					"cli_session_id":    threadID,
+					"title":             "stdio thread",
+					"cwd":               "/repo",
+				}}},
+				appServerRoute: "stdio",
+				nativeRoute:    "desktop_ipc",
+				sentSession:    make(chan string, 1),
+			}}
+			srv := NewServer(cfg, provider.Registry{"codex": fp}, st)
+
+			rr := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/resume_native_session", strings.NewReader(
+				`{"provider_id":"codex","native_session_id":"`+threadID+`"}`,
+			))
+			srv.Handler().ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			var body map[string]any
+			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if body["ok"] != true || fp.resumeSession != "logical-stdio" || fp.resumeID != threadID ||
+				fp.boundRoute != "stdio" {
+				t.Fatalf("response=%#v provider=%#v", body, fp)
+			}
+			rec, found, err := srv.findSessionForProviderAny("codex", "logical-stdio")
+			if err != nil || !found || recordString(rec, "codex_control_route") != "stdio" ||
+				recordString(rec, "delivery_route") != "" {
+				t.Fatalf("stored session=%#v found=%v err=%v", rec, found, err)
+			}
+		})
+	}
+}
+
+func TestResumeNativeCodexFailsClosedWhenPersistedOwnerCannotBeRead(t *testing.T) {
+	const threadID = "019f608d-a673-7e70-b276-4734639df592"
+	dataDir := filepath.Join(t.TempDir(), "data")
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "sessions.json"), []byte("{not-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := state.New(dataDir)
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &resumeCodexProvider{directCodexProvider: directCodexProvider{
+		fakePushProvider: fakePushProvider{id: "codex", native: []map[string]any{{
+			"native_session_id": threadID,
+			"cli_session_id":    threadID,
+			"title":             "unreadable owner",
+			"cwd":               "/repo",
+		}}},
+		appServerRoute: "shared_daemon",
+		nativeRoute:    "shared_daemon",
+		sentSession:    make(chan string, 1),
+	}}
+	srv := NewServer(cfg, provider.Registry{"codex": fp}, st)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/resume_native_session", strings.NewReader(
+		`{"provider_id":"codex","native_session_id":"`+threadID+`"}`,
+	))
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if fp.resumeSession != "" || fp.resumeID != "" || fp.boundRoute != "" {
+		t.Fatalf("unreadable owner reached provider: %#v", fp)
+	}
+}
+
 func TestBrowseDirsAndProjectFile(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, "repo")
@@ -1427,6 +1743,7 @@ func TestRewindUserMessageCreatesDrivingSession(t *testing.T) {
 	if err := st.SaveSessions([]state.Record{{
 		"session_id": "old-logical", "provider_id": "codex", "title": "Inspect",
 		"cwd": "/repo", "native_session_id": "thread-1", "transcript_id": "thread-1",
+		"delivery_route": "desktop_ipc", "codex_control_route": "shared_daemon",
 	}}); err != nil {
 		t.Fatal(err)
 	}
@@ -1462,7 +1779,10 @@ func TestRewindUserMessageCreatesDrivingSession(t *testing.T) {
 			break
 		}
 	}
-	if created == nil || recordString(created, "transcript_id") != "thread-1" || recordString(created, "last_prompt") != "edited" {
+	if created == nil || recordString(created, "transcript_id") != "thread-1" ||
+		recordString(created, "last_prompt") != "edited" ||
+		recordString(created, "codex_control_route") != "shared_daemon" ||
+		recordString(created, "delivery_route") != "desktop_ipc" {
 		t.Fatalf("rewind session not stored: body=%#v records=%#v", body, records)
 	}
 }
@@ -1759,6 +2079,9 @@ type fakeRewindProvider struct {
 }
 
 func (f *fakeRewindProvider) ID() string { return "codex" }
+func (f *fakeRewindProvider) AppServerDeliveryRoute() string {
+	return "shared_daemon"
+}
 
 func (f *fakeRewindProvider) RewindUserMessage(opts provider.RewindUserMessageOptions) (provider.RewindUserMessageResult, error) {
 	f.opts = opts

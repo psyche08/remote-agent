@@ -439,7 +439,7 @@ func TestCodexPreviewBindRefreshesPreexistingDesktopApproval(t *testing.T) {
 		}))
 		refreshed <- struct{}{}
 	}
-	c.BindTranscript("sess-preview", approvalThreadA)
+	c.BindDesktopTranscript("sess-preview", approvalThreadA)
 	select {
 	case <-refreshed:
 	case <-time.After(time.Second):
@@ -460,7 +460,7 @@ func TestCodexDesktopApprovalDecisionRouting(t *testing.T) {
 	c := testCodexWithClient(t, fc)
 	desktop := &fakeDesktopClient{}
 	c.desktopFactory = func() codexDesktopClient { return desktop }
-	c.BindTranscript("sess-a", approvalThreadA)
+	c.BindDesktopTranscript("sess-a", approvalThreadA)
 
 	b := newCodexDesktopBridge("", "local")
 	c.bridge = b
@@ -518,9 +518,44 @@ func TestCodexDesktopApprovalDecisionRouting(t *testing.T) {
 	}
 }
 
+func TestCodexApprovalVisibilityFollowsBoundOwnerRoute(t *testing.T) {
+	c := testCodexWithClient(t, newFakeCodexClient())
+	c.BindSessionRoute("shared", approvalThreadA, "shared_daemon", "/repo")
+	c.BindDesktopTranscript("desktop", approvalThreadB)
+	c.onServerRequest(float64(71), "item/commandExecution/requestApproval", commandApprovalParams(approvalThreadA, nil))
+	c.onServerRequest(float64(72), "item/commandExecution/requestApproval", commandApprovalParams(approvalThreadB, nil))
+
+	b := newCodexDesktopBridge("", "local")
+	c.bridge = b
+	b.HandleBroadcast(bridgeSnapshotFrame(approvalThreadA, "owner-a", 1, map[string]any{
+		"id": approvalThreadA,
+		"requests": []any{map[string]any{
+			"id": float64(73), "method": "item/commandExecution/requestApproval",
+			"params": commandApprovalParams(approvalThreadA, nil),
+		}},
+	}))
+	b.HandleBroadcast(bridgeSnapshotFrame(approvalThreadB, "owner-b", 1, map[string]any{
+		"id": approvalThreadB,
+		"requests": []any{map[string]any{
+			"id": float64(74), "method": "item/commandExecution/requestApproval",
+			"params": commandApprovalParams(approvalThreadB, nil),
+		}},
+	}))
+
+	shared := c.ApprovalRequest("shared")
+	if shared == nil || shared["request_id"] != "71" || shared["source"] != codexApprovalSourceAppServer {
+		t.Fatalf("shared route leaked Desktop approval: %#v", shared)
+	}
+	desktop := c.ApprovalRequest("desktop")
+	if desktop == nil || desktop["request_id"] != "74" || desktop["source"] != codexApprovalSourceDesktop {
+		t.Fatalf("Desktop route leaked app-server approval: %#v", desktop)
+	}
+}
+
 func TestCodexAttachRefreshesQuestionCreatedBeforeBridge(t *testing.T) {
 	fc := newFakeCodexClient()
 	c := testCodexWithClient(t, fc)
+	c.appServerTransport = "stdio"
 	desktop := &fakeDesktopClient{}
 	c.desktopFactory = func() codexDesktopClient { return desktop }
 	c.desktopOpener = func(string) error { return nil }
@@ -637,7 +672,7 @@ func TestCodexResolvedAndTurnCompletedCleanup(t *testing.T) {
 func TestCodexSessionSettingsFromBridge(t *testing.T) {
 	fc := newFakeCodexClient()
 	c := testCodexWithClient(t, fc)
-	c.BindTranscript("sess-a", approvalThreadA)
+	c.BindDesktopTranscript("sess-a", approvalThreadA)
 	b := newCodexDesktopBridge("", "local")
 	c.bridge = b
 	b.HandleBroadcast(bridgeSnapshotFrame(approvalThreadA, "owner-1", 1, map[string]any{
@@ -731,7 +766,7 @@ func TestCodexRelayApprovalNewestWithoutRequestID(t *testing.T) {
 func TestCodexInstalledDetection(t *testing.T) {
 	missing := NewCodex("codex", config.ProviderConfig{
 		Command: "/nonexistent/codex-e2e-missing", Cwd: "/tmp",
-		Extra: map[string]any{"prefer_desktop_codex": false},
+		Extra: map[string]any{"prefer_desktop_codex": false, "app_server_transport": "stdio"},
 	})
 	if missing.Installed() {
 		t.Fatal("codex must report not installed for a missing binary")
@@ -742,7 +777,7 @@ func TestCodexInstalledDetection(t *testing.T) {
 	}
 	present := NewCodex("codex", config.ProviderConfig{
 		Command: bin, Cwd: "/tmp",
-		Extra: map[string]any{"prefer_desktop_codex": false},
+		Extra: map[string]any{"prefer_desktop_codex": false, "app_server_transport": "stdio"},
 	})
 	if !present.Installed() || !present.Status().Installed {
 		t.Fatal("codex must report installed when the binary exists")
@@ -786,7 +821,7 @@ func TestCodexFutureApprovalMethodsStayActionable(t *testing.T) {
 
 func TestCodexFutureDesktopApprovalStaysVisibleButNonActionable(t *testing.T) {
 	c := testCodexWithClient(t, newFakeCodexClient())
-	c.BindTranscript("sess-a", approvalThreadA)
+	c.BindDesktopTranscript("sess-a", approvalThreadA)
 	b := newCodexDesktopBridge("", "local")
 	c.bridge = b
 	b.HandleBroadcast(bridgeSnapshotFrame(approvalThreadA, "owner-future", 1, map[string]any{

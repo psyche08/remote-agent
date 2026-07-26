@@ -117,14 +117,7 @@ func (b *codexDesktopBridge) dialConn(timeout time.Duration) (net.Conn, error) {
 	if b.dial != nil {
 		return b.dial(timeout)
 	}
-	path := b.socketPath
-	if path == "" {
-		path = defaultCodexDesktopSocket()
-	}
-	if path == "" {
-		return nil, CodexDesktopIPCError{"Codex Desktop IPC socket not found"}
-	}
-	return net.DialTimeout("unix", path, timeout)
+	return dialCodexDesktopSocket(b.socketPath, timeout)
 }
 
 func (b *codexDesktopBridge) connectAndRead() error {

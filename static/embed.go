@@ -10,7 +10,7 @@ import (
 // and deployed with the binary. The relay only needs the stable device host
 // from shell.html.
 //
-//go:embed index.html manifest.webmanifest sw.js icon-192.png icon-512.png
+//go:embed index.html manifest.webmanifest sw.js icon-192.png icon-512.png vendor/mermaid-11.16.0.min.js vendor/mermaid-LICENSE.txt
 var files embed.FS
 
 // Handler serves the device-owned console. The build version is injected at
@@ -30,6 +30,10 @@ func Handler(version string) http.Handler {
 				version = "dev"
 			}
 			body = []byte(strings.ReplaceAll(string(body), "__REMOTE_AGENT_STATIC_VERSION__", version))
+			// The console uses inline application code today, so script/style
+			// cannot yet drop unsafe-inline. Keep every fetch and embedded
+			// diagram resource same-origin, and block plugin/object execution.
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' ws: wss:; font-src 'self' data:; frame-src 'self' about:; object-src 'none'; base-uri 'none'; form-action 'self'")
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			_, _ = w.Write(body)
 			return

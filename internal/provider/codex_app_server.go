@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,6 +18,71 @@ type CodexAppServerError struct {
 }
 
 func (e CodexAppServerError) Error() string { return e.Message }
+
+const (
+	codexAppServerWebSocketDialTimeout    = 2 * time.Second
+	codexAppServerInitializeTimeout       = 3 * time.Second
+	codexAppServerStdioInitializeTimeout  = 8 * time.Second
+	codexAppServerThreadStartTimeout      = 15 * time.Second
+	codexAppServerStdioThreadStartTimeout = 20 * time.Second
+	codexAppServerMutationTimeout         = 5 * time.Second
+	codexAppServerStdioResumeTimeout      = 8 * time.Second
+	codexAppServerBackgroundTimeout       = 30 * time.Second
+	codexAppServerStdioBackgroundTimeout  = 60 * time.Second
+)
+
+type codexAppServerJSONTransport interface {
+	WriteJSON([]byte) error
+	ReadJSON() ([]byte, error)
+	Close() error
+}
+
+type codexAppServerStdioTransport struct {
+	stdin   io.WriteCloser
+	stdout  io.ReadCloser
+	scanner *bufio.Scanner
+}
+
+func newCodexAppServerStdioTransport(stdin io.WriteCloser, stdout io.ReadCloser) *codexAppServerStdioTransport {
+	scanner := bufio.NewScanner(stdout)
+	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	return &codexAppServerStdioTransport{stdin: stdin, stdout: stdout, scanner: scanner}
+}
+
+func (t *codexAppServerStdioTransport) WriteJSON(payload []byte) error {
+	payload = append(append([]byte(nil), payload...), '\n')
+	for len(payload) > 0 {
+		n, err := t.stdin.Write(payload)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		payload = payload[n:]
+	}
+	return nil
+}
+
+func (t *codexAppServerStdioTransport) ReadJSON() ([]byte, error) {
+	for t.scanner.Scan() {
+		line := t.scanner.Bytes()
+		if len(line) != 0 {
+			return append([]byte(nil), line...), nil
+		}
+	}
+	if err := t.scanner.Err(); err != nil {
+		return nil, err
+	}
+	return nil, io.EOF
+}
+
+func (t *codexAppServerStdioTransport) Close() error {
+	// Closing stdin preserves the prior graceful child shutdown behavior. The
+	// read side remains open until the child exits so cmd.Wait and scanner EOF
+	// retain a single lifecycle owner in readLoop.
+	return t.stdin.Close()
+}
 
 type codexAppClient interface {
 	Start() error
@@ -49,20 +115,23 @@ type CodexAppServerClient struct {
 	OnServerRequest func(requestID any, method string, params map[string]any)
 	OnExit          func(error)
 
-	cmd          *exec.Cmd
-	stdin        io.WriteCloser
-	nextID       atomic.Int64
-	writeMu      sync.Mutex
-	mu           sync.Mutex
-	pending      map[int64]chan map[string]any
-	threadStatus map[string]string
-	threadTurn   map[string]string
-	lastModel    string
-	closed       bool
-	exited       bool
-	exitErr      error
-	done         chan struct{}
-	doneOnce     sync.Once
+	cmd           *exec.Cmd
+	transport     codexAppServerJSONTransport
+	shared        bool
+	sharedDaemon  CodexSharedDaemonStatus
+	dialWebSocket func(CodexSharedDaemonStatus, time.Duration) (codexAppServerJSONTransport, error)
+	nextID        atomic.Int64
+	writeMu       sync.Mutex
+	mu            sync.Mutex
+	pending       map[int64]chan map[string]any
+	threadStatus  map[string]string
+	threadTurn    map[string]string
+	lastModel     string
+	closed        bool
+	exited        bool
+	exitErr       error
+	done          chan struct{}
+	doneOnce      sync.Once
 }
 
 func NewCodexAppServerClient(command []string, cwd string, onNotification func(string, map[string]any), onServerRequest func(any, string, map[string]any)) *CodexAppServerClient {
@@ -76,13 +145,35 @@ func NewCodexAppServerClient(command []string, cwd string, onNotification func(s
 	}
 }
 
+func NewCodexSharedAppServerClient(status CodexSharedDaemonStatus, cwd string, onNotification func(string, map[string]any), onServerRequest func(any, string, map[string]any)) *CodexAppServerClient {
+	client := NewCodexAppServerClient(nil, cwd, onNotification, onServerRequest)
+	client.shared = true
+	client.sharedDaemon = status
+	client.dialWebSocket = func(status CodexSharedDaemonStatus, timeout time.Duration) (codexAppServerJSONTransport, error) {
+		return dialCodexAppServerWebSocketStatus(status, timeout)
+	}
+	return client
+}
+
 func (c *CodexAppServerClient) Start() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return CodexAppServerError{"client closed"}
 	}
-	if c.cmd != nil {
+	if c.transport != nil {
+		return nil
+	}
+	if c.shared {
+		if c.sharedDaemon.SocketPath == "" {
+			return CodexAppServerError{"codex shared app-server socket path is empty"}
+		}
+		transport, err := c.dialWebSocket(c.sharedDaemon, codexAppServerWebSocketDialTimeout)
+		if err != nil {
+			return err
+		}
+		c.transport = transport
+		go c.readLoop(transport, nil)
 		return nil
 	}
 	ctx := context.Background()
@@ -96,14 +187,18 @@ func (c *CodexAppServerClient) Start() error {
 	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdin.Close()
 		return err
 	}
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = stdout.Close()
 		return err
 	}
+	transport := newCodexAppServerStdioTransport(stdin, stdout)
 	c.cmd = cmd
-	c.stdin = stdin
-	go c.readLoop(stdout, cmd)
+	c.transport = transport
+	go c.readLoop(transport, cmd)
 	return nil
 }
 
@@ -111,19 +206,33 @@ func (c *CodexAppServerClient) Close() error {
 	c.mu.Lock()
 	c.closed = true
 	cmd := c.cmd
-	stdin := c.stdin
+	transport := c.transport
+	shared := c.shared
 	c.mu.Unlock()
-	if stdin != nil {
-		_ = stdin.Close()
+	var closeErr error
+	if transport != nil {
+		closeErr = transport.Close()
+	}
+	if shared {
+		if transport == nil {
+			c.finish(CodexAppServerError{"client closed"})
+		} else {
+			select {
+			case <-c.done:
+			case <-time.After(2 * time.Second):
+				c.finish(CodexAppServerError{"client closed"})
+			}
+		}
+		return closeErr
 	}
 	if cmd == nil || cmd.Process == nil {
 		c.finish(CodexAppServerError{"client closed"})
-		return nil
+		return closeErr
 	}
 	_ = signalCodexOwnedProcess(cmd.Process, false)
 	select {
 	case <-c.done:
-		return nil
+		return closeErr
 	case <-time.After(2 * time.Second):
 	}
 	if cmd != nil && cmd.Process != nil {
@@ -133,7 +242,7 @@ func (c *CodexAppServerClient) Close() error {
 	case <-c.done:
 	case <-time.After(2 * time.Second):
 	}
-	return nil
+	return closeErr
 }
 
 func (c *CodexAppServerClient) SetExitHandler(handler func(error)) {
@@ -155,10 +264,17 @@ func (c *CodexAppServerClient) ExitError() error {
 }
 
 func (c *CodexAppServerClient) Initialize(name string) error {
+	timeout := codexAppServerInitializeTimeout
+	if !c.shared {
+		// Legacy stdio must also cover a cold child startup. Keep the larger
+		// allowance bounded so the longest synchronous relay path remains
+		// below its 30 second HTTP timeout.
+		timeout = codexAppServerStdioInitializeTimeout
+	}
 	_, err := c.request("initialize", map[string]any{
 		"clientInfo":   map[string]any{"name": name, "title": name, "version": remoteCodingClientVersion()},
 		"capabilities": nil,
-	}, 30*time.Second)
+	}, timeout)
 	if err != nil {
 		return err
 	}
@@ -174,7 +290,11 @@ func (c *CodexAppServerClient) AccountRead(timeout time.Duration) (any, error) {
 }
 
 func (c *CodexAppServerClient) ThreadStart(params map[string]any) (string, error) {
-	res, err := c.request("thread/start", compactMap(params), 60*time.Second)
+	timeout := codexAppServerThreadStartTimeout
+	if !c.shared {
+		timeout = codexAppServerStdioThreadStartTimeout
+	}
+	res, err := c.request("thread/start", compactMap(params), timeout)
 	if err != nil {
 		return "", err
 	}
@@ -204,7 +324,7 @@ func (c *CodexAppServerClient) ThreadFork(threadID string, params map[string]any
 		params = map[string]any{}
 	}
 	params["threadId"] = threadID
-	return c.request("thread/fork", compactMap(params), 60*time.Second)
+	return c.request("thread/fork", compactMap(params), codexAppServerMutationTimeout)
 }
 
 func (c *CodexAppServerClient) ThreadRollback(threadID string, numTurns int, params map[string]any) (any, error) {
@@ -213,7 +333,7 @@ func (c *CodexAppServerClient) ThreadRollback(threadID string, numTurns int, par
 	}
 	params["threadId"] = threadID
 	params["numTurns"] = numTurns
-	return c.request("thread/rollback", compactMap(params), 60*time.Second)
+	return c.request("thread/rollback", compactMap(params), codexAppServerMutationTimeout)
 }
 
 func (c *CodexAppServerClient) ThreadList(timeout time.Duration, params map[string]any) (any, error) {
@@ -225,6 +345,14 @@ func (c *CodexAppServerClient) TurnStart(threadID string, prompt string, extra m
 }
 
 func (c *CodexAppServerClient) TurnStartWithAttachments(threadID string, prompt string, attachments []Attachment, extra map[string]any) (any, error) {
+	timeout := codexAppServerBackgroundTimeout
+	if !c.shared {
+		timeout = codexAppServerStdioBackgroundTimeout
+	}
+	return c.TurnStartWithAttachmentsTimeout(threadID, prompt, attachments, extra, timeout)
+}
+
+func (c *CodexAppServerClient) TurnStartWithAttachmentsTimeout(threadID string, prompt string, attachments []Attachment, extra map[string]any, timeout time.Duration) (any, error) {
 	if c.IsActive(threadID) {
 		return nil, CodexAppServerError{"thread " + threadID + " has a live turn in progress"}
 	}
@@ -235,7 +363,7 @@ func (c *CodexAppServerClient) TurnStartWithAttachments(threadID string, prompt 
 	for k, v := range extra {
 		params[k] = v
 	}
-	res, err := c.request("turn/start", compactMap(params), 60*time.Second)
+	res, err := c.request("turn/start", compactMap(params), timeout)
 	if err == nil {
 		c.rememberTurn(threadID, res)
 	}
@@ -257,7 +385,7 @@ func (c *CodexAppServerClient) TurnSteer(threadID string, prompt string, extra m
 		}
 		params["expectedTurnId"] = turnID
 	}
-	res, err := c.request("turn/steer", compactMap(params), 60*time.Second)
+	res, err := c.request("turn/steer", compactMap(params), codexAppServerMutationTimeout)
 	if err == nil {
 		c.rememberTurn(threadID, res)
 	}
@@ -276,7 +404,7 @@ func (c *CodexAppServerClient) TurnInterrupt(threadID string, extra map[string]a
 		}
 		params["turnId"] = turnID
 	}
-	return c.request("turn/interrupt", compactMap(params), 60*time.Second)
+	return c.request("turn/interrupt", compactMap(params), codexAppServerMutationTimeout)
 }
 
 func (c *CodexAppServerClient) Respond(requestID any, result map[string]any) error {
@@ -333,42 +461,54 @@ func (c *CodexAppServerClient) write(obj map[string]any) error {
 	if err != nil {
 		return err
 	}
-	payload := append(b, '\n')
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
 	c.mu.Lock()
-	stdin, closed := c.stdin, c.closed
+	transport, closed := c.transport, c.closed
 	c.mu.Unlock()
-	if stdin == nil {
+	if transport == nil {
+		c.writeMu.Unlock()
 		return CodexAppServerError{"client not started"}
 	}
 	if closed {
+		c.writeMu.Unlock()
 		return CodexAppServerError{"client closed"}
 	}
-	for len(payload) > 0 {
-		n, err := stdin.Write(payload)
-		if err != nil {
-			return err
+	err = transport.WriteJSON(b)
+	if err != nil {
+		c.mu.Lock()
+		c.closed = true
+		c.mu.Unlock()
+	}
+	c.writeMu.Unlock()
+	if err != nil {
+		writeErr := CodexAppServerError{"write to codex app-server failed: " + err.Error()}
+		// A failed write means the stream can no longer prove message
+		// boundaries or delivery. Retire the whole generation immediately;
+		// otherwise the read loop may remain blocked forever on an idle UDS
+		// while ensureClient keeps reusing a dead writer.
+		_ = transport.Close()
+		c.mu.Lock()
+		cmd := c.cmd
+		c.mu.Unlock()
+		if cmd != nil && cmd.Process != nil {
+			_ = signalCodexOwnedProcess(cmd.Process, true)
 		}
-		if n <= 0 {
-			return io.ErrShortWrite
-		}
-		payload = payload[n:]
+		c.finish(writeErr)
+		return writeErr
 	}
 	return nil
 }
 
-func (c *CodexAppServerClient) readLoop(r io.Reader, cmd *exec.Cmd) {
-	scanner := bufio.NewScanner(r)
-	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+func (c *CodexAppServerClient) readLoop(transport codexAppServerJSONTransport, cmd *exec.Cmd) {
 	var readErr error
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
+	for {
+		payload, err := transport.ReadJSON()
+		if err != nil {
+			readErr = err
+			break
 		}
 		var msg map[string]any
-		if err := json.Unmarshal(line, &msg); err != nil {
+		if err := json.Unmarshal(payload, &msg); err != nil {
 			readErr = CodexAppServerError{"invalid JSON from codex app-server: " + err.Error()}
 			break
 		}
@@ -400,17 +540,17 @@ func (c *CodexAppServerClient) readLoop(r io.Reader, cmd *exec.Cmd) {
 			c.OnNotification(method, params)
 		}
 	}
-	if readErr == nil {
-		readErr = scanner.Err()
+	_ = transport.Close()
+	if cmd != nil {
+		if readErr != nil && cmd.Process != nil {
+			_ = signalCodexOwnedProcess(cmd.Process, true)
+		}
+		waitErr := cmd.Wait()
+		if readErr == nil || errors.Is(readErr, io.EOF) {
+			readErr = waitErr
+		}
 	}
-	if readErr != nil && cmd.Process != nil {
-		_ = signalCodexOwnedProcess(cmd.Process, true)
-	}
-	waitErr := cmd.Wait()
-	if readErr == nil {
-		readErr = waitErr
-	}
-	if readErr == nil {
+	if readErr == nil || errors.Is(readErr, io.EOF) {
 		readErr = CodexAppServerError{"codex app-server exited"}
 	}
 	c.finish(readErr)
@@ -515,9 +655,16 @@ func compactMap(in map[string]any) map[string]any {
 	}
 	out := map[string]any{}
 	for k, v := range in {
-		if v != nil {
-			out[k] = v
+		if v == nil {
+			continue
 		}
+		if text, ok := v.(string); ok && strings.TrimSpace(text) == "" {
+			// Empty protocol overrides are not equivalent to omission. In
+			// particular, model="" prevents the managed daemon from applying
+			// the device's configured default and makes the turn fail.
+			continue
+		}
+		out[k] = v
 	}
 	return out
 }

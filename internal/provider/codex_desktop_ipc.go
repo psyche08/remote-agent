@@ -10,6 +10,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -188,18 +190,7 @@ func (c *CodexDesktopIPCClient) request(method string, params map[string]any, ti
 }
 
 func (c *CodexDesktopIPCClient) connect(timeout time.Duration) (net.Conn, error) {
-	path := c.SocketPath
-	if path == "" {
-		path = defaultCodexDesktopSocket()
-	}
-	if path == "" {
-		return nil, CodexDesktopIPCError{"Codex Desktop IPC socket not found"}
-	}
-	conn, err := net.DialTimeout("unix", path, timeout)
-	if err != nil {
-		return nil, CodexDesktopIPCError{"failed to connect Codex Desktop IPC socket " + path + ": " + err.Error()}
-	}
-	return conn, nil
+	return dialCodexDesktopSocket(c.SocketPath, timeout)
 }
 
 func (c *CodexDesktopIPCClient) initialize(conn net.Conn, timeout time.Duration) error {
@@ -350,31 +341,131 @@ func desktopRequestVersion(method string) int {
 }
 
 func defaultCodexDesktopSocket() string {
+	for _, path := range codexDesktopSocketCandidates() {
+		if _, err := validateCodexDesktopSocket(path); err == nil {
+			return path
+		}
+	}
+	return ""
+}
+
+func codexDesktopSocketCandidates() []string {
 	uid := os.Getuid()
 	name := "ipc-" + strconv.Itoa(uid) + ".sock"
 	candidates := []string{}
+
+	// Current ChatGPT/Codex Desktop and the VS Code extension share the
+	// stable CODEX_HOME router. Older builds used a per-user socket below
+	// TMPDIR/codex-ipc, so keep those locations as compatibility fallbacks.
+	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
+		candidates = append(candidates, filepath.Join(expandUser(codexHome), "ipc", "ipc.sock"))
+	}
+	if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+		candidates = append(candidates, filepath.Join(home, ".codex", "ipc", "ipc.sock"))
+	}
 	if tmp := os.Getenv("TMPDIR"); tmp != "" {
 		candidates = append(candidates, filepath.Join(tmp, "codex-ipc", name))
 	}
 	candidates = append(candidates, filepath.Join(os.TempDir(), "codex-ipc", name), filepath.Join("/tmp", "codex-ipc", name))
 	if matches, err := filepath.Glob(filepath.Join("/var/folders", "*", "*", "T", "codex-ipc", name)); err == nil {
+		sort.SliceStable(matches, func(i, j int) bool {
+			ai, aerr := os.Stat(matches[i])
+			bi, berr := os.Stat(matches[j])
+			if aerr == nil && berr == nil {
+				return ai.ModTime().After(bi.ModTime())
+			}
+			return aerr == nil
+		})
 		candidates = append(candidates, matches...)
 	}
-	candidates = dedupeStrings(candidates)
-	sort.SliceStable(candidates, func(i, j int) bool {
-		ai, aerr := os.Stat(candidates[i])
-		bi, berr := os.Stat(candidates[j])
-		if aerr == nil && berr == nil {
-			return ai.ModTime().After(bi.ModTime())
-		}
-		return aerr == nil
-	})
-	for _, p := range candidates {
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p
-		}
+	return dedupeStrings(candidates)
+}
+
+func dialCodexDesktopSocket(socketPath string, timeout time.Duration) (net.Conn, error) {
+	candidates := []string{}
+	if strings.TrimSpace(socketPath) != "" {
+		candidates = append(candidates, expandUser(strings.TrimSpace(socketPath)))
+	} else {
+		candidates = codexDesktopSocketCandidates()
 	}
-	return ""
+	return dialCodexDesktopSocketCandidates(candidates, timeout)
+}
+
+func dialCodexDesktopSocketCandidates(candidates []string, timeout time.Duration) (net.Conn, error) {
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	found := false
+	var lastPath string
+	var lastErr error
+	for _, path := range candidates {
+		before, err := validateCodexDesktopSocket(path)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				found = true
+				lastPath = path
+				lastErr = err
+			}
+			continue
+		}
+		found = true
+		lastPath = path
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			lastErr = errors.New("Codex Desktop IPC socket discovery timed out")
+			break
+		}
+		conn, err := net.DialTimeout("unix", path, remaining)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		after, statErr := os.Lstat(path)
+		if statErr != nil || !os.SameFile(before, after) {
+			_ = conn.Close()
+			lastErr = errors.New("Codex Desktop IPC socket changed while connecting")
+			continue
+		}
+		return conn, nil
+	}
+	if !found {
+		return nil, CodexDesktopIPCError{"Codex Desktop IPC socket not found"}
+	}
+	return nil, CodexDesktopIPCError{"failed to connect Codex Desktop IPC socket " + lastPath + ": " + lastErr.Error()}
+}
+
+func validateCodexDesktopSocket(path string) (os.FileInfo, error) {
+	if !filepath.IsAbs(path) {
+		return nil, errors.New("Codex Desktop IPC socket path is not absolute")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+		return nil, errors.New("Codex Desktop IPC path is not a direct Unix socket")
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return nil, errors.New("Codex Desktop IPC socket permissions are not private")
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Getuid() {
+		return nil, errors.New("Codex Desktop IPC socket is not owned by the current user")
+	}
+	parent, err := os.Lstat(filepath.Dir(path))
+	if err != nil {
+		return nil, err
+	}
+	if parent.Mode()&os.ModeSymlink != 0 || !parent.IsDir() {
+		return nil, errors.New("Codex Desktop IPC parent is not a direct directory")
+	}
+	if parent.Mode().Perm()&0o022 != 0 {
+		return nil, errors.New("Codex Desktop IPC parent is writable by another user")
+	}
+	if stat, ok := parent.Sys().(*syscall.Stat_t); ok && int(stat.Uid) != os.Getuid() {
+		return nil, errors.New("Codex Desktop IPC parent is not owned by the current user")
+	}
+	return info, nil
 }
 
 func dedupeStrings(in []string) []string {

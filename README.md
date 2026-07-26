@@ -15,7 +15,7 @@ layer:
 | Family | Providers | How it drives the agent | How it reads output |
 |--------|-----------|-------------------------|---------------------|
 | **Claude** | `claude` | creates/resumes the real CLI as a managed `stream-json` child | live NDJSON events + merged Desktop/CLI transcript metadata |
-| **Codex Desktop/app-server** | `codex` | maps each logical session to a Codex thread and binds it to either Desktop owner/follower IPC or its own headless `codex app-server` (`turn/start`, `turn/steer`, `turn/interrupt`) | merged app-server/local discovery, app-server notifications for headless turns, and rollout preview tailing for Desktop-owned turns |
+| **Codex Desktop/app-server** | `codex` | maps each logical session to a Codex thread and binds mutable control to the official shared app-server daemon; Desktop owner/follower IPC is an explicit compatibility route | merged app-server/local discovery, app-server notifications, and rollout preview tailing |
 | **Generic terminal fallback** | configured `"type": "pty"` providers | starts one fixed executable + args in one PTY per logical session; no shell expansion | bounded, terminal-control-sanitized memory + WebSocket deltas |
 
 > **Account isolation is solved at the device layer.** One Mac ≈ one Claude
@@ -139,18 +139,20 @@ available.
 
 The registered `codex` provider is the Go `provider.Codex`.
 
-* **Desktop owner first for attached threads**. A logical web session maps to a
-  native Codex thread id. When that session was attached to an existing Codex
-  UUID thread, remote-agent first asks Codex Desktop over the same-user
-  owner/follower IPC socket to start/steer/interrupt the turn, so Desktop renders
-  the turn live instead of catching up only after refresh. Attach also requests
-  a complete Desktop snapshot so approvals or user-input questions that were
-  already pending before the web session connected are restored immediately.
+* **Shared daemon owns mutable native control by default**. A logical web
+  session maps to one native Codex thread id. Remote-agent resumes that exact
+  thread and cwd on the official same-user daemon before starting a turn.
+  Desktop owner/follower IPC is used only when
+  `extra.native_delivery_route=desktop_ipc` is explicitly configured; in that
+  compatibility mode attach also requests a complete pending-request snapshot.
 * **Delivery route belongs to the logical session**. New remote-agent-created
-  threads are headless app-server sessions. Sending from a native Codex preview
-  persists `delivery_route=desktop_ipc`, opens the thread in Desktop if needed,
-  and targets its owner client. A Desktop-routed session never falls back to a
-  second app-server owner when attach/IPC fails; the request returns an error.
+  threads are managed app-server sessions. Sending from a native Codex preview
+  persists the explicit `codex_control_route=shared_daemon`, resumes the exact
+  thread id/cwd on the official managed daemon, and starts the turn on that
+  same connection. `delivery_route=desktop_ipc` is retained temporarily as a
+  fail-closed rollback contract for older binaries. Desktop IPC remains
+  available only through the explicit `extra.native_delivery_route=desktop_ipc`
+  compatibility override; a request is never retried across owner routes.
 * **Native reads**: `/native_sessions` merges app-server `thread/list` with the
   local Codex index/rollouts. `/session_preview` reads rollout JSONL first and
   only uses a bounded `thread/resume` fallback when the rollout is not yet on
@@ -172,7 +174,7 @@ The registered `codex` provider is the Go `provider.Codex`.
   and pending-request changes.
 * **Approvals bridge over Desktop IPC**. Approval requests for a Desktop-owned
   turn are sent by app-server to the turn's *owner* client, not to
-  remote-agent's own app-server child. A persistent follower connection
+  remote-agent's shared-daemon connection. A persistent follower connection
   mirrors each owner's `thread-stream-state-changed` broadcasts (snapshot +
   immer patches); the broadcast conversation state carries the raw pending
   server requests (`requests[]`, including the JSON-RPC request id) plus the
@@ -186,14 +188,21 @@ The registered `codex` provider is the Go `provider.Codex`.
   `approvalsReviewer=auto_review` turns are guardian-reviewed server-side and
   never surface fake web approvals. Approvals are tracked per thread +
   request id: one thread going idle no longer clears another thread's queue.
-* **Binary selection**: by default it prefers the Codex executable bundled in
-  `/Applications/ChatGPT.app` (or the same under `~/Applications`), then checks
-  the legacy standalone `Codex.app`, and finally falls back to `$PATH`; set
-  `extra.prefer_desktop_codex=false` to opt out.
-* **Owned app-server lifecycle**: the provider assigns every child a connection
-  generation. EOF, malformed JSON, or process exit immediately fails pending
-  RPCs, retires only that generation's routes, and reaps the owned process
-  group. An old exit callback cannot clear a newer connection.
+* **Managed daemon prerequisite**: mutable Codex traffic defaults to the
+  official standalone install at
+  `~/.codex/packages/standalone/current/codex`. Install it with OpenAI's
+  `https://chatgpt.com/codex/install.sh`, then run
+  `codex app-server daemon start`. Set
+  `extra.shared_daemon_autostart=true` only on devices where remote-agent is
+  explicitly allowed to start an already-installed daemon after reboot. This
+  flag never installs Codex, bootstraps its updater, or enables OpenAI cloud
+  remote control. `extra.app_server_transport=stdio` is a legacy headless-only
+  compatibility mode and must not control native Desktop previews.
+* **Shared app-server lifecycle**: the provider assigns every UDS WebSocket
+  connection a generation. EOF, malformed JSON, or socket loss immediately
+  fails pending RPCs and retires only that generation's routes. An old exit
+  callback cannot clear a newer connection, and the daemon itself outlives a
+  remote-agent reconnect.
 * **Authoritative completion**: approval/question response writes remain
   non-terminal until the matching typed `serverRequest/resolved` arrives.
   Likewise, `turn/interrupt` reports `cancellation_requested`; the session
@@ -201,6 +210,12 @@ The registered `codex` provider is the Go `provider.Codex`.
 * **Per-turn usage**: completed `task_started` / `task_complete` boundaries use
   Codex's native duration and the delta of cumulative token counters, so a
   session total is never repeated as an individual turn's usage.
+* **Markdown diagrams**: fenced `mermaid` blocks use a pinned embedded Mermaid
+  runtime, strict/no-HTML-label rendering, SVG scrubbing, and a scriptless
+  sandbox iframe. Unsafe or invalid diagrams keep their source visible.
+  The device UI CSP intentionally blocks arbitrary remote Markdown images;
+  transcript images are served through the session-scoped `/session_asset`
+  route instead.
 
 ### API-price estimates
 
@@ -256,15 +271,14 @@ make go-build
 cp config.example.json config.json       # edit device_id, cwd, providers
 ```
 
-Requires a runnable standalone `claude` CLI for the `claude` provider. Codex
-prefers the binary bundled inside ChatGPT.app, then the legacy Codex.app, and
-only then falls back to PATH:
+Requires a runnable standalone `claude` CLI for the `claude` provider. Mutable
+Codex control requires OpenAI's managed standalone install and its local
+app-server daemon:
 
 ```bash
 which claude
-test -x /Applications/ChatGPT.app/Contents/Resources/codex \
-  || test -x /Applications/Codex.app/Contents/Resources/codex \
-  || which codex
+test -x ~/.codex/packages/standalone/current/codex
+~/.codex/packages/standalone/current/codex app-server daemon start
 ```
 
 ### 2. macOS permissions

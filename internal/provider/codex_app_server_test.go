@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -84,6 +85,353 @@ func TestCodexAppServerExitImmediatelyFailsPendingRPC(t *testing.T) {
 	case <-client.Done():
 	case <-time.After(time.Second):
 		t.Fatal("client lifecycle did not close after child exit")
+	}
+}
+
+type fakeCodexAppServerJSONTransport struct {
+	writes    chan []byte
+	reads     chan []byte
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+type writeFailingCodexAppServerTransport struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func newWriteFailingCodexAppServerTransport() *writeFailingCodexAppServerTransport {
+	return &writeFailingCodexAppServerTransport{closed: make(chan struct{})}
+}
+
+func (t *writeFailingCodexAppServerTransport) WriteJSON([]byte) error {
+	return io.ErrClosedPipe
+}
+
+func (t *writeFailingCodexAppServerTransport) ReadJSON() ([]byte, error) {
+	<-t.closed
+	return nil, io.EOF
+}
+
+func (t *writeFailingCodexAppServerTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+
+func newFakeCodexAppServerJSONTransport() *fakeCodexAppServerJSONTransport {
+	return &fakeCodexAppServerJSONTransport{
+		writes: make(chan []byte, 16),
+		reads:  make(chan []byte, 16),
+		closed: make(chan struct{}),
+	}
+}
+
+func TestCodexSharedAppServerWriteFailureRetiresBlockedReader(t *testing.T) {
+	transport := newWriteFailingCodexAppServerTransport()
+	client := NewCodexSharedAppServerClient(
+		CodexSharedDaemonStatus{SocketPath: "/private/tmp/codex-shared-write-failure.sock"},
+		t.TempDir(),
+		nil,
+		nil,
+	)
+	client.dialWebSocket = func(CodexSharedDaemonStatus, time.Duration) (codexAppServerJSONTransport, error) {
+		return transport, nil
+	}
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := client.ThreadList(time.Second, nil)
+	if err == nil || !strings.Contains(err.Error(), "write to codex app-server failed") {
+		t.Fatalf("write error=%v", err)
+	}
+	select {
+	case <-client.Done():
+	case <-time.After(time.Second):
+		t.Fatal("write failure left client lifecycle open")
+	}
+	select {
+	case <-transport.closed:
+	default:
+		t.Fatal("write failure did not close transport and unblock reader")
+	}
+	if exitErr := client.ExitError(); exitErr == nil ||
+		!strings.Contains(exitErr.Error(), "write to codex app-server failed") {
+		t.Fatalf("exit error=%v", exitErr)
+	}
+}
+
+func (t *fakeCodexAppServerJSONTransport) WriteJSON(payload []byte) error {
+	select {
+	case <-t.closed:
+		return io.ErrClosedPipe
+	case t.writes <- append([]byte(nil), payload...):
+		return nil
+	}
+}
+
+func (t *fakeCodexAppServerJSONTransport) ReadJSON() ([]byte, error) {
+	select {
+	case <-t.closed:
+		return nil, io.EOF
+	case payload := <-t.reads:
+		return append([]byte(nil), payload...), nil
+	}
+}
+
+func (t *fakeCodexAppServerJSONTransport) Close() error {
+	t.closeOnce.Do(func() { close(t.closed) })
+	return nil
+}
+
+func (t *fakeCodexAppServerJSONTransport) send(tst *testing.T, obj map[string]any) {
+	tst.Helper()
+	payload, err := json.Marshal(obj)
+	if err != nil {
+		tst.Fatal(err)
+	}
+	select {
+	case t.reads <- payload:
+	case <-time.After(time.Second):
+		tst.Fatal("timed out delivering fake app-server message")
+	}
+}
+
+func (t *fakeCodexAppServerJSONTransport) nextWrite(tst *testing.T) map[string]any {
+	tst.Helper()
+	select {
+	case payload := <-t.writes:
+		if strings.HasSuffix(string(payload), "\n") {
+			tst.Fatalf("WebSocket payload unexpectedly used stdio newline framing: %q", payload)
+		}
+		var msg map[string]any
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			tst.Fatalf("invalid client JSON: %v", err)
+		}
+		return msg
+	case <-time.After(time.Second):
+		tst.Fatal("timed out waiting for app-server write")
+		return nil
+	}
+}
+
+func newFakeSharedCodexClient(t *testing.T, transport *fakeCodexAppServerJSONTransport, onNotification func(string, map[string]any), onServerRequest func(any, string, map[string]any)) *CodexAppServerClient {
+	t.Helper()
+	const socketPath = "/private/tmp/codex-shared-test.sock"
+	status := CodexSharedDaemonStatus{SocketPath: socketPath}
+	client := NewCodexSharedAppServerClient(status, t.TempDir(), onNotification, onServerRequest)
+	client.dialWebSocket = func(got CodexSharedDaemonStatus, timeout time.Duration) (codexAppServerJSONTransport, error) {
+		if got.SocketPath != socketPath {
+			t.Fatalf("dial path=%q want=%q", got.SocketPath, socketPath)
+		}
+		if timeout != codexAppServerWebSocketDialTimeout {
+			t.Fatalf("dial timeout=%s want=%s", timeout, codexAppServerWebSocketDialTimeout)
+		}
+		return transport, nil
+	}
+	return client
+}
+
+func initializeFakeSharedCodexClient(t *testing.T, client *CodexAppServerClient, transport *fakeCodexAppServerJSONTransport) {
+	t.Helper()
+	result := make(chan error, 1)
+	go func() { result <- client.Initialize("remote-agent-shared-test") }()
+
+	initialize := transport.nextWrite(t)
+	if method := stringAny(initialize["method"]); method != "initialize" {
+		t.Fatalf("first method=%q want=initialize", method)
+	}
+	transport.send(t, map[string]any{"id": initialize["id"], "result": map[string]any{
+		"codexHome": "/tmp/codex-home", "platformFamily": "unix",
+	}})
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("initialize did not complete")
+	}
+	initialized := transport.nextWrite(t)
+	if method := stringAny(initialized["method"]); method != "initialized" {
+		t.Fatalf("second method=%q want=initialized", method)
+	}
+}
+
+func TestCodexSharedAppServerClientUsesWebSocketJSONFrames(t *testing.T) {
+	transport := newFakeCodexAppServerJSONTransport()
+	notifications := make(chan map[string]any, 1)
+	serverRequests := make(chan map[string]any, 1)
+	client := newFakeSharedCodexClient(t, transport,
+		func(method string, params map[string]any) {
+			notifications <- map[string]any{"method": method, "params": params}
+		},
+		func(id any, method string, params map[string]any) {
+			serverRequests <- map[string]any{"id": id, "method": method, "params": params}
+		},
+	)
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	initializeFakeSharedCodexClient(t, client, transport)
+
+	resumeResult := make(chan error, 1)
+	go func() {
+		_, err := client.ThreadResume("thread-shared", map[string]any{"excludeTurns": true}, time.Second)
+		resumeResult <- err
+	}()
+	resume := transport.nextWrite(t)
+	if method := stringAny(resume["method"]); method != "thread/resume" {
+		t.Fatalf("method=%q want=thread/resume", method)
+	}
+	if threadID := stringAny(mapAny(resume["params"])["threadId"]); threadID != "thread-shared" {
+		t.Fatalf("threadId=%q want=thread-shared", threadID)
+	}
+	transport.send(t, map[string]any{"id": resume["id"], "result": map[string]any{
+		"thread": map[string]any{"id": "thread-shared"},
+	}})
+	if err := <-resumeResult; err != nil {
+		t.Fatal(err)
+	}
+
+	transport.send(t, map[string]any{
+		"method": "thread/status/changed",
+		"params": map[string]any{
+			"threadId": "thread-shared",
+			"turnId":   "turn-shared",
+			"status":   map[string]any{"type": "active"},
+		},
+	})
+	select {
+	case notification := <-notifications:
+		if method := stringAny(notification["method"]); method != "thread/status/changed" {
+			t.Fatalf("notification method=%q", method)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("notification callback was not invoked")
+	}
+	if !client.IsActive("thread-shared") {
+		t.Fatal("shared transport notification did not update thread status")
+	}
+	if turnID, ok := client.ThreadTurn("thread-shared"); !ok || turnID != "turn-shared" {
+		t.Fatalf("turn=(%q,%v) want=(turn-shared,true)", turnID, ok)
+	}
+
+	transport.send(t, map[string]any{
+		"id":     71,
+		"method": "item/commandExecution/requestApproval",
+		"params": map[string]any{"threadId": "thread-shared"},
+	})
+	var request map[string]any
+	select {
+	case request = <-serverRequests:
+	case <-time.After(time.Second):
+		t.Fatal("server request callback was not invoked")
+	}
+	if stringAny(request["method"]) != "item/commandExecution/requestApproval" {
+		t.Fatalf("unexpected server request: %#v", request)
+	}
+	if err := client.Respond(request["id"], map[string]any{"decision": "accept"}); err != nil {
+		t.Fatal(err)
+	}
+	response := transport.nextWrite(t)
+	if id, ok := numericID(response["id"]); !ok || id != 71 {
+		t.Fatalf("response id=%v want=71", response["id"])
+	}
+	if decision := stringAny(mapAny(response["result"])["decision"]); decision != "accept" {
+		t.Fatalf("decision=%q want=accept", decision)
+	}
+}
+
+func TestCodexSharedAppServerExitFailsPendingRPC(t *testing.T) {
+	transport := newFakeCodexAppServerJSONTransport()
+	client := newFakeSharedCodexClient(t, transport, nil, nil)
+	exits := make(chan error, 2)
+	client.SetExitHandler(func(err error) { exits <- err })
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	initializeFakeSharedCodexClient(t, client, transport)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := client.ThreadList(5*time.Second, nil)
+		result <- err
+	}()
+	request := transport.nextWrite(t)
+	if method := stringAny(request["method"]); method != "thread/list" {
+		t.Fatalf("method=%q want=thread/list", method)
+	}
+	started := time.Now()
+	if err := transport.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "codex app-server exited") {
+			t.Fatalf("error=%v want app-server exit", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("pending shared RPC was not failed on WebSocket close")
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("pending shared RPC failed too slowly: %s", elapsed)
+	}
+	select {
+	case <-client.Done():
+	case <-time.After(time.Second):
+		t.Fatal("shared client lifecycle did not close")
+	}
+	select {
+	case err := <-exits:
+		if err == nil || !strings.Contains(err.Error(), "codex app-server exited") {
+			t.Fatalf("exit callback error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shared client exit callback was not invoked")
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-exits:
+		t.Fatalf("shared client exit callback invoked more than once: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestCodexSharedAppServerRejectsEmptySocketPath(t *testing.T) {
+	client := NewCodexSharedAppServerClient(CodexSharedDaemonStatus{}, t.TempDir(), nil, nil)
+	if err := client.Start(); err == nil || !strings.Contains(err.Error(), "socket path is empty") {
+		t.Fatalf("Start error=%v want empty socket path failure", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-client.Done():
+	case <-time.After(time.Second):
+		t.Fatal("unstarted shared client did not close its lifecycle")
+	}
+}
+
+func TestCompactMapDropsEmptyProtocolOverrides(t *testing.T) {
+	got := compactMap(map[string]any{
+		"model":           "",
+		"reasoningEffort": "  ",
+		"cwd":             "/tmp/project",
+		"enabled":         false,
+		"count":           0,
+	})
+	if _, ok := got["model"]; ok {
+		t.Fatalf("empty model override was retained: %#v", got)
+	}
+	if _, ok := got["reasoningEffort"]; ok {
+		t.Fatalf("empty effort override was retained: %#v", got)
+	}
+	if got["cwd"] != "/tmp/project" || got["enabled"] != false || got["count"] != 0 {
+		t.Fatalf("non-empty values were changed: %#v", got)
 	}
 }
 

@@ -292,9 +292,15 @@ func (s *Server) bindProviderTranscript(p provider.Provider, id string) {
 	}
 	if !ok {
 		// Native-session previews are intentionally not persisted as logical
-		// sessions until the web sends a prompt. Bind the native id to itself so
-		// providers can subscribe/refresh Desktop-owned pending requests while
-		// the tab is still read-only.
+		// sessions until the web sends a prompt. Bind the native id to itself
+		// with the provider's explicit native route so read-side running,
+		// settings, and pending-request state cannot leak from another owner.
+		if binder, routeAware := p.(interface {
+			BindSessionRoute(string, string, string, string)
+		}); routeAware {
+			binder.BindSessionRoute(id, id, codexPreferredNativeDeliveryRoute(p), "")
+			return
+		}
 		p.(interface{ BindTranscript(string, string) }).BindTranscript(id, id)
 		return
 	}
@@ -312,7 +318,18 @@ func bindSessionTranscript(p provider.Provider, rec state.Record, sessionID stri
 	if p == nil || sessionID == "" || transcriptID == "" {
 		return
 	}
-	if codexDesktopDeliveryRecord(rec) {
+	if binder, ok := p.(interface {
+		BindSessionRoute(string, string, string, string)
+	}); ok {
+		binder.BindSessionRoute(
+			sessionID,
+			transcriptID,
+			codexControlRouteForProvider(p, rec),
+			recordString(rec, "cwd"),
+		)
+		return
+	}
+	if codexDesktopDeliveryForProvider(p, rec) {
 		if binder, ok := p.(interface{ BindDesktopTranscript(string, string) }); ok {
 			binder.BindDesktopTranscript(sessionID, transcriptID)
 			return
@@ -321,6 +338,71 @@ func bindSessionTranscript(p provider.Provider, rec state.Record, sessionID stri
 	if binder, ok := p.(interface{ BindTranscript(string, string) }); ok {
 		binder.BindTranscript(sessionID, transcriptID)
 	}
+}
+
+func codexPreferredNativeDeliveryRoute(p provider.Provider) string {
+	if p != nil {
+		if router, ok := p.(interface{ NativeDeliveryRoute() string }); ok {
+			if route := strings.TrimSpace(router.NativeDeliveryRoute()); route != "" {
+				return route
+			}
+		}
+	}
+	// Providers predating explicit route selection keep their historical
+	// Desktop behavior. The production Codex provider always implements the
+	// selector and defaults to shared_daemon.
+	return "desktop_ipc"
+}
+
+func codexAppServerDeliveryRoute(p provider.Provider) string {
+	if p != nil {
+		if router, ok := p.(interface{ AppServerDeliveryRoute() string }); ok {
+			switch route := strings.TrimSpace(router.AppServerDeliveryRoute()); route {
+			case "shared_daemon", "stdio":
+				return route
+			}
+		}
+	}
+	// Compatibility for alternate providers predating explicit app-server
+	// ownership. The production Codex provider always returns a concrete route.
+	return "app_server"
+}
+
+func setCodexAppServerDeliveryRoute(rec state.Record, p provider.Provider) {
+	if rec == nil {
+		return
+	}
+	route := codexAppServerDeliveryRoute(p)
+	rec["codex_control_route"] = route
+	if route == "shared_daemon" {
+		// Old binaries ignore codex_control_route. Retaining their Desktop
+		// marker makes rollback fail closed instead of starting a competing
+		// stdio writer for a shared-daemon thread.
+		rec["delivery_route"] = "desktop_ipc"
+	} else {
+		delete(rec, "delivery_route")
+	}
+}
+
+func codexDesktopDeliveryForProvider(p provider.Provider, rec state.Record) bool {
+	if route := strings.TrimSpace(recordString(rec, "codex_control_route")); route != "" {
+		return route == "desktop_ipc"
+	}
+	return codexControlRouteForProvider(p, rec) == "desktop_ipc" && codexDesktopDeliveryRecord(rec)
+}
+
+func codexControlRouteForProvider(p provider.Provider, rec state.Record) string {
+	if route := strings.TrimSpace(recordString(rec, "codex_control_route")); route != "" {
+		return route
+	}
+	if codexDesktopDeliveryRecord(rec) {
+		return codexPreferredNativeDeliveryRoute(p)
+	}
+	// A logical session created by remote-agent is provider-owned, not a
+	// native Desktop preview. Let the provider bind it to its configured
+	// app-server transport. This preserves legacy stdio sessions without
+	// silently changing them into Desktop-owned sessions after a restart.
+	return "app_server"
 }
 
 func codexDesktopDeliveryRecord(rec state.Record) bool {

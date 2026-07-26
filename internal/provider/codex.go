@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,86 +48,98 @@ const (
 )
 
 type Codex struct {
-	id                   string
-	cfg                  config.ProviderConfig
-	command              string
-	cwd                  string
-	approvalPolicy       string
-	sandbox              string
-	nextModel            string
-	nextEffort           string
-	preferDesktopCodex   bool
-	desktopSyncEnabled   bool
-	desktopIPCSocket     string
-	desktopIPCTimeout    time.Duration
-	desktopAttachTimeout time.Duration
-	desktopIPCHostID     string
-	client               codexAppClient
-	clientMu             sync.Mutex
-	connectMu            sync.Mutex
-	clientGeneration     uint64
-	clientSequence       uint64
-	threadListMu         sync.Mutex
-	threadListLegacy     bool
-	discoveryMu          sync.Mutex
-	discovery            *codexDiscoveryCatalog
-	sessMu               sync.Mutex
-	threads              map[string]string
-	sessionStartOptions  map[string]map[string]any
-	desktopSyncSessions  map[string]bool
-	desktopOwnerClients  map[string]string
-	approvalMu           sync.Mutex
-	approvalsByThread    map[string][]*codexPendingApproval
-	bridge               *codexDesktopBridge
-	bridgeMu             sync.Mutex
-	desktopRefreshMu     sync.Mutex
-	desktopRefreshAt     map[string]time.Time
-	rateLimits           map[string]any
-	rateLimitsByID       map[string]any
-	streamPublisher      func(target string, frame map[string]any)
-	runtimeMu            sync.Mutex
-	activeThreads        map[string]time.Time
-	appServerThreads     map[string]bool
-	interruptingThreads  map[string]string
-	pendingTools         map[string]map[string]map[string]any
-	turnThreads          map[string]string
-	planType             string
-	lastState            string
-	lastError            string
-	lastChange           time.Time
-	clientFactory        func(func(string, map[string]any), func(any, string, map[string]any)) codexAppClient
-	desktopFactory       func() codexDesktopClient
-	desktopOpener        func(string) error
+	id                      string
+	cfg                     config.ProviderConfig
+	command                 string
+	cwd                     string
+	approvalPolicy          string
+	sandbox                 string
+	nextModel               string
+	nextEffort              string
+	preferDesktopCodex      bool
+	desktopSyncEnabled      bool
+	desktopIPCSocket        string
+	desktopIPCTimeout       time.Duration
+	desktopAttachTimeout    time.Duration
+	desktopIPCHostID        string
+	nativeDeliveryRoute     string
+	appServerTransport      string
+	sharedDaemonCommand     string
+	sharedDaemonAutostart   bool
+	client                  codexAppClient
+	clientMu                sync.Mutex
+	connectMu               sync.Mutex
+	clientGeneration        uint64
+	clientSequence          uint64
+	threadListMu            sync.Mutex
+	threadListLegacy        bool
+	discoveryMu             sync.Mutex
+	discovery               *codexDiscoveryCatalog
+	sessMu                  sync.Mutex
+	threads                 map[string]string
+	sessionStartOptions     map[string]map[string]any
+	desktopSyncSessions     map[string]bool
+	appServerResumeSessions map[string]bool
+	sessionRoutes           map[string]string
+	desktopOwnerClients     map[string]string
+	approvalMu              sync.Mutex
+	approvalsByThread       map[string][]*codexPendingApproval
+	bridge                  *codexDesktopBridge
+	bridgeMu                sync.Mutex
+	desktopRefreshMu        sync.Mutex
+	desktopRefreshAt        map[string]time.Time
+	rateLimits              map[string]any
+	rateLimitsByID          map[string]any
+	streamPublisher         func(target string, frame map[string]any)
+	runtimeMu               sync.Mutex
+	activeThreads           map[string]time.Time
+	appServerThreads        map[string]bool
+	interruptingThreads     map[string]string
+	pendingTools            map[string]map[string]map[string]any
+	turnThreads             map[string]string
+	planType                string
+	lastState               string
+	lastError               string
+	lastChange              time.Time
+	clientFactory           func(func(string, map[string]any), func(any, string, map[string]any)) codexAppClient
+	desktopFactory          func() codexDesktopClient
+	desktopOpener           func(string) error
 }
 
 func NewCodex(id string, cfg config.ProviderConfig) *Codex {
 	c := &Codex{
-		id:                   id,
-		cfg:                  cfg,
-		command:              firstNonEmpty(cfg.Command, "codex"),
-		cwd:                  expandUser(firstNonEmpty(cfg.Cwd, "~/Developer")),
-		approvalPolicy:       stringExtra(cfg.Extra, "approval_policy", "never"),
-		sandbox:              stringExtra(cfg.Extra, "sandbox", "workspace-write"),
-		nextModel:            stringExtra(cfg.Extra, "model", ""),
-		nextEffort:           stringExtra(cfg.Extra, "effort", ""),
-		preferDesktopCodex:   boolExtra(cfg.Extra, "prefer_desktop_codex", true),
-		desktopSyncEnabled:   boolExtra(cfg.Extra, "desktop_sync", true),
-		desktopIPCSocket:     stringExtra(cfg.Extra, "desktop_ipc_socket", ""),
-		desktopIPCTimeout:    durationExtra(cfg.Extra, "desktop_ipc_timeout", 8*time.Second),
-		desktopAttachTimeout: durationExtra(cfg.Extra, "desktop_attach_timeout", 6*time.Second),
-		desktopIPCHostID:     stringExtra(cfg.Extra, "desktop_ipc_host_id", "local"),
-		threads:              map[string]string{},
-		sessionStartOptions:  map[string]map[string]any{},
-		desktopSyncSessions:  map[string]bool{},
-		desktopOwnerClients:  map[string]string{},
-		approvalsByThread:    map[string][]*codexPendingApproval{},
-		activeThreads:        map[string]time.Time{},
-		appServerThreads:     map[string]bool{},
-		interruptingThreads:  map[string]string{},
-		pendingTools:         map[string]map[string]map[string]any{},
-		turnThreads:          map[string]string{},
-		desktopRefreshAt:     map[string]time.Time{},
-		lastState:            "idle",
+		id:                      id,
+		cfg:                     cfg,
+		command:                 firstNonEmpty(cfg.Command, "codex"),
+		cwd:                     expandUser(firstNonEmpty(cfg.Cwd, "~/Developer")),
+		approvalPolicy:          stringExtra(cfg.Extra, "approval_policy", "never"),
+		sandbox:                 stringExtra(cfg.Extra, "sandbox", "workspace-write"),
+		nextModel:               stringExtra(cfg.Extra, "model", ""),
+		nextEffort:              stringExtra(cfg.Extra, "effort", ""),
+		preferDesktopCodex:      boolExtra(cfg.Extra, "prefer_desktop_codex", true),
+		desktopSyncEnabled:      boolExtra(cfg.Extra, "desktop_sync", true),
+		desktopIPCSocket:        stringExtra(cfg.Extra, "desktop_ipc_socket", ""),
+		desktopIPCTimeout:       durationExtra(cfg.Extra, "desktop_ipc_timeout", 8*time.Second),
+		desktopAttachTimeout:    durationExtra(cfg.Extra, "desktop_attach_timeout", 6*time.Second),
+		desktopIPCHostID:        stringExtra(cfg.Extra, "desktop_ipc_host_id", "local"),
+		nativeDeliveryRoute:     codexNativeDeliveryRoute(stringExtra(cfg.Extra, "native_delivery_route", "")),
+		appServerTransport:      codexAppServerTransport(stringExtra(cfg.Extra, "app_server_transport", "")),
+		sharedDaemonCommand:     stringExtra(cfg.Extra, "shared_daemon_command", ""),
+		sharedDaemonAutostart:   boolExtra(cfg.Extra, "shared_daemon_autostart", false),
+		threads:                 map[string]string{},
+		sessionStartOptions:     map[string]map[string]any{},
+		desktopSyncSessions:     map[string]bool{},
+		appServerResumeSessions: map[string]bool{},
+		sessionRoutes:           map[string]string{},
+		desktopOwnerClients:     map[string]string{},
+		approvalsByThread:       map[string][]*codexPendingApproval{},
+		activeThreads:           map[string]time.Time{},
+		appServerThreads:        map[string]bool{},
+		interruptingThreads:     map[string]string{},
+		pendingTools:            map[string]map[string]map[string]any{},
+		turnThreads:             map[string]string{},
+		desktopRefreshAt:        map[string]time.Time{},
+		lastState:               "idle",
 	}
 	return c
 }
@@ -137,13 +150,66 @@ func (c *Codex) SetStreamPublisher(publish func(target string, frame map[string]
 
 func (c *Codex) ID() string { return c.id }
 
-// Installed reports whether a runnable codex binary exists on this device
-// (Codex.app bundled binary or PATH). Uninstalled providers are hidden from
-// the web console's provider list.
-func (c *Codex) Installed() bool { return c.resolveCommand() != "" }
+// NativeDeliveryRoute tells the API how a read-only native Codex preview
+// should be persisted before its first prompt. Current ChatGPT Desktop builds
+// do not publish an owner on the VS Code private IPC router, while the
+// supported shared app-server daemon can resume the exact persisted thread. Keep
+// Desktop IPC available only as an explicit compatibility override.
+func (c *Codex) NativeDeliveryRoute() string {
+	if c.nativeDeliveryRoute == "desktop_ipc" && !c.desktopSyncEnabled {
+		return "unavailable"
+	}
+	if c.appServerTransport != "shared_daemon" && c.nativeDeliveryRoute == "shared_daemon" {
+		if c.desktopSyncEnabled {
+			return "desktop_ipc"
+		}
+		return "unavailable"
+	}
+	return c.nativeDeliveryRoute
+}
+
+// AppServerDeliveryRoute identifies the concrete writer used for sessions
+// created by remote-agent itself. Persisting this value keeps a restart or
+// config change from silently moving an existing thread between the shared
+// daemon and a legacy stdio child.
+func (c *Codex) AppServerDeliveryRoute() string {
+	return c.appServerTransport
+}
+
+func codexNativeDeliveryRoute(route string) string {
+	if strings.EqualFold(strings.TrimSpace(route), "desktop_ipc") {
+		return "desktop_ipc"
+	}
+	return "shared_daemon"
+}
+
+func codexAppServerTransport(transport string) string {
+	if strings.EqualFold(strings.TrimSpace(transport), "stdio") {
+		return "stdio"
+	}
+	return "shared_daemon"
+}
+
+// Installed reports whether the configured transport has its required Codex
+// executable. Shared mode requires the official managed standalone layout;
+// legacy stdio mode accepts the Desktop bundle or PATH.
+func (c *Codex) Installed() bool {
+	if c.appServerTransport == "shared_daemon" {
+		_, err := c.resolveSharedDaemonCommand()
+		return err == nil
+	}
+	return c.resolveCommand() != ""
+}
 
 func (c *Codex) Status() Status {
 	cli := c.resolveCommand()
+	if c.appServerTransport == "shared_daemon" {
+		if managed, err := c.resolveSharedDaemonCommand(); err == nil {
+			cli = managed
+		} else {
+			cli = ""
+		}
+	}
 	err := (*string)(nil)
 	if msg := c.getLastError(); msg != "" {
 		err = &msg
@@ -161,7 +227,7 @@ func (c *Codex) Status() Status {
 			"screenshot": false, "ocr": false, "approval": true, "app_server": true,
 			"streaming": true, "steer": true, "interrupt": true, "rewind_user_message": true, "create_session": true,
 		},
-		Backend: "codex_app_server_go",
+		Backend: map[bool]string{true: "codex_shared_app_server", false: "codex_app_server_go"}[c.appServerTransport == "shared_daemon"],
 		Command: firstNonEmpty(cli, c.command),
 		Cwd:     c.cwd,
 		Account: c.accountBlock(),
@@ -291,6 +357,12 @@ func (c *Codex) SessionMessages(sessionID string) ([]map[string]any, error) {
 	if items := codexSessionMessages(threadID, stringSliceExtra(c.cfg.Extra, "codex_sessions_dirs", nil), nativePreviewUnlimited); len(items) > 0 {
 		return items, nil
 	}
+	switch c.sessionRoute(sessionID) {
+	case "desktop_ipc", "unavailable":
+		// A read fallback must not create a competing app-server owner for a
+		// Desktop-owned thread, nor bypass a fail-closed transport binding.
+		return nil, nil
+	}
 	// Native previews are latency-sensitive and are polled by the PWA. The
 	// app-server can take long enough to outlive the relay's upstream request,
 	// leaving a real conversation rendered as "0 messages". Use it only as a
@@ -416,7 +488,8 @@ func (c *Codex) OpenOrCreateSession(sessionID string, opts StartOptions) (string
 		c.setLastState("error")
 		return "", err
 	}
-	c.bindThread(sessionID, tid)
+	c.BindSessionRoute(sessionID, tid, c.appServerTransport, opts.Cwd)
+	c.markAppServerSessionReady(sessionID)
 	c.markAppServerThread(tid)
 	c.setStartOptions(sessionID, startOpts)
 	c.setLastError("")
@@ -425,6 +498,37 @@ func (c *Codex) OpenOrCreateSession(sessionID string, opts StartOptions) (string
 }
 
 func (c *Codex) OpenResumeSession(sessionID string, resumeID string, cwd string, fork bool) (string, error) {
+	route := c.sessionRoute(sessionID)
+	if route == "" {
+		route = c.NativeDeliveryRoute()
+	}
+	if route == "desktop_ipc" {
+		if fork {
+			err := errors.New("native Codex fork is unsupported over Desktop IPC")
+			c.setLastError(err.Error())
+			return "", err
+		}
+		c.BindSessionRoute(sessionID, resumeID, route, firstNonEmpty(cwd, c.cwd))
+		if err := c.attachDesktopOwner(resumeID); err != nil {
+			c.setLastError(err.Error())
+			c.setLastState("error")
+			return "", err
+		}
+		c.refreshDesktopPendingState(resumeID)
+		c.setLastError("")
+		c.setLastState("idle")
+		return resumeID, nil
+	}
+	if route != "shared_daemon" && route != "stdio" {
+		err := fmt.Errorf("native Codex resume/fork route is unavailable: %s", route)
+		c.setLastError(err.Error())
+		return "", err
+	}
+	if route != c.appServerTransport {
+		err := fmt.Errorf("persisted Codex owner route %s is unavailable", route)
+		c.setLastError(err.Error())
+		return "", err
+	}
 	client, err := c.ensureClient()
 	if err != nil {
 		c.setLastError(err.Error())
@@ -434,7 +538,10 @@ func (c *Codex) OpenResumeSession(sessionID string, resumeID string, cwd string,
 	if fork {
 		result, err = client.ThreadFork(resumeID, nil)
 		if err != nil && isThreadNotFound(err) {
-			_, _ = c.resumeThread(client, sessionID, resumeID, cwd)
+			if _, resumeErr := c.resumeThread(client, resumeID, resumeID, cwd); resumeErr != nil {
+				c.setLastError(resumeErr.Error())
+				return "", resumeErr
+			}
 			result, err = client.ThreadFork(resumeID, nil)
 		}
 	} else {
@@ -446,20 +553,20 @@ func (c *Codex) OpenResumeSession(sessionID string, resumeID string, cwd string,
 		c.setLastError(err.Error())
 		return "", err
 	}
-	tid := firstNonEmpty(stringAny(mapAny(mapAny(result)["thread"])["id"]), resumeID)
-	c.bindThread(sessionID, tid)
-	c.markDesktopSyncCandidate(sessionID, tid)
-	if err := c.attachDesktopOwner(tid); err != nil {
-		if !isNoDesktopOwnerClient(err) {
-			c.setLastError(err.Error())
-			c.setLastState("error")
-			return tid, err
-		}
+	tid := stringAny(mapAny(mapAny(result)["thread"])["id"])
+	if tid == "" {
+		err := errors.New("native Codex resume/fork returned no thread id")
+		c.setLastError(err.Error())
+		return "", err
 	}
-	// The Desktop owner may already be waiting on approval/user input. Force a
-	// full snapshot so the persistent follower bridge receives requests that
-	// predate this attach instead of waiting for a future patch.
-	c.refreshDesktopPendingState(tid)
+	if fork && tid == resumeID {
+		err := errors.New("native Codex fork returned the source thread id")
+		c.setLastError(err.Error())
+		return "", err
+	}
+	c.BindSessionRoute(sessionID, tid, route, firstNonEmpty(cwd, c.cwd))
+	c.markAppServerSessionReady(sessionID)
+	c.markAppServerThread(tid)
 	c.setLastError("")
 	c.setLastState("idle")
 	return tid, nil
@@ -481,6 +588,24 @@ func (c *Codex) RewindUserMessage(opts RewindUserMessageOptions) (RewindUserMess
 	if strings.TrimSpace(opts.Prompt) == "" {
 		return RewindUserMessageResult{}, errors.New("prompt is empty")
 	}
+	threadID := c.threadForSession(opts.ThreadID)
+	if threadID == "" {
+		return RewindUserMessageResult{}, errors.New("codex rewind source has no native thread")
+	}
+	sourceRoute := c.sessionRoute(opts.ThreadID)
+	if sourceRoute == "" && threadID == opts.ThreadID && codexThreadIDRE.MatchString(threadID) {
+		sourceRoute = c.NativeDeliveryRoute()
+	}
+	if sourceRoute != "shared_daemon" && sourceRoute != "stdio" {
+		err := errors.New("codex rewind requires an app-server-owned source session")
+		c.setLastError(err.Error())
+		return RewindUserMessageResult{}, err
+	}
+	if sourceRoute != c.appServerTransport {
+		err := fmt.Errorf("codex rewind owner transport %s is unavailable", sourceRoute)
+		c.setLastError(err.Error())
+		return RewindUserMessageResult{}, err
+	}
 	client, err := c.ensureClient()
 	if err != nil {
 		c.setLastError(err.Error())
@@ -492,7 +617,7 @@ func (c *Codex) RewindUserMessage(opts RewindUserMessageOptions) (RewindUserMess
 		c.setLastError(err.Error())
 		return RewindUserMessageResult{}, err
 	}
-	res, err := client.ThreadResume(opts.ThreadID, nil, 20*time.Second)
+	res, err := client.ThreadResume(threadID, nil, c.appServerResumeTimeout())
 	if err != nil {
 		c.setLastError(err.Error())
 		return RewindUserMessageResult{}, err
@@ -503,12 +628,59 @@ func (c *Codex) RewindUserMessage(opts RewindUserMessageOptions) (RewindUserMess
 		c.setLastError(err.Error())
 		return RewindUserMessageResult{}, err
 	}
+	resumedID := firstNonEmpty(stringAny(thread["id"]), stringAny(thread["threadId"]))
+	if resumedID != threadID {
+		err := fmt.Errorf("thread/resume route mismatch: requested %s, received %s", threadID, resumedID)
+		c.setLastError(err.Error())
+		return RewindUserMessageResult{}, err
+	}
+	targetCwd := firstNonEmpty(opts.Cwd, c.cwd)
+	returnedCwd := firstNonEmpty(stringAny(thread["cwd"]), stringAny(mapAny(res)["cwd"]))
+	if returnedCwd != "" && !sameCodexCwd(returnedCwd, targetCwd) {
+		err := fmt.Errorf(
+			"thread/resume cwd mismatch for %s: requested %q, received %q",
+			threadID,
+			targetCwd,
+			returnedCwd,
+		)
+		c.setLastError(err.Error())
+		return RewindUserMessageResult{}, err
+	}
+	status := firstNonEmpty(
+		stringAny(mapAny(thread["status"])["type"]),
+		stringAny(thread["status"]),
+	)
+	if status == "" {
+		status = "idle"
+	}
+	activeTurnID, activeTurns := codexResumedActiveTurn(thread)
+	if activeTurns > 1 || (status == "active" && activeTurns != 1) ||
+		(status != "active" && activeTurns != 0) {
+		err := fmt.Errorf("thread/resume returned inconsistent active turn state for %s", threadID)
+		c.setLastError(err.Error())
+		return RewindUserMessageResult{}, err
+	}
+	client.SetThreadStatus(threadID, status)
+	c.setThreadActive(threadID, status == "active")
+	if activeTurnID != "" {
+		client.SetThreadTurn(threadID, activeTurnID)
+		c.bindTurnThread(threadID, activeTurnID)
+	}
+	if status == "active" {
+		err := errors.New("a turn is already in progress for this codex thread")
+		c.setLastError(err.Error())
+		return RewindUserMessageResult{}, err
+	}
 	numTurns, err := codexRollbackTurnCount(thread, opts.TurnID)
 	if err != nil {
 		c.setLastError(err.Error())
 		return RewindUserMessageResult{}, err
 	}
-	c.bindThread(opts.SessionID, opts.ThreadID)
+	if _, err := client.ThreadRollback(threadID, numTurns, nil); err != nil {
+		c.setLastError(err.Error())
+		c.setLastState("error")
+		return RewindUserMessageResult{}, err
+	}
 	startOpts := c.startOptionsFor(opts.SessionID)
 	if startOpts == nil {
 		startOpts = map[string]any{}
@@ -517,33 +689,37 @@ func (c *Codex) RewindUserMessage(opts RewindUserMessageOptions) (RewindUserMess
 		startOpts["cwd"] = opts.Cwd
 	}
 	c.setStartOptions(opts.SessionID, startOpts)
-	c.markDesktopSyncCandidate(opts.SessionID, opts.ThreadID)
-	if _, err := client.ThreadRollback(opts.ThreadID, numTurns, nil); err != nil {
-		c.setLastError(err.Error())
-		c.setLastState("error")
-		return RewindUserMessageResult{}, err
-	}
-	turnID, route, err := c.startTurn(opts.SessionID, opts.ThreadID, opts.Prompt)
+	c.BindSessionRoute(opts.SessionID, threadID, sourceRoute, targetCwd)
+	c.markAppServerSessionReady(opts.SessionID)
+	c.markAppServerThread(threadID)
+	turnID, route, err := c.startTurnWithBudget(
+		opts.SessionID,
+		threadID,
+		opts.Prompt,
+		nil,
+		codexAppServerMutationTimeout,
+		false,
+	)
 	if err != nil {
 		c.setLastError(err.Error())
 		c.setLastState("error")
 		return RewindUserMessageResult{}, err
 	}
 	if turnID != "" {
-		client.SetThreadTurn(opts.ThreadID, turnID)
+		client.SetThreadTurn(threadID, turnID)
 	}
 	if route != "Codex app-server" {
-		c.setThreadActive(opts.ThreadID, true)
+		c.setThreadActive(threadID, true)
 		c.setLastError("")
 		c.setLastState("running")
 	}
 	return RewindUserMessageResult{
 		SessionID:    opts.SessionID,
-		ThreadID:     opts.ThreadID,
+		ThreadID:     threadID,
 		TurnID:       turnID,
 		State:        "running",
 		Message:      "codex thread rewound and edited turn started via " + route,
-		NativeTaskID: opts.ThreadID,
+		NativeTaskID: threadID,
 	}, nil
 }
 
@@ -553,6 +729,8 @@ func (c *Codex) CloseSession(sessionID string) map[string]any {
 	delete(c.threads, sessionID)
 	delete(c.sessionStartOptions, sessionID)
 	delete(c.desktopSyncSessions, sessionID)
+	delete(c.appServerResumeSessions, sessionID)
+	delete(c.sessionRoutes, sessionID)
 	c.sessMu.Unlock()
 	c.clearDesktopOwnerClient(tid)
 	return map[string]any{"ok": true, "killed": false, "detail": "thread detached (persists on disk; attach by id)"}
@@ -563,16 +741,73 @@ func (c *Codex) BindTranscript(sessionID string, transcriptID string) {
 		return
 	}
 	c.bindThread(sessionID, transcriptID)
-	c.scheduleDesktopPendingRefresh(transcriptID)
 }
 
-// BindDesktopTranscript marks a persisted native Desktop preview for IPC
-// delivery. Plain BindTranscript intentionally does not: remote-agent-owned
-// app-server threads use the same UUID format and must remain on app-server.
+// BindSessionRoute restores the persisted mutable owner route and cwd. Plain
+// BindTranscript remains a read-side alias and must not change ownership.
+func (c *Codex) BindSessionRoute(sessionID string, transcriptID string, route string, cwd string) {
+	if sessionID == "" || transcriptID == "" {
+		return
+	}
+	route = strings.TrimSpace(route)
+	if route == "app_server" {
+		route = c.appServerTransport
+	}
+	if route == "shared_daemon" && c.appServerTransport != "shared_daemon" {
+		// A persisted owner route is authoritative. Configuration drift must
+		// fail closed instead of moving a thread to a different writer.
+		route = "unavailable"
+	}
+	if route == "stdio" && c.appServerTransport != "stdio" {
+		route = "unavailable"
+	}
+	if route == "desktop_ipc" && !c.desktopSyncEnabled {
+		route = "unavailable"
+	}
+	if route != "desktop_ipc" && route != "shared_daemon" && route != "stdio" && route != "unavailable" {
+		route = "unavailable"
+	}
+	c.sessMu.Lock()
+	alreadyReady := c.threads[sessionID] == transcriptID &&
+		c.sessionRoutes[sessionID] == route &&
+		!c.appServerResumeSessions[sessionID]
+	c.threads[sessionID] = transcriptID
+	c.sessionRoutes[sessionID] = route
+	if cwd != "" {
+		opts := c.sessionStartOptions[sessionID]
+		if opts == nil {
+			opts = map[string]any{}
+		}
+		opts["cwd"] = expandUser(cwd)
+		c.sessionStartOptions[sessionID] = opts
+	}
+	if route == "desktop_ipc" {
+		c.desktopSyncSessions[sessionID] = true
+		delete(c.appServerResumeSessions, sessionID)
+	} else if route == "shared_daemon" || route == "stdio" {
+		delete(c.desktopSyncSessions, sessionID)
+		if !alreadyReady {
+			c.appServerResumeSessions[sessionID] = true
+		}
+	} else {
+		delete(c.desktopSyncSessions, sessionID)
+		delete(c.appServerResumeSessions, sessionID)
+	}
+	c.sessMu.Unlock()
+	if route == "desktop_ipc" {
+		c.markDesktopOwnedThread(transcriptID)
+	} else {
+		c.clearDesktopOwnerClient(transcriptID)
+	}
+	if route == "desktop_ipc" {
+		c.scheduleDesktopPendingRefresh(transcriptID)
+	}
+}
+
+// BindDesktopTranscript is the compatibility binder for providers/API
+// versions that do not yet pass an explicit route.
 func (c *Codex) BindDesktopTranscript(sessionID string, transcriptID string) {
-	c.BindTranscript(sessionID, transcriptID)
-	c.markDesktopOwnedThread(transcriptID)
-	c.markDesktopSyncCandidate(sessionID, transcriptID)
+	c.BindSessionRoute(sessionID, transcriptID, "desktop_ipc", "")
 }
 
 func (c *Codex) SendPrompt(sessionID string, prompt string) SendResult {
@@ -617,8 +852,7 @@ func (c *Codex) SendPromptWithAttachments(sessionID string, prompt string, attac
 }
 
 func (c *Codex) LatestOutput(sessionID string) map[string]any {
-	tid := c.threadForSession(sessionID)
-	msgs, _ := c.SessionMessages(tid)
+	msgs, _ := c.SessionMessages(sessionID)
 	text := ""
 	for i := len(msgs) - 1; i >= 0; i-- {
 		if s := stringAny(msgs[i]["text"]); s != "" {
@@ -703,7 +937,7 @@ func (c *Codex) relayApprovalDecision(sessionID string, req *codexPendingApprova
 	status := "relayed"
 	confirmed := true
 	if req.Source == codexApprovalSourceAppServer {
-		// A successful stdin write is only transport acceptance. Keep the
+		// A successful response write is only transport acceptance. Keep the
 		// immutable request route until serverRequest/resolved or turn terminal.
 		status = "responding"
 		confirmed = false
@@ -1033,10 +1267,13 @@ func (c *Codex) SessionRunning(sessionID string) *bool {
 	if tid == "" {
 		return nil
 	}
+	switch c.sessionRoute(sessionID) {
+	case "unavailable":
+		return nil
+	case "desktop_ipc":
+		return c.desktopThreadRunning(tid)
+	}
 	if client == nil {
-		if v := c.desktopThreadRunning(tid); v != nil {
-			return v
-		}
 		if c.threadActive(tid) {
 			v := true
 			return &v
@@ -1049,9 +1286,6 @@ func (c *Codex) SessionRunning(sessionID string) *bool {
 			c.setThreadActive(tid, true)
 			return &v
 		}
-	}
-	if v := c.desktopThreadRunning(tid); v != nil {
-		return v
 	}
 	if c.threadActive(tid) {
 		v := true
@@ -1552,11 +1786,39 @@ func (c *Codex) ensureClient() (codexAppClient, error) {
 		if c.clientFactory != nil {
 			client = c.clientFactory(onNotification, onServerRequest)
 		} else {
-			bin := c.resolveCommand()
-			if bin == "" {
-				return nil, CodexAppServerError{"codex binary not found in ChatGPT.app, Codex.app, or PATH: " + c.command}
+			if c.appServerTransport == "shared_daemon" {
+				bin, err := c.resolveSharedDaemonCommand()
+				if err != nil {
+					return nil, err
+				}
+				status, queryErr := QueryCodexSharedDaemon(context.Background(), bin, codexSharedDaemonStatusTimeout)
+				if queryErr != nil && c.sharedDaemonAutostart {
+					if startErr := StartCodexSharedDaemon(context.Background(), bin, codexSharedDaemonMaxTimeout); startErr != nil {
+						return nil, startErr
+					}
+					status, queryErr = QueryCodexSharedDaemon(context.Background(), bin, codexSharedDaemonStatusTimeout)
+				}
+				if queryErr != nil {
+					return nil, queryErr
+				}
+				client = NewCodexSharedAppServerClient(
+					status,
+					c.cwd,
+					onNotification,
+					onServerRequest,
+				)
+			} else {
+				bin := c.resolveCommand()
+				if bin == "" {
+					return nil, CodexAppServerError{"codex binary not found in ChatGPT.app, Codex.app, or PATH: " + c.command}
+				}
+				client = NewCodexAppServerClient(
+					[]string{bin, "app-server"},
+					c.cwd,
+					onNotification,
+					onServerRequest,
+				)
 			}
-			client = NewCodexAppServerClient([]string{bin, "app-server"}, c.cwd, onNotification, onServerRequest)
 		}
 		if lifecycle, ok := client.(codexAppClientExitHandler); ok {
 			lifecycle.SetExitHandler(func(err error) {
@@ -1669,7 +1931,7 @@ func (c *Codex) threadFor(sessionID string) string {
 
 func (c *Codex) resumeThread(client codexAppClient, sessionID string, threadID string, cwd string) (string, error) {
 	targetCwd := firstNonEmpty(cwd, c.cwd)
-	res, err := client.ThreadResume(threadID, map[string]any{"cwd": targetCwd}, 60*time.Second)
+	res, err := client.ThreadResume(threadID, map[string]any{"cwd": targetCwd}, c.appServerResumeTimeout())
 	if err != nil {
 		return "", err
 	}
@@ -1681,9 +1943,14 @@ func (c *Codex) resumeThread(client codexAppClient, sessionID string, threadID s
 	if tid != threadID {
 		return "", fmt.Errorf("thread/resume route mismatch: requested %s, received %s", threadID, tid)
 	}
-	if returnedCwd := stringAny(thread["cwd"]); returnedCwd != "" &&
-		filepath.Clean(expandUser(returnedCwd)) != filepath.Clean(expandUser(targetCwd)) {
-		return "", fmt.Errorf("thread/resume cwd mismatch for %s", threadID)
+	returnedCwd := firstNonEmpty(stringAny(thread["cwd"]), stringAny(mapAny(res)["cwd"]))
+	if returnedCwd != "" && !sameCodexCwd(returnedCwd, targetCwd) {
+		return "", fmt.Errorf(
+			"thread/resume cwd mismatch for %s: requested %q, received %q",
+			threadID,
+			targetCwd,
+			returnedCwd,
+		)
 	}
 	c.bindThread(sessionID, tid)
 	opts := c.startOptionsFor(sessionID)
@@ -1692,8 +1959,73 @@ func (c *Codex) resumeThread(client codexAppClient, sessionID string, threadID s
 	}
 	opts["cwd"] = targetCwd
 	c.setStartOptions(sessionID, opts)
-	client.SetThreadStatus(tid, "idle")
+	status := firstNonEmpty(
+		stringAny(mapAny(thread["status"])["type"]),
+		stringAny(thread["status"]),
+	)
+	if status == "" {
+		status = "idle"
+	}
+	activeTurnID, activeTurns := codexResumedActiveTurn(thread)
+	if activeTurns > 1 || (status == "active" && activeTurns != 1) ||
+		(status != "active" && activeTurns != 0) {
+		return "", fmt.Errorf("thread/resume returned inconsistent active turn state for %s", threadID)
+	}
+	client.SetThreadStatus(tid, status)
+	c.setThreadActive(tid, status == "active")
+	if activeTurnID != "" {
+		client.SetThreadTurn(tid, activeTurnID)
+		c.bindTurnThread(tid, activeTurnID)
+	}
 	return tid, nil
+}
+
+func sameCodexCwd(left string, right string) bool {
+	return comparableCodexCwd(left) == comparableCodexCwd(right)
+}
+
+func (c *Codex) appServerResumeTimeout() time.Duration {
+	if c.appServerTransport == "stdio" {
+		return codexAppServerStdioResumeTimeout
+	}
+	return codexAppServerMutationTimeout
+}
+
+func comparableCodexCwd(path string) string {
+	clean := filepath.Clean(expandUser(path))
+	probe := clean
+	suffix := []string{}
+	for {
+		if resolved, err := filepath.EvalSymlinks(probe); err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved)
+		}
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			return clean
+		}
+		suffix = append(suffix, filepath.Base(probe))
+		probe = parent
+	}
+}
+
+func codexResumedActiveTurn(thread map[string]any) (string, int) {
+	activeID := ""
+	count := 0
+	for _, turn := range codexThreadTurns(thread) {
+		status := strings.ToLower(firstNonEmpty(
+			stringAny(mapAny(turn["status"])["type"]),
+			stringAny(turn["status"]),
+		))
+		switch status {
+		case "active", "running", "inprogress", "in_progress":
+			count++
+			activeID = stringAny(turn["id"])
+		}
+	}
+	return activeID, count
 }
 
 func (c *Codex) threadStartOptions(cwd string, model string, effort string, mode string) map[string]any {
@@ -1751,6 +2083,32 @@ func (c *Codex) resolveCommand() string {
 		return p
 	}
 	return ""
+}
+
+func (c *Codex) resolveSharedDaemonCommand() (string, error) {
+	candidates := []string{}
+	if configured := strings.TrimSpace(c.sharedDaemonCommand); configured != "" {
+		candidates = append(candidates, expandUser(configured))
+	} else {
+		if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
+			candidates = append(candidates, filepath.Join(expandUser(codexHome), "packages", "standalone", "current", "codex"))
+		}
+		if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+			candidates = append(candidates, filepath.Join(home, ".codex", "packages", "standalone", "current", "codex"))
+		}
+	}
+	var lastErr error
+	for _, candidate := range dedupeStrings(candidates) {
+		resolved, err := validateCodexSharedDaemonExecutable(candidate)
+		if err == nil {
+			return resolved, nil
+		}
+		lastErr = err
+	}
+	if strings.TrimSpace(c.sharedDaemonCommand) != "" && lastErr != nil {
+		return "", fmt.Errorf("configured Codex shared daemon command is unsafe: %w", lastErr)
+	}
+	return "", errors.New("Codex shared app-server requires the managed standalone install at ~/.codex/packages/standalone/current/codex")
 }
 
 func resolveDesktopCodex(candidates []string) string {
@@ -1920,6 +2278,15 @@ func (c *Codex) attachDesktopOwner(threadID string) error {
 			return nil
 		}
 		if time.Now().After(deadline) {
+			if c.desktopFactory == nil {
+				conn, socketErr := dialCodexDesktopSocket(c.desktopIPCSocket, 500*time.Millisecond)
+				if conn != nil {
+					_ = conn.Close()
+				}
+				if socketErr != nil {
+					return fmt.Errorf("codex Desktop IPC unavailable: %w", socketErr)
+				}
+			}
 			return errNoDesktopOwnerClient()
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -1967,7 +2334,11 @@ func (c *Codex) shouldTryDesktopSync(sessionID string, threadID string) bool {
 func (c *Codex) threadForDelivery(sessionID string) (string, error) {
 	c.sessMu.Lock()
 	bound := c.threads[sessionID]
+	route := c.sessionRoutes[sessionID]
 	c.sessMu.Unlock()
+	if route == "unavailable" {
+		return "", errors.New("native Codex delivery requires shared daemon or explicit Desktop IPC")
+	}
 	tid := firstNonEmpty(bound, sessionID)
 	if tid == "" {
 		return "", errors.New("no codex thread")
@@ -1981,18 +2352,27 @@ func (c *Codex) threadForDelivery(sessionID string) (string, error) {
 	return tid, nil
 }
 
-// startTurn keeps Desktop ownership authoritative for native Desktop threads.
-// A preview may not have an owner yet because merely listing a persisted
-// thread does not load it into a renderer. Open it lazily on the first send,
-// wait for the renderer to claim ownership, and then address that owner over
-// IPC. Falling back to a separate app-server for such a thread is unsafe: the
-// Desktop app-server may already own it, while a second thread/resume can hang
-// and leave the caller unable to tell whether the prompt was delivered.
+// startTurn honors the owner route bound before delivery. Shared-daemon
+// sessions resume and write on that connection; the explicit Desktop
+// compatibility route lazily opens the renderer and targets its published IPC
+// owner. A request is never retried across those routes after delivery may
+// have occurred.
 func (c *Codex) startTurn(sessionID string, threadID string, prompt string) (string, string, error) {
 	return c.startTurnWithAttachments(sessionID, threadID, prompt, nil)
 }
 
 func (c *Codex) startTurnWithAttachments(sessionID string, threadID string, prompt string, attachments []Attachment) (string, string, error) {
+	return c.startTurnWithBudget(sessionID, threadID, prompt, attachments, 0, true)
+}
+
+func (c *Codex) startTurnWithBudget(
+	sessionID string,
+	threadID string,
+	prompt string,
+	attachments []Attachment,
+	timeout time.Duration,
+	retryThreadNotFound bool,
+) (string, string, error) {
 	if c.shouldTryDesktopSync(sessionID, threadID) {
 		if c.ensureDesktopOwnerClient(threadID) == "" {
 			if err := c.attachDesktopOwner(threadID); err != nil {
@@ -2026,8 +2406,30 @@ func (c *Codex) startTurnWithAttachments(sessionID string, threadID string, prom
 		return "", "", err
 	}
 	_, generation := c.currentClientRoute()
+	if c.appServerResumeBound(sessionID) {
+		resumeCwd := stringAny(c.startOptionsFor(sessionID)["cwd"])
+		if _, err := c.resumeThread(client, sessionID, threadID, resumeCwd); err != nil {
+			return "", "", err
+		}
+		if client.IsActive(threadID) {
+			return "", "", errors.New("a turn is already in progress for this codex thread")
+		}
+	}
 	c.markAppServerThread(threadID)
 	start := func() (any, error) {
+		if timeout > 0 {
+			if timed, ok := client.(interface {
+				TurnStartWithAttachmentsTimeout(string, string, []Attachment, map[string]any, time.Duration) (any, error)
+			}); ok {
+				return timed.TurnStartWithAttachmentsTimeout(
+					threadID,
+					prompt,
+					attachments,
+					c.startOptionsFor(sessionID),
+					timeout,
+				)
+			}
+		}
 		if len(attachments) == 0 {
 			return client.TurnStart(threadID, prompt, c.startOptionsFor(sessionID))
 		}
@@ -2040,13 +2442,20 @@ func (c *Codex) startTurnWithAttachments(sessionID string, threadID string, prom
 		return withAttachments.TurnStartWithAttachments(threadID, prompt, attachments, c.startOptionsFor(sessionID))
 	}
 	res, err := start()
-	if err != nil && isThreadNotFound(err) {
+	if err != nil && retryThreadNotFound && isThreadNotFound(err) {
 		if _, resumeErr := c.resumeThread(client, sessionID, threadID, ""); resumeErr != nil {
 			return "", "", resumeErr
 		}
 		res, err = start()
 	}
 	if err != nil {
+		if codexTurnStartOutcomeUnknown(err) {
+			c.markAppServerSessionNeedsResume(sessionID)
+			return "", "", fmt.Errorf(
+				"%w; turn/start delivery outcome is unknown and the next send will reconcile this thread first",
+				err,
+			)
+		}
 		return "", "", err
 	}
 	turnID := responseTurnID(res)
@@ -2054,9 +2463,20 @@ func (c *Codex) startTurnWithAttachments(sessionID string, threadID string, prom
 		client.SetThreadTurn(threadID, turnID)
 	}
 	if !c.activateAppServerTurn(client, generation, threadID, turnID) {
+		c.markAppServerSessionNeedsResume(sessionID)
 		return "", "", errors.New("Codex app-server exited after turn/start acknowledgement; terminal state is unknown")
 	}
 	return turnID, "Codex app-server", nil
+}
+
+func codexTurnStartOutcomeUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "timeout waiting for turn/start") ||
+		strings.Contains(message, "write to codex app-server failed") ||
+		strings.Contains(message, `"code":-32099`)
 }
 
 func (c *Codex) markDesktopSyncCandidate(sessionID string, threadID string) {
@@ -2064,6 +2484,8 @@ func (c *Codex) markDesktopSyncCandidate(sessionID string, threadID string) {
 	defer c.sessMu.Unlock()
 	if c.desktopSyncEnabled && codexThreadIDRE.MatchString(threadID) {
 		c.desktopSyncSessions[sessionID] = true
+		delete(c.appServerResumeSessions, sessionID)
+		c.sessionRoutes[sessionID] = "desktop_ipc"
 	} else {
 		delete(c.desktopSyncSessions, sessionID)
 	}
@@ -2414,6 +2836,30 @@ func (c *Codex) desktopSyncBound(sessionID string) bool {
 	return c.desktopSyncSessions[sessionID]
 }
 
+func (c *Codex) sessionRoute(sessionID string) string {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	return c.sessionRoutes[sessionID]
+}
+
+func (c *Codex) appServerResumeBound(sessionID string) bool {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	return c.appServerResumeSessions[sessionID]
+}
+
+func (c *Codex) markAppServerSessionReady(sessionID string) {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	delete(c.appServerResumeSessions, sessionID)
+}
+
+func (c *Codex) markAppServerSessionNeedsResume(sessionID string) {
+	c.sessMu.Lock()
+	defer c.sessMu.Unlock()
+	c.appServerResumeSessions[sessionID] = true
+}
+
 func (c *Codex) setLastState(state string) {
 	c.sessMu.Lock()
 	defer c.sessMu.Unlock()
@@ -2514,6 +2960,9 @@ func (c *Codex) refreshDesktopPendingState(threadID string) bool {
 // Codex Desktop (approval policy, reviewer, sandbox, model, effort) so
 // /status reflects the rollout truth instead of provider defaults.
 func (c *Codex) SessionSettings(sessionID string) map[string]any {
+	if !c.desktopSyncBound(sessionID) {
+		return nil
+	}
 	tid := c.threadForSession(sessionID)
 	if tid == "" || !codexThreadIDRE.MatchString(tid) {
 		return nil
@@ -2705,18 +3154,23 @@ func (c *Codex) anyAppServerApprovals() bool {
 	return false
 }
 
-// pendingApprovalsForSession merges app-server approvals with Desktop-owned
-// approvals mirrored by the IPC bridge, oldest first. With an empty session
-// id it reports app-server approvals across all threads (provider-global
-// view).
+// pendingApprovalsForSession returns approvals only from the session's bound
+// owner route. With an empty session id it reports app-server approvals across
+// all threads for the provider-global view.
 func (c *Codex) pendingApprovalsForSession(sessionID string) (string, []*codexPendingApproval) {
 	threadID := ""
 	out := []*codexPendingApproval{}
 	seen := map[string]bool{}
 	interrupting := c.interruptingThreadSet()
+	route := ""
 	if sessionID != "" {
 		threadID = c.threadForSession(sessionID)
+		route = c.sessionRoute(sessionID)
+		if route == "unavailable" {
+			return threadID, out
+		}
 	}
+	desktopRoute := route == "desktop_ipc"
 	c.approvalMu.Lock()
 	if sessionID == "" {
 		for _, list := range c.approvalsByThread {
@@ -2726,7 +3180,7 @@ func (c *Codex) pendingApprovalsForSession(sessionID string) (string, []*codexPe
 				}
 			}
 		}
-	} else {
+	} else if !desktopRoute {
 		if !interrupting[threadID] {
 			for _, req := range c.approvalsByThread[threadID] {
 				if !req.Responding {
@@ -2739,7 +3193,7 @@ func (c *Codex) pendingApprovalsForSession(sessionID string) (string, []*codexPe
 	for _, req := range out {
 		seen[req.Key] = true
 	}
-	if threadID != "" {
+	if threadID != "" && desktopRoute {
 		if b := c.desktopBridge(); b != nil {
 			for _, breq := range b.PendingHumanRequests(threadID) {
 				req := newCodexPendingApproval(breq.ID, breq.Method, breq.Params, codexApprovalSourceDesktop)

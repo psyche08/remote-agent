@@ -16,15 +16,56 @@ import (
 
 const fakeCodexThreadID = "019ecffb-fd7d-7422-b05c-2e1c3ebec53d"
 
+func TestCodexWorstCaseMutableRequestBudgetFitsRelay(t *testing.T) {
+	const relayHTTPTimeout = 30 * time.Second
+	sharedConnectBudget := 2*codexSharedDaemonStatusTimeout +
+		codexSharedDaemonMaxTimeout +
+		codexAppServerWebSocketDialTimeout +
+		codexAppServerInitializeTimeout
+	// Rewind is the longest synchronous mutable path: authoritative resume,
+	// rollback, then turn/start. Other create/send/control requests use fewer
+	// app-server mutations.
+	sharedRewindBudget := sharedConnectBudget + 3*codexAppServerMutationTimeout
+	stdioRewindBudget := codexAppServerStdioInitializeTimeout +
+		codexAppServerStdioResumeTimeout +
+		2*codexAppServerMutationTimeout
+	// A first resume request can negotiate thread/list, then validate a
+	// missing source with resume before retrying fork. The two list variants
+	// share one deadline rather than each consuming a full timeout.
+	sharedResumeBudget := sharedConnectBudget + codexThreadListTotalTimeout +
+		2*codexAppServerMutationTimeout
+	stdioResumeBudget := codexAppServerStdioInitializeTimeout +
+		codexThreadListTotalTimeout +
+		codexAppServerStdioResumeTimeout +
+		codexAppServerMutationTimeout
+	sharedCreateBudget := sharedConnectBudget + codexAppServerThreadStartTimeout
+	stdioCreateBudget := codexAppServerStdioInitializeTimeout + codexAppServerStdioThreadStartTimeout
+	for name, budget := range map[string]time.Duration{
+		"shared rewind": sharedRewindBudget,
+		"stdio rewind":  stdioRewindBudget,
+		"shared resume": sharedResumeBudget,
+		"stdio resume":  stdioResumeBudget,
+		"shared create": sharedCreateBudget,
+		"stdio create":  stdioCreateBudget,
+	} {
+		if budget >= relayHTTPTimeout {
+			t.Fatalf("%s budget=%s must stay below relay timeout=%s", name, budget, relayHTTPTimeout)
+		}
+	}
+}
+
 type fakeCodexClient struct {
 	mu             sync.Mutex
 	threadStatus   map[string]string
 	threadTurn     map[string]string
 	turns          [][2]string
+	turnErrors     []error
+	turnHook       func()
 	steers         [][2]string
 	interrupts     []string
 	rollbacks      [][2]any
 	resumes        []string
+	forks          []string
 	responses      []map[string]any
 	errorResponses []map[string]any
 	respondedIDs   []any
@@ -32,6 +73,9 @@ type fakeCodexClient struct {
 	listParams     []map[string]any
 	listErrors     []error
 	resumeResult   any
+	resumeErr      error
+	forkResult     any
+	forkErrors     []error
 	active         bool
 	lastModel      string
 	startErr       error
@@ -64,6 +108,9 @@ func (f *fakeCodexClient) ThreadResume(threadID string, params map[string]any, t
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.resumes = append(f.resumes, threadID)
+	if f.resumeErr != nil {
+		return nil, f.resumeErr
+	}
 	f.threadStatus[threadID] = "idle"
 	if f.resumeResult != nil {
 		return f.resumeResult, nil
@@ -72,6 +119,19 @@ func (f *fakeCodexClient) ThreadResume(threadID string, params map[string]any, t
 }
 
 func (f *fakeCodexClient) ThreadFork(threadID string, params map[string]any) (any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.forks = append(f.forks, threadID)
+	if len(f.forkErrors) > 0 {
+		err := f.forkErrors[0]
+		f.forkErrors = f.forkErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
+	if f.forkResult != nil {
+		return f.forkResult, nil
+	}
 	return map[string]any{"thread": map[string]any{"id": "fork-1"}}, nil
 }
 
@@ -112,9 +172,21 @@ func (f *fakeCodexClient) TurnStart(threadID string, prompt string, extra map[st
 		return nil, errors.New("thread " + threadID + " has a live turn in progress")
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	if len(f.turnErrors) > 0 {
+		err := f.turnErrors[0]
+		f.turnErrors = f.turnErrors[1:]
+		if err != nil {
+			f.mu.Unlock()
+			return nil, err
+		}
+	}
 	f.turns = append(f.turns, [2]string{threadID, prompt})
 	f.threadTurn[threadID] = "turn-1"
+	hook := f.turnHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return map[string]any{"turn": map[string]any{"id": "turn-1"}}, nil
 }
 
@@ -349,12 +421,22 @@ func TestCodexOpenSessionThenSendTurnViaAppServer(t *testing.T) {
 	if tid != fakeCodexThreadID || c.threads["s1"] != fakeCodexThreadID {
 		t.Fatalf("bad thread mapping: %s %#v", tid, c.threads)
 	}
+	if c.sessionRoutes["s1"] != "shared_daemon" {
+		t.Fatalf("new session owner route=%q", c.sessionRoutes["s1"])
+	}
+	// The API persists and idempotently rebinds the concrete owner after
+	// OpenOrCreateSession returns. That must not turn a just-created thread
+	// into a resume candidate before its first rollout exists.
+	c.BindSessionRoute("s1", fakeCodexThreadID, "shared_daemon", "/work")
 	res := c.SendPrompt("s1", "hello codex")
 	if !res.OK || res.NativeTaskID != fakeCodexThreadID || res.Message != "turn started via Codex app-server" {
 		t.Fatalf("bad send: %#v", res)
 	}
 	if len(fc.turns) != 1 || fc.turns[0] != [2]string{fakeCodexThreadID, "hello codex"} {
 		t.Fatalf("app-server TurnStart not used: %#v", fc.turns)
+	}
+	if len(fc.resumes) != 0 {
+		t.Fatalf("fresh thread was redundantly resumed: %#v", fc.resumes)
 	}
 }
 
@@ -730,7 +812,7 @@ func TestCodexInterruptRefreshesStaleDesktopOwnerOnce(t *testing.T) {
 	}
 }
 
-func TestCodexResumeDoesNotSendWithoutDesktopOwner(t *testing.T) {
+func TestCodexResumeSendsThroughSharedDaemonWithoutDesktopOwner(t *testing.T) {
 	fc := newFakeCodexClient()
 	c := testCodexWithClient(t, fc)
 	c.desktopAttachTimeout = time.Millisecond
@@ -741,15 +823,15 @@ func TestCodexResumeDoesNotSendWithoutDesktopOwner(t *testing.T) {
 		t.Fatalf("resume should remain usable through app-server: tid=%q err=%v", tid, err)
 	}
 	res := c.SendPrompt("s1", "from pwa")
-	if res.OK || res.Error == nil || !stringsContains(*res.Error, "no active Desktop IPC owner") {
-		t.Fatalf("resumed native thread must wait for a Desktop owner: %#v", res)
+	if !res.OK || res.Message != "turn started via Codex app-server" {
+		t.Fatalf("resumed native thread did not use shared app-server: %#v", res)
 	}
-	if len(fc.turns) != 0 {
-		t.Fatalf("resumed native thread must not fall back to app-server: %#v", fc.turns)
+	if len(fc.turns) != 1 || fc.turns[0] != [2]string{fakeCodexThreadID, "from pwa"} {
+		t.Fatalf("shared app-server did not receive the turn: %#v", fc.turns)
 	}
 }
 
-func TestCodexRewindUserMessageRollsBackTurnsAndStartsViaDesktop(t *testing.T) {
+func TestCodexRewindUserMessageRollsBackTurnsAndStartsViaSharedDaemon(t *testing.T) {
 	fc := newFakeCodexClient()
 	fc.resumeResult = map[string]any{"thread": map[string]any{
 		"id": fakeCodexThreadID,
@@ -760,11 +842,12 @@ func TestCodexRewindUserMessageRollsBackTurnsAndStartsViaDesktop(t *testing.T) {
 		},
 	}}
 	c := testCodexWithClient(t, fc)
+	c.BindSessionRoute("source-logical", fakeCodexThreadID, "shared_daemon", "/repo")
 	desktop := &fakeDesktopClient{snapshots: desktopOwnerSnapshot(fakeCodexThreadID, "owner-1")}
 	c.desktopFactory = func() codexDesktopClient { return desktop }
 	res, err := c.RewindUserMessage(RewindUserMessageOptions{
 		SessionID: "logical-rewind",
-		ThreadID:  fakeCodexThreadID,
+		ThreadID:  "source-logical",
 		TurnID:    "turn-b",
 		Prompt:    "edited second",
 		Cwd:       "/repo",
@@ -772,24 +855,161 @@ func TestCodexRewindUserMessageRollsBackTurnsAndStartsViaDesktop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.ThreadID != fakeCodexThreadID || res.State != "running" || res.TurnID != "desktop-turn" {
+	if res.ThreadID != fakeCodexThreadID || res.State != "running" || res.TurnID != "turn-1" {
 		t.Fatalf("bad rewind result: %#v", res)
 	}
 	if len(fc.rollbacks) != 1 || fc.rollbacks[0] != [2]any{fakeCodexThreadID, 2} {
 		t.Fatalf("bad rollback calls: %#v", fc.rollbacks)
 	}
-	if len(desktop.starts) != 1 || desktop.starts[0] != [2]string{fakeCodexThreadID, "edited second"} {
-		t.Fatalf("bad desktop calls: %#v", desktop.starts)
+	if len(desktop.starts) != 0 || len(fc.turns) != 1 ||
+		fc.turns[0] != [2]string{fakeCodexThreadID, "edited second"} {
+		t.Fatalf("bad shared/Desktop calls shared=%#v desktop=%#v", fc.turns, desktop.starts)
 	}
-	if c.threads["logical-rewind"] != fakeCodexThreadID || !c.desktopSyncSessions["logical-rewind"] {
-		t.Fatalf("rewind session not bound to Desktop IPC: threads=%#v sync=%#v", c.threads, c.desktopSyncSessions)
+	if c.threads["logical-rewind"] != fakeCodexThreadID ||
+		c.sessionRoutes["logical-rewind"] != "shared_daemon" {
+		t.Fatalf("rewind session not bound to shared daemon: threads=%#v routes=%#v", c.threads, c.sessionRoutes)
+	}
+}
+
+func TestCodexRewindUserMessageHonorsPersistedStdioOwner(t *testing.T) {
+	fc := newFakeCodexClient()
+	fc.resumeResult = map[string]any{"thread": map[string]any{
+		"id": fakeCodexThreadID,
+		"turns": []any{
+			map[string]any{"id": "turn-a"},
+			map[string]any{"id": "turn-b"},
+		},
+	}}
+	c := testCodexWithClient(t, fc)
+	c.appServerTransport = "stdio"
+	c.BindSessionRoute("source-stdio", fakeCodexThreadID, "stdio", "/repo")
+
+	res, err := c.RewindUserMessage(RewindUserMessageOptions{
+		SessionID: "rewound-stdio",
+		ThreadID:  "source-stdio",
+		TurnID:    "turn-b",
+		Prompt:    "edited",
+		Cwd:       "/repo",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.ThreadID != fakeCodexThreadID || c.sessionRoutes["rewound-stdio"] != "stdio" {
+		t.Fatalf("stdio rewind route drifted: result=%#v routes=%#v", res, c.sessionRoutes)
+	}
+	if len(fc.resumes) != 1 || len(fc.rollbacks) != 1 || len(fc.turns) != 1 {
+		t.Fatalf("stdio rewind calls: resumes=%#v rollbacks=%#v turns=%#v", fc.resumes, fc.rollbacks, fc.turns)
+	}
+}
+
+func TestCodexRewindRejectsNonAppServerOwnerBeforeRPC(t *testing.T) {
+	tests := []struct {
+		name string
+		bind func(*Codex)
+		id   string
+	}{
+		{
+			name: "desktop",
+			id:   "source",
+			bind: func(c *Codex) { c.BindDesktopTranscript("source", fakeCodexThreadID) },
+		},
+		{
+			name: "unavailable",
+			id:   "source",
+			bind: func(c *Codex) {
+				c.appServerTransport = "stdio"
+				c.BindSessionRoute("source", fakeCodexThreadID, "shared_daemon", "/repo")
+			},
+		},
+		{
+			name: "route-less native uses explicit Desktop",
+			id:   fakeCodexThreadID,
+			bind: func(c *Codex) { c.nativeDeliveryRoute = "desktop_ipc" },
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := newFakeCodexClient()
+			c := testCodexWithClient(t, fc)
+			tc.bind(c)
+			_, err := c.RewindUserMessage(RewindUserMessageOptions{
+				SessionID: "rewound",
+				ThreadID:  tc.id,
+				TurnID:    "turn-a",
+				Prompt:    "edited",
+				Cwd:       "/repo",
+			})
+			if err == nil || !stringsContains(err.Error(), "app-server-owned") {
+				t.Fatalf("rewind error=%v", err)
+			}
+			if len(fc.resumes) != 0 || len(fc.rollbacks) != 0 || len(fc.turns) != 0 {
+				t.Fatalf("rejected rewind touched app-server: resumes=%#v rollbacks=%#v turns=%#v",
+					fc.resumes, fc.rollbacks, fc.turns)
+			}
+		})
+	}
+}
+
+func TestCodexRewindRejectsAuthoritativeActiveResume(t *testing.T) {
+	fc := newFakeCodexClient()
+	fc.resumeResult = map[string]any{"thread": map[string]any{
+		"id":     fakeCodexThreadID,
+		"status": map[string]any{"type": "active"},
+		"turns": []any{
+			map[string]any{"id": "turn-active", "status": "inProgress"},
+		},
+	}}
+	c := testCodexWithClient(t, fc)
+	c.BindSessionRoute("source", fakeCodexThreadID, "shared_daemon", "/repo")
+	_, err := c.RewindUserMessage(RewindUserMessageOptions{
+		SessionID: "rewound",
+		ThreadID:  "source",
+		TurnID:    "turn-active",
+		Prompt:    "edited",
+		Cwd:       "/repo",
+	})
+	if err == nil || !stringsContains(err.Error(), "already in progress") {
+		t.Fatalf("active rewind error=%v", err)
+	}
+	if len(fc.resumes) != 1 || len(fc.rollbacks) != 0 || len(fc.turns) != 0 {
+		t.Fatalf("active rewind mutated thread: resumes=%#v rollbacks=%#v turns=%#v",
+			fc.resumes, fc.rollbacks, fc.turns)
+	}
+}
+
+func TestCodexRewindRejectsActiveTurnFromInitialTurnsPage(t *testing.T) {
+	fc := newFakeCodexClient()
+	fc.resumeResult = map[string]any{
+		"thread": map[string]any{
+			"id":     fakeCodexThreadID,
+			"status": map[string]any{"type": "active"},
+		},
+		"initialTurnsPage": map[string]any{"turns": []any{
+			map[string]any{"id": "turn-active", "status": "inProgress"},
+		}},
+	}
+	c := testCodexWithClient(t, fc)
+	c.BindSessionRoute("source", fakeCodexThreadID, "shared_daemon", "/repo")
+	_, err := c.RewindUserMessage(RewindUserMessageOptions{
+		SessionID: "rewound",
+		ThreadID:  "source",
+		TurnID:    "turn-active",
+		Prompt:    "edited",
+		Cwd:       "/repo",
+	})
+	if err == nil || !stringsContains(err.Error(), "already in progress") {
+		t.Fatalf("active rewind error=%v", err)
+	}
+	if len(fc.resumes) != 1 || len(fc.rollbacks) != 0 || len(fc.turns) != 0 {
+		t.Fatalf("paged active rewind mutated thread: resumes=%#v rollbacks=%#v turns=%#v",
+			fc.resumes, fc.rollbacks, fc.turns)
 	}
 }
 
 func TestCodexLiveTurnGuard(t *testing.T) {
 	fc := newFakeCodexClient()
 	c := testCodexWithClient(t, fc)
-	c.BindTranscript("s1", fakeCodexThreadID)
+	c.BindDesktopTranscript("s1", fakeCodexThreadID)
 	c.desktopFactory = func() codexDesktopClient {
 		return &fakeDesktopClient{snapshots: []map[string]any{{
 			"transcript_id": fakeCodexThreadID, "live": true, "status": "active",
@@ -872,7 +1092,7 @@ func TestCodexSessionRunningClearsStaleDesktopActive(t *testing.T) {
 	fc := newFakeCodexClient()
 	c := testCodexWithClient(t, fc)
 	tid := "019ecffb-fd7d-7422-b05c-2e1c3ebec53d"
-	c.threads["s1"] = tid
+	c.BindDesktopTranscript("s1", tid)
 	c.setThreadActive(tid, true)
 	desktop := &fakeDesktopClient{snapshots: []map[string]any{}}
 	c.desktopFactory = func() codexDesktopClient { return desktop }
@@ -886,7 +1106,7 @@ func TestCodexSessionRunningClearsStaleDesktopActive(t *testing.T) {
 	}
 }
 
-func TestCodexResumeForkAndDesktopSync(t *testing.T) {
+func TestCodexResumeForkAndSharedDaemonSync(t *testing.T) {
 	fc := newFakeCodexClient()
 	c := testCodexWithClient(t, fc)
 	tid := "019ecffb-fd7d-7422-b05c-2e1c3ebec53d"
@@ -897,14 +1117,14 @@ func TestCodexResumeForkAndDesktopSync(t *testing.T) {
 	if err != nil || got != tid {
 		t.Fatalf("resume: %s %v", got, err)
 	}
-	if !c.desktopSyncSessions["s1"] {
-		t.Fatalf("desktop sync not marked")
+	if c.sessionRoutes["s1"] != "shared_daemon" {
+		t.Fatalf("shared daemon route not marked: %#v", c.sessionRoutes)
 	}
 	res := c.SendPrompt("s1", "from web")
-	if !res.OK || res.Message != "turn started via Codex Desktop" {
-		t.Fatalf("desktop send not used: %#v", res)
+	if !res.OK || res.Message != "turn started via Codex app-server" {
+		t.Fatalf("shared app-server send not used: %#v", res)
 	}
-	if len(fc.turns) != 0 || desktop.starts[0] != [2]string{tid, "from web"} {
+	if len(fc.turns) != 1 || len(desktop.starts) != 0 {
 		t.Fatalf("bad desktop/app-server calls desktop=%#v app=%#v", desktop.starts, fc.turns)
 	}
 	if rows := c.RuntimeSessions(); len(rows) != 1 || rows[0]["native_session_id"] != tid {
@@ -913,6 +1133,108 @@ func TestCodexResumeForkAndDesktopSync(t *testing.T) {
 	fork, err := c.OpenResumeSession("s2", tid, "", true)
 	if err != nil || fork != "fork-1" {
 		t.Fatalf("fork: %s %v", fork, err)
+	}
+}
+
+func TestCodexOpenResumeHonorsDesktopOwnerWithoutAppServerClaim(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.nativeDeliveryRoute = "desktop_ipc"
+	desktop, opener := attachableDesktop(fakeCodexThreadID, "owner-1")
+	c.desktopFactory = func() codexDesktopClient { return desktop }
+	c.desktopOpener = opener
+
+	got, err := c.OpenResumeSession("desktop", fakeCodexThreadID, "/repo", false)
+	if err != nil || got != fakeCodexThreadID {
+		t.Fatalf("Desktop resume: got=%q err=%v", got, err)
+	}
+	if c.sessionRoutes["desktop"] != "desktop_ipc" {
+		t.Fatalf("Desktop route=%q", c.sessionRoutes["desktop"])
+	}
+	if len(fc.resumes) != 0 || len(fc.forks) != 0 {
+		t.Fatalf("Desktop resume claimed app-server owner: resumes=%#v forks=%#v", fc.resumes, fc.forks)
+	}
+
+	if _, err := c.OpenResumeSession("desktop-fork", fakeCodexThreadID, "/repo", true); err == nil ||
+		!stringsContains(err.Error(), "unsupported over Desktop IPC") {
+		t.Fatalf("Desktop fork error=%v", err)
+	}
+	if len(fc.resumes) != 0 || len(fc.forks) != 0 {
+		t.Fatalf("unsupported Desktop fork touched app-server: resumes=%#v forks=%#v", fc.resumes, fc.forks)
+	}
+}
+
+func TestCodexOpenResumeHonorsPersistedStdioOwner(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.appServerTransport = "stdio"
+	c.BindSessionRoute("stdio", fakeCodexThreadID, "stdio", "/repo")
+	desktop := &fakeDesktopClient{}
+	c.desktopFactory = func() codexDesktopClient { return desktop }
+
+	got, err := c.OpenResumeSession("stdio", fakeCodexThreadID, "/repo", false)
+	if err != nil || got != fakeCodexThreadID {
+		t.Fatalf("stdio resume: got=%q err=%v", got, err)
+	}
+	if len(fc.resumes) != 1 || fc.resumes[0] != fakeCodexThreadID {
+		t.Fatalf("stdio owner did not resume exact thread: %#v", fc.resumes)
+	}
+	if c.sessionRoutes["stdio"] != "stdio" || len(desktop.starts) != 0 {
+		t.Fatalf("stdio owner route drifted: route=%q desktop=%#v", c.sessionRoutes["stdio"], desktop.starts)
+	}
+}
+
+func TestCodexOpenResumeFailsClosedWhenPersistedOwnerIsUnavailable(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.appServerTransport = "stdio"
+	c.BindSessionRoute("blocked", fakeCodexThreadID, "shared_daemon", "/repo")
+	if _, err := c.OpenResumeSession("blocked", fakeCodexThreadID, "/repo", false); err == nil ||
+		!stringsContains(err.Error(), "unavailable") {
+		t.Fatalf("unavailable owner error=%v", err)
+	}
+	if len(fc.resumes) != 0 || len(fc.forks) != 0 {
+		t.Fatalf("unavailable owner touched app-server: resumes=%#v forks=%#v", fc.resumes, fc.forks)
+	}
+}
+
+func TestCodexOpenForkRejectsMalformedOrSameThreadResult(t *testing.T) {
+	tests := []struct {
+		name   string
+		result any
+	}{
+		{name: "missing id", result: map[string]any{"thread": map[string]any{}}},
+		{name: "source id", result: map[string]any{"thread": map[string]any{"id": fakeCodexThreadID}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := newFakeCodexClient()
+			fc.forkResult = tc.result
+			c := testCodexWithClient(t, fc)
+			if _, err := c.OpenResumeSession("fork-target", fakeCodexThreadID, "/repo", true); err == nil {
+				t.Fatal("malformed fork unexpectedly succeeded")
+			}
+			if c.boundThread("fork-target") != "" {
+				t.Fatalf("malformed fork bound target session: %#v", c.threads)
+			}
+		})
+	}
+}
+
+func TestCodexOpenForkDoesNotRetryAfterResumeValidationFailure(t *testing.T) {
+	fc := newFakeCodexClient()
+	fc.forkErrors = []error{errors.New("thread not found")}
+	fc.resumeResult = map[string]any{"thread": map[string]any{"id": approvalThreadA}}
+	c := testCodexWithClient(t, fc)
+	if _, err := c.OpenResumeSession("fork-target", fakeCodexThreadID, "/repo", true); err == nil ||
+		!stringsContains(err.Error(), "route mismatch") {
+		t.Fatalf("fork resume validation error=%v", err)
+	}
+	if len(fc.forks) != 1 {
+		t.Fatalf("fork retried after failed resume validation: %#v", fc.forks)
+	}
+	if c.boundThread("fork-target") != "" {
+		t.Fatalf("failed fork bound target session: %#v", c.threads)
 	}
 }
 
@@ -941,6 +1263,216 @@ func TestCodexBindDesktopTranscriptRestoresDesktopSyncAfterRestart(t *testing.T)
 	}
 }
 
+func TestCodexNativeDeliveryRouteDefaultsToSharedDaemon(t *testing.T) {
+	defaultProvider := NewCodex("codex", config.ProviderConfig{})
+	if got := defaultProvider.NativeDeliveryRoute(); got != "shared_daemon" {
+		t.Fatalf("default native route=%q", got)
+	}
+	if got := defaultProvider.AppServerDeliveryRoute(); got != "shared_daemon" {
+		t.Fatalf("default app-server route=%q", got)
+	}
+	desktopProvider := NewCodex("codex", config.ProviderConfig{Extra: map[string]any{
+		"native_delivery_route": "desktop_ipc",
+	}})
+	if got := desktopProvider.NativeDeliveryRoute(); got != "desktop_ipc" {
+		t.Fatalf("explicit native route=%q", got)
+	}
+	desktopDisabled := NewCodex("codex", config.ProviderConfig{Extra: map[string]any{
+		"native_delivery_route": "desktop_ipc",
+		"desktop_sync":          false,
+	}})
+	if got := desktopDisabled.NativeDeliveryRoute(); got != "unavailable" {
+		t.Fatalf("disabled Desktop native route=%q", got)
+	}
+	legacyStdio := NewCodex("codex", config.ProviderConfig{Extra: map[string]any{
+		"app_server_transport": "stdio",
+	}})
+	if got := legacyStdio.NativeDeliveryRoute(); got != "desktop_ipc" {
+		t.Fatalf("legacy stdio native route=%q", got)
+	}
+	if got := legacyStdio.AppServerDeliveryRoute(); got != "stdio" {
+		t.Fatalf("legacy app-server route=%q", got)
+	}
+}
+
+func TestCodexBindSessionRouteMigratesDesktopRouteAndResumesBeforeSend(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindDesktopTranscript("s1", fakeCodexThreadID)
+	if !c.desktopSyncSessions["s1"] {
+		t.Fatal("precondition: Desktop route was not bound")
+	}
+
+	c.BindSessionRoute("s1", fakeCodexThreadID, "shared_daemon", "/tmp")
+	if c.desktopSyncSessions["s1"] || !c.appServerResumeSessions["s1"] {
+		t.Fatalf("route was not migrated: desktop=%v resume=%v",
+			c.desktopSyncSessions["s1"], c.appServerResumeSessions["s1"])
+	}
+	res := c.SendPrompt("s1", "resume then send")
+	if !res.OK || res.Message != "turn started via Codex app-server" {
+		t.Fatalf("send=%#v", res)
+	}
+	if len(fc.resumes) != 1 || fc.resumes[0] != fakeCodexThreadID {
+		t.Fatalf("thread was not explicitly resumed: %#v", fc.resumes)
+	}
+	if len(fc.turns) != 1 || fc.turns[0] != [2]string{fakeCodexThreadID, "resume then send"} {
+		t.Fatalf("turn/start calls=%#v", fc.turns)
+	}
+}
+
+func TestCodexBindSessionRouteKeepsLegacyHeadlessSessionOffDesktop(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.appServerTransport = "stdio"
+	c.BindSessionRoute("s1", fakeCodexThreadID, "app_server", "/tmp")
+	if c.sessionRoutes["s1"] != "stdio" || c.desktopSyncSessions["s1"] ||
+		!c.appServerResumeSessions["s1"] {
+		t.Fatalf("legacy headless route changed owner: route=%q desktop=%v resume=%v",
+			c.sessionRoutes["s1"], c.desktopSyncSessions["s1"], c.appServerResumeSessions["s1"])
+	}
+	result := c.SendPrompt("s1", "legacy resume then send")
+	if !result.OK {
+		t.Fatalf("send=%#v", result)
+	}
+	if len(fc.resumes) != 1 || fc.resumes[0] != fakeCodexThreadID {
+		t.Fatalf("thread was not resumed on the configured app-server: %#v", fc.resumes)
+	}
+}
+
+func TestCodexBindSessionRouteFailsClosedOnOwnerTransportDrift(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.appServerTransport = "stdio"
+	c.BindSessionRoute("s1", fakeCodexThreadID, "shared_daemon", "/tmp")
+	result := c.SendPrompt("s1", "must not cross owner routes")
+	if result.OK || result.Error == nil || !stringsContains(*result.Error, "requires shared daemon") {
+		t.Fatalf("send=%#v", result)
+	}
+	if len(fc.resumes) != 0 || len(fc.turns) != 0 {
+		t.Fatalf("prompt reached a different owner: resumes=%#v turns=%#v", fc.resumes, fc.turns)
+	}
+}
+
+func TestCodexSessionRunningFollowsBoundOwnerRoute(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	b := newCodexDesktopBridge("", "local")
+	c.bridge = b
+
+	c.BindSessionRoute("shared", approvalThreadA, "shared_daemon", "/repo")
+	fc.SetThreadStatus(approvalThreadA, "idle")
+	b.HandleBroadcast(bridgeSnapshotFrame(approvalThreadA, "owner-a", 1, map[string]any{
+		"id": approvalThreadA, "requests": []any{},
+		"threadRuntimeStatus": map[string]any{"type": "active"},
+	}))
+	if running := c.SessionRunning("shared"); running != nil && *running {
+		t.Fatalf("shared session inherited Desktop running state: %v", *running)
+	}
+
+	c.BindDesktopTranscript("desktop", approvalThreadB)
+	fc.SetThreadStatus(approvalThreadB, "active")
+	b.HandleBroadcast(bridgeSnapshotFrame(approvalThreadB, "owner-b", 1, map[string]any{
+		"id": approvalThreadB, "requests": []any{},
+		"threadRuntimeStatus": map[string]any{"type": "idle"},
+	}))
+	if running := c.SessionRunning("desktop"); running == nil || *running {
+		t.Fatalf("Desktop session inherited app-server running state: %v", running)
+	}
+}
+
+func TestCodexUnavailableRouteHidesRunningAndAppServerApprovals(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.appServerTransport = "stdio"
+	c.BindSessionRoute("blocked", approvalThreadA, "shared_daemon", "/repo")
+	fc.SetThreadStatus(approvalThreadA, "active")
+	c.setThreadActive(approvalThreadA, true)
+	c.onServerRequest(float64(75), "item/commandExecution/requestApproval", commandApprovalParams(approvalThreadA, nil))
+
+	if running := c.SessionRunning("blocked"); running != nil {
+		t.Fatalf("unavailable route exposed running state: %v", *running)
+	}
+	if approval := c.ApprovalRequest("blocked"); approval != nil {
+		t.Fatalf("unavailable route exposed approval: %#v", approval)
+	}
+	if res := c.RelayApprovalRequest("blocked", "75", "allow"); boolAny(res["ok"]) || res["status"] != "stale" {
+		t.Fatalf("unavailable route relayed approval: %#v", res)
+	}
+	if len(fc.responses) != 0 {
+		t.Fatalf("unavailable route wrote an app-server response: %#v", fc.responses)
+	}
+}
+
+func TestCodexSessionMessagesDoesNotResumeDesktopOrUnavailableOwner(t *testing.T) {
+	tests := []struct {
+		name string
+		bind func(*Codex)
+	}{
+		{
+			name: "desktop",
+			bind: func(c *Codex) { c.BindDesktopTranscript("session", fakeCodexThreadID) },
+		},
+		{
+			name: "unavailable",
+			bind: func(c *Codex) {
+				c.appServerTransport = "stdio"
+				c.BindSessionRoute("session", fakeCodexThreadID, "shared_daemon", "/repo")
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := newFakeCodexClient()
+			c := testCodexWithClient(t, fc)
+			tc.bind(c)
+			items, err := c.SessionMessages("session")
+			if err != nil || len(items) != 0 {
+				t.Fatalf("messages=%#v err=%v", items, err)
+			}
+			_ = c.LatestOutput("session")
+			if len(fc.resumes) != 0 {
+				t.Fatalf("read path claimed app-server owner: %#v", fc.resumes)
+			}
+		})
+	}
+}
+
+func TestCodexResumeRestoresExactActiveTurn(t *testing.T) {
+	fc := newFakeCodexClient()
+	fc.resumeResult = map[string]any{"thread": map[string]any{
+		"id":     fakeCodexThreadID,
+		"status": map[string]any{"type": "active"},
+		"turns": []any{
+			map[string]any{"id": "turn-active", "status": "inProgress"},
+			map[string]any{"id": "turn-old", "status": "completed"},
+		},
+	}}
+	c := testCodexWithClient(t, fc)
+	if _, err := c.resumeThread(fc, "s1", fakeCodexThreadID, "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	if !fc.IsActive(fakeCodexThreadID) {
+		t.Fatal("active thread status was not restored")
+	}
+	if turnID, ok := fc.ThreadTurn(fakeCodexThreadID); !ok || turnID != "turn-active" {
+		t.Fatalf("active turn=%q ok=%v", turnID, ok)
+	}
+}
+
+func TestCodexResumeRejectsInconsistentActiveTurnState(t *testing.T) {
+	fc := newFakeCodexClient()
+	fc.resumeResult = map[string]any{"thread": map[string]any{
+		"id":     fakeCodexThreadID,
+		"status": map[string]any{"type": "active"},
+		"turns":  []any{},
+	}}
+	c := testCodexWithClient(t, fc)
+	if _, err := c.resumeThread(fc, "s1", fakeCodexThreadID, "/tmp"); err == nil ||
+		!stringsContains(err.Error(), "inconsistent active turn") {
+		t.Fatalf("error=%v", err)
+	}
+}
+
 func TestCodexSendPromptUsesAppServerForBoundThreadWithoutDesktopSync(t *testing.T) {
 	fc := newFakeCodexClient()
 	c := testCodexWithClient(t, fc)
@@ -951,6 +1483,106 @@ func TestCodexSendPromptUsesAppServerForBoundThreadWithoutDesktopSync(t *testing
 	}
 	if len(fc.turns) != 1 || fc.turns[0] != [2]string{fakeCodexThreadID, "fallback"} {
 		t.Fatalf("app-server TurnStart must be used: %#v", fc.turns)
+	}
+}
+
+func TestCodexTurnStartUnknownOutcomeRequiresAuthoritativeResumeBeforeRetry(t *testing.T) {
+	tests := []struct {
+		name          string
+		firstError    error
+		resumedActive bool
+	}{
+		{name: "ack timeout then idle", firstError: CodexAppServerError{Message: "timeout waiting for turn/start"}},
+		{name: "transport EOF after write", firstError: CodexAppServerError{
+			Message: `turn/start failed: {"code":-32099,"message":"EOF"}`,
+		}, resumedActive: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			fc := newFakeCodexClient()
+			fc.turnErrors = []error{tc.firstError}
+			if tc.resumedActive {
+				fc.resumeResult = map[string]any{"thread": map[string]any{
+					"id":     fakeCodexThreadID,
+					"status": map[string]any{"type": "active"},
+					"turns": []any{
+						map[string]any{"id": "turn-original", "status": "inProgress"},
+					},
+				}}
+			}
+			c := testCodexWithClient(t, fc)
+			c.BindSessionRoute("s1", fakeCodexThreadID, "shared_daemon", "/repo")
+			c.markAppServerSessionReady("s1")
+
+			first := c.SendPrompt("s1", "first")
+			if first.OK || first.Error == nil || !stringsContains(*first.Error, "delivery outcome is unknown") {
+				t.Fatalf("first send=%#v", first)
+			}
+			if !c.appServerResumeBound("s1") {
+				t.Fatal("unknown turn/start outcome did not require reconciliation")
+			}
+			if len(fc.resumes) != 0 || len(fc.turns) != 0 {
+				t.Fatalf("first send performed unexpected operations: resumes=%#v turns=%#v", fc.resumes, fc.turns)
+			}
+
+			second := c.SendPrompt("s1", "second")
+			if tc.resumedActive {
+				if second.OK || second.Error == nil || !stringsContains(*second.Error, "already in progress") {
+					t.Fatalf("active retry=%#v", second)
+				}
+			} else if !second.OK {
+				t.Fatalf("idle retry=%#v", second)
+			}
+			if len(fc.resumes) != 1 || fc.resumes[0] != fakeCodexThreadID {
+				t.Fatalf("retry did not authoritatively resume exact thread: %#v", fc.resumes)
+			}
+			if tc.resumedActive {
+				if len(fc.turns) != 0 {
+					t.Fatalf("active original turn was duplicated: %#v", fc.turns)
+				}
+			} else if len(fc.turns) != 1 || fc.turns[0] != [2]string{fakeCodexThreadID, "second"} {
+				t.Fatalf("idle retry turn=%#v", fc.turns)
+			}
+		})
+	}
+}
+
+func TestCodexTurnStartAckAfterGenerationLossRequiresAuthoritativeResume(t *testing.T) {
+	first := newFakeCodexClient()
+	replacement := newFakeCodexClient()
+	replacement.resumeResult = map[string]any{"thread": map[string]any{
+		"id":     fakeCodexThreadID,
+		"status": map[string]any{"type": "active"},
+		"turns": []any{
+			map[string]any{"id": "turn-original", "status": "inProgress"},
+		},
+	}}
+	c := testCodexWithClient(t, first)
+	c.BindSessionRoute("s1", fakeCodexThreadID, "shared_daemon", "/repo")
+	c.markAppServerSessionReady("s1")
+	first.turnHook = func() {
+		c.clientMu.Lock()
+		c.client = replacement
+		c.clientGeneration = 2
+		c.clientSequence = 2
+		c.clientMu.Unlock()
+	}
+
+	result := c.SendPrompt("s1", "first")
+	if result.OK || result.Error == nil || !stringsContains(*result.Error, "terminal state is unknown") {
+		t.Fatalf("send=%#v", result)
+	}
+	if !c.appServerResumeBound("s1") {
+		t.Fatal("generation loss after acknowledgement did not require reconciliation")
+	}
+
+	retry := c.SendPrompt("s1", "second")
+	if retry.OK || retry.Error == nil || !stringsContains(*retry.Error, "already in progress") {
+		t.Fatalf("retry=%#v", retry)
+	}
+	if len(replacement.resumes) != 1 || len(replacement.turns) != 0 {
+		t.Fatalf("retry did not reconcile active turn: resumes=%#v turns=%#v",
+			replacement.resumes, replacement.turns)
 	}
 }
 
@@ -1344,6 +1976,24 @@ func TestCodexResumeRejectsThreadAndCwdRouteMismatch(t *testing.T) {
 	fc.resumeResult = map[string]any{"thread": map[string]any{"id": approvalThreadA, "cwd": "/other"}}
 	if _, err := c.resumeThread(fc, "s1", approvalThreadA, "/repo"); err == nil || !strings.Contains(err.Error(), "cwd mismatch") {
 		t.Fatalf("cwd mismatch was accepted: %v", err)
+	}
+}
+
+func TestSameCodexCwdResolvesSymlinksThroughMissingLeaf(t *testing.T) {
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(realParent, alias); err != nil {
+		t.Fatal(err)
+	}
+	if !sameCodexCwd(
+		filepath.Join(alias, "missing", "project"),
+		filepath.Join(realParent, "missing", "project"),
+	) {
+		t.Fatal("equivalent cwd paths were rejected after the leaf disappeared")
 	}
 }
 

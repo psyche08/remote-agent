@@ -36,8 +36,8 @@ flowchart LR
 
     Registry --> Codex["codex provider"]
     Codex --> CodexDiscovery["thread/list + local index/rollout"]
-    Codex --> AppServer["owned codex app-server child"]
-    Codex --> DesktopIPC["Codex Desktop owner/follower IPC"]
+    Codex --> AppServer["official shared app-server daemon"]
+    Codex -. explicit compatibility .-> DesktopIPC["Codex Desktop owner/follower IPC"]
     AppServer --> Rollout["~/.codex rollout JSONL"]
     DesktopIPC --> Rollout
 
@@ -108,7 +108,8 @@ action 明确 `endpoint`、`scope`、`risk`、`supported`；PWA 的 steer/interr
 | `transcript_id` | durable read side | transcript/rollout 的合并键；通常与 native id 相同，但语义上是持久读侧 |
 | `origin` | discovery | `cli` / `desktop` / `both` 等元数据，只说明从哪里发现，不决定发送路由 |
 | `source` | runtime/read side | `claude_cli_stream`、`claude_turnstate`、Codex local/app-server 等观测来源，不决定 owner |
-| `delivery_route` | persisted logical session | 当前只对 Codex Desktop-native 会话显式写 `desktop_ipc`；普通缺省 record 表示 remote-agent-owned app-server，旧 `r0...` / `r-codex-...` logical id 仍有 Desktop-route 兼容识别 |
+| `codex_control_route` | persisted logical session | Codex mutable owner 的权威字段：`shared_daemon` / `stdio` / `desktop_ipc`；配置漂移时内存绑定降为 `unavailable` 并拒绝写入 |
+| `delivery_route` | persisted logical session | Codex shared-daemon record 暂时写 `desktop_ipc` 作为旧 binary 的 fail-closed 回滚标记；当前 binary 以 `codex_control_route` 为准。legacy stdio record 保持缺省，旧 `r0...` / `r-codex-...` logical id 仍有 Desktop-route 兼容识别 |
 
 `sessions.json` 保存 logical record，核心映射是：
 
@@ -239,9 +240,11 @@ Codex app-server/Desktop IPC：
 
 ### Discovery 与 read side
 
-生产实例是 `NewCodex("codex", ...)`，backend 为 `codex_app_server_go`。
-默认优先使用 ChatGPT.app 内置 Codex binary，其次兼容旧的 Codex.app，最后才是
-`$PATH`。
+生产实例是 `NewCodex("codex", ...)`，默认 backend 为
+`codex_shared_app_server`。mutable traffic 只连接官方 standalone managed daemon；
+ChatGPT.app/Codex.app/PATH binary 只属于 legacy stdio/显式 Desktop compatibility
+候选；shared 模式的安装检测只认 managed standalone，read side 另从本地 index 与
+rollout 发现 metadata，不能把其他 binary 当成 native thread 的竞争 owner。
 
 - `/native_sessions` 以 app-server `thread/list` 为主，再按 thread UUID 合并本地
   `~/.codex` index 和 rollout JSONL；app-server 不可用时仍返回本地结果。
@@ -258,9 +261,17 @@ Codex app-server/Desktop IPC：
 
 ### App-server 连接与终态
 
-- 每个 owned `codex app-server` 子进程都有单调递增的 connection generation。
-  EOF、非法 JSON 或进程退出会立即唤醒所有 pending RPC、回收进程组，并只清理同一
-  代 client；旧 read loop/exit callback 不能污染新连接。
+- 每个 managed daemon UDS WebSocket connection 都有单调递增的 connection
+  generation。EOF、非法 JSON 或 socket loss 会立即唤醒所有 pending RPC，并只清理
+  同一代 client；旧 read loop/exit callback 不能污染新连接。关闭 remote-agent
+  connection 不会停止 shared daemon。
+- 连接前校验 managed executable、socket owner/mode/parent，保留 discovery inode
+  snapshot，并在 dial 前后执行 `SameFile`；连接完成后再校验 peer UID。协议直接使用
+  daemon 的 RFC 6455 UDS endpoint（client frame masked），不把 raw
+  `app-server proxy` 当作 JSONL transport。
+- daemon status/start、UDS dial、initialize 和 mutable RPC 都有独立上限；即使
+  autostart 与最长同步 rewind 链路叠加，预算也必须严格小于 relay 的 30 秒 HTTP
+  timeout。
 - `turn/start` 返回后会登记 `turn_id → thread_id`。缺少 thread id 的通知只能通过
   这个精确映射恢复，不能回退到 provider-global “最后一个 thread”。
 - approval/question 的 JSON-RPC response 写入仅代表传输完成。内部请求从
@@ -274,15 +285,25 @@ Codex app-server/Desktop IPC：
 
 | 会话来源 | route | 建立方式 | 发送/steer/interrupt owner |
 |---|---|---|---|
-| PWA 新建 | app-server（record 中 `delivery_route` 缺省） | `thread/start` | remote-agent 自己的 app-server child |
-| Codex native preview 直接发送 | `desktop_ipc` | 先持久化 deterministic logical id；不预先 `thread/resume` | 懒加载 `codex://threads/<id>` 后的 Desktop owner client |
-| 显式 resume/fork 兼容路径 | provider `OpenResumeSession` | `thread/resume` 或 `thread/fork`，标记 Desktop-sync candidate 并尝试 attach owner | attach 成功后的 Desktop owner；fork 得到新 thread |
+| PWA 新建 | `codex_control_route=shared_daemon`（默认）或 `stdio`（legacy 配置） | `thread/start` 后立即持久化 concrete owner route；shared 模式同时保留旧 binary 的 fail-closed marker | 建立 thread 的同一 app-server transport |
+| Codex native preview 直接发送 | `shared_daemon`（默认） | 先持久化 deterministic logical id；发送前按 exact thread id/cwd 执行 `thread/resume` | managed daemon 的同一 UDS WebSocket connection |
+| Codex native preview 兼容模式 | `desktop_ipc`（显式配置） | 懒加载 `codex://threads/<id>` | 已发布 owner 的 Desktop / VS Code client |
+| 显式 resume/fork | provider `OpenResumeSession` | shared 模式执行 `thread/resume` 或 `thread/fork` 并持久化 route/cwd | managed daemon 的同一 connection |
 
 Codex Desktop thread 和 app-server thread 都是 UUID，不能靠 id 格式判断 owner。
-`BindDesktopTranscript` 和持久化 `delivery_route=desktop_ipc` 用来区分 native Desktop
-delivery；普通 `BindTranscript` 必须保留 app-server ownership。
+当前 ChatGPT Desktop build 不会向 VS Code 的 `~/.codex/ipc/ipc.sock` router 发布
+ChatGPT thread owner，因此 native preview 默认使用 `codex_control_route=shared_daemon`。
+为保证回滚到旧 binary 时 fail closed，兼容期仍保留
+`delivery_route=desktop_ipc`；新 binary 只读显式 control route。旧 record 在下一次发送
+前补齐该字段，再由 managed daemon `thread/resume` 校验 exact thread id/cwd 后投递；
+这不是一次 IPC 失败后的跨 route 重试。只有显式配置
+`extra.native_delivery_route=desktop_ipc` 时才保留 owner/follower 路径。
 
-Desktop route 的发送规则是：
+`BindSessionRoute` 从 record 恢复 route 与 cwd；普通 `BindTranscript` 只建立
+read-side alias，不得改变 owner。`BindDesktopTranscript` 仅保留给旧 API 的显式
+Desktop IPC compatibility。
+
+显式 Desktop route 的发送规则是：
 
 1. 找到持久化 thread id 和缓存的 Desktop `owner_client_id`。
 2. owner 未加载时通过 `codex://threads/<id>` 打开 thread，并在 bounded timeout 内
@@ -292,9 +313,11 @@ Desktop route 的发送规则是：
 4. owner 缺失、attach 超时或 IPC 结果不确定时返回错误，不能 fallback 到另一个
    app-server owner。这样调用方能明确知道 prompt 没有被安全确认投递。
 
-只有从一开始就由 remote-agent 创建并拥有的 headless session 才走 app-server
-`turn/start`、`turn/steer`、`turn/interrupt`。这里的“两条 route”是 session ownership
-模型，不是每次请求的主备切换模型。
+remote-agent 新建的 headless session 以及发送前已明确持久化为
+`shared_daemon` 的 native session 走同一个 managed app-server daemon
+`thread/resume` / `turn/start` / `turn/steer` / `turn/interrupt`。两条 route 是在发送前
+确定的 session ownership 模型，不是一次请求中的主备切换；写出后的不确定结果绝不
+跨 route 重投。
 
 ### Desktop follower 与审批
 
@@ -310,9 +333,9 @@ Desktop route 的发送规则是：
 先回答后，另一侧晚到的结果返回 `stale`。`auto_review` 已由 guardian 处理的请求
 不会伪装成人工审批。
 
-headless route 的审批直接回复 remote-agent 自己 app-server child 的 JSON-RPC
-request。两条 route 最终都以 `(thread_id, request_id)` 跟踪，某个 thread idle 不得
-清空其他 thread 的 pending queue。
+headless route 的审批通过建立该 turn 的 managed daemon connection 直接回复
+JSON-RPC request。两条 route 最终都以 `(thread_id, request_id)` 跟踪，某个
+thread idle 不得清空其他 thread 的 pending queue。
 
 ## 必须保持的架构不变量
 

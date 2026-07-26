@@ -1,6 +1,8 @@
 package webui
 
 import (
+	"crypto/sha256"
+	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -225,6 +227,65 @@ func TestDeviceUIRendersConversationImagesAndUploadsFiles(t *testing.T) {
 	}
 }
 
+func TestDeviceUIRendersMermaidSafelyFromEmbeddedAsset(t *testing.T) {
+	body, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := string(body)
+	for _, want := range []string{
+		`const MERMAID_ASSET = "vendor/mermaid-11.16.0.min.js"`,
+		`script.integrity = MERMAID_ASSET_INTEGRITY`,
+		`securityLevel: "strict"`,
+		`htmlLabels: false`,
+		`flowchart: { htmlLabels: false`,
+		`function mermaidSourceIssue(source)`,
+		`function sanitizeMermaidSVG(svgText)`,
+		`new DOMParser().parseFromString(svgText, "image/svg+xml")`,
+		`new Set(["script", "foreignobject", "iframe", "object", "embed", "image"`,
+		`name.startsWith("on")`,
+		`frame.setAttribute("sandbox", "")`,
+		`frame.referrerPolicy = "no-referrer"`,
+		`frame.srcdoc = mermaidFrameHTML(safe.svg)`,
+		`new MutationObserver(mutations =>`,
+		`processMermaidFences(document);`,
+		`code.closest("#live-bubble, .tw-caret")`,
+		`Mermaid 图无法渲染，已显示源码。`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Fatalf("device UI missing safe Mermaid behavior %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"cdn.jsdelivr.net", "unpkg.com", `securityLevel: "loose"`, `allow-scripts`, `allow-same-origin`,
+		`processMermaidFences(root && root.isConnected ? root : document)`,
+	} {
+		if strings.Contains(ui, forbidden) {
+			t.Fatalf("device UI Mermaid path contains unsafe/runtime-network behavior %q", forbidden)
+		}
+	}
+}
+
+func TestMermaidAssetMatchesPinnedIntegrity(t *testing.T) {
+	asset, err := os.ReadFile("vendor/mermaid-11.16.0.min.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sum := sha256.Sum256(asset)
+	got := "sha256-" + base64.StdEncoding.EncodeToString(sum[:])
+	const want = "sha256-dNfEbavKMowilHM5EKiqHtDDdFF3bo1Sldo4ordY+5s="
+	if got != want {
+		t.Fatalf("Mermaid asset integrity=%q want=%q", got, want)
+	}
+	ui, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ui), `const MERMAID_ASSET_INTEGRITY = "`+want+`"`) {
+		t.Fatal("device UI SRI does not match the embedded Mermaid asset")
+	}
+}
+
 func TestDeviceUIRendersSessionAndPerTurnCosts(t *testing.T) {
 	body, err := os.ReadFile("index.html")
 	if err != nil {
@@ -347,11 +408,24 @@ func TestDeviceUIDirectlySendsNativeCodexSessionWithoutAttach(t *testing.T) {
 }
 
 func TestHandlerServesEmbeddedAssets(t *testing.T) {
-	for _, path := range []string{"/manifest.webmanifest", "/sw.js", "/icon-192.png"} {
+	for _, path := range []string{"/manifest.webmanifest", "/sw.js", "/icon-192.png", "/vendor/mermaid-11.16.0.min.js", "/vendor/mermaid-LICENSE.txt"} {
 		rr := httptest.NewRecorder()
 		Handler("abc12345").ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
 		if rr.Code != http.StatusOK || rr.Body.Len() == 0 {
 			t.Fatalf("path=%s status=%d size=%d", path, rr.Code, rr.Body.Len())
+		}
+	}
+}
+
+func TestHandlerAppliesDeviceUICSP(t *testing.T) {
+	rr := httptest.NewRecorder()
+	Handler("abc12345").ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/", nil))
+	csp := rr.Header().Get("Content-Security-Policy")
+	for _, want := range []string{
+		"default-src 'self'", "img-src 'self' data: blob:", "object-src 'none'", "base-uri 'none'",
+	} {
+		if !strings.Contains(csp, want) {
+			t.Fatalf("device UI CSP missing %q: %s", want, csp)
 		}
 	}
 }

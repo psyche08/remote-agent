@@ -427,6 +427,10 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 		if native != "" {
 			session["native_session_id"] = native
 			session["transcript_id"] = native
+			if providerID == "codex" {
+				setCodexAppServerDeliveryRoute(session, p)
+				bindSessionTranscript(p, session, recordString(session, "session_id"), native)
+			}
 		}
 		if err := s.store.UpsertSession(session); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
@@ -483,10 +487,9 @@ func (s *Server) sendPrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A native Codex preview can resolve to an existing logical session by its
-	// transcript id. It still represents an explicit Desktop-native delivery
-	// request, so route it through prepareDirectCodexSession even though the
-	// record lookup succeeded. Requests using the logical session id retain the
-	// record's existing app-server/Desktop route.
+	// transcript id. Route it through prepareDirectCodexSession even when the
+	// record lookup succeeded so the provider's current native delivery route
+	// is persisted before any prompt is accepted.
 	directCodexPreview := providerID == "codex" && (!ok || (recordString(session, "session_id") != "" && body.SessionID != recordString(session, "session_id")))
 	if directCodexPreview {
 		session, err = s.prepareDirectCodexSession(p, providerID, body.SessionID)
@@ -522,6 +525,22 @@ func (s *Server) sendPrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	session["provider_id"] = providerID
+	// Migrate persisted native Codex sessions before binding. Older releases
+	// recorded desktop_ipc even on ChatGPT Desktop builds that never publish
+	// an owner to the private VS Code IPC router. Route selection is explicit
+	// and happens before prompt delivery, so this is not a retry/fallback.
+	if providerID == "codex" && recordString(session, "codex_control_route") == "" &&
+		codexDesktopDeliveryRecord(session) {
+		route := codexPreferredNativeDeliveryRoute(p)
+		// Keep delivery_route=desktop_ipc as a fail-closed rollback contract
+		// for pre-shared-daemon binaries. New binaries always persist and use
+		// the explicit control route, including Desktop compatibility mode.
+		session["codex_control_route"] = route
+		if err := s.store.UpsertSession(session); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	s.bindProviderTranscript(p, body.SessionID)
 	attachments, err := s.loadAttachments(providerID, body.SessionID, body.Attachments)
 	if err != nil {
@@ -534,7 +553,7 @@ func (s *Server) sendPrompt(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	deliveryState := "delivering"
-	if codexDesktopDeliveryRecord(session) {
+	if codexDesktopDeliveryForProvider(p, session) {
 		deliveryState = "attaching"
 	}
 	task := newTaskRecord(s.cfg.DeviceID, body.SessionID, providerID, body.Prompt)
@@ -763,6 +782,10 @@ func (s *Server) rewindUserMessage(w http.ResponseWriter, r *http.Request) {
 	session["rewound_from_session_id"] = body.SessionID
 	session["rewound_from_turn_id"] = body.TurnID
 	session["updated_at"] = nowISO()
+	if providerID == "codex" {
+		setCodexAppServerDeliveryRoute(session, p)
+		bindSessionTranscript(p, session, logicalID, threadID)
+	}
 	if err := s.store.UpsertSession(session); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -804,8 +827,9 @@ func (s *Server) nativeSessionByID(providerID string, p provider.Provider, nativ
 }
 
 // prepareDirectCodexSession turns a read-only native Codex preview into a
-// persisted logical session without calling thread/resume. On first send the
-// provider lazily loads that thread in Desktop and targets its IPC owner.
+// persisted logical session without delivering a prompt. The provider's
+// explicit native route determines whether first send resumes the thread on
+// app-server or addresses a known Desktop IPC owner.
 func (s *Server) prepareDirectCodexSession(p provider.Provider, providerID string, nativeID string) (state.Record, error) {
 	if err := rejectUnsafeSessionID(nativeID); err != nil {
 		return nil, err
@@ -826,7 +850,19 @@ func (s *Server) prepareDirectCodexSession(p provider.Provider, providerID strin
 	if existing, found, err := s.findSessionForProviderAny(providerID, threadID); err != nil {
 		return nil, err
 	} else if found {
-		existing["delivery_route"] = "desktop_ipc"
+		if recordString(existing, "codex_control_route") == "" {
+			controlRoute := codexControlRouteForProvider(p, existing)
+			if controlRoute == "app_server" {
+				controlRoute = codexAppServerDeliveryRoute(p)
+			}
+			existing["codex_control_route"] = controlRoute
+			switch controlRoute {
+			case "shared_daemon", "desktop_ipc":
+				existing["delivery_route"] = "desktop_ipc"
+			case "stdio":
+				delete(existing, "delivery_route")
+			}
+		}
 		if hidden {
 			existing[hiddenFromSessionListsKey] = true
 		}
@@ -836,11 +872,13 @@ func (s *Server) prepareDirectCodexSession(p provider.Provider, providerID strin
 		bindSessionTranscript(p, existing, recordString(existing, "session_id"), threadID)
 		return existing, nil
 	}
+	deliveryRoute := codexPreferredNativeDeliveryRoute(p)
 	session := newSessionRecord(s.cfg.DeviceID, providerID, firstNonEmpty(stringAny(native["title"]), "Codex"), provider.StartOptions{Cwd: stringAny(native["cwd"])})
 	session["session_id"] = logicalID
 	session["native_session_id"] = threadID
 	session["transcript_id"] = threadID
 	session["delivery_route"] = "desktop_ipc"
+	session["codex_control_route"] = deliveryRoute
 	if hidden {
 		session[hiddenFromSessionListsKey] = true
 	}
@@ -893,13 +931,40 @@ func (s *Server) resumeNativeSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	logicalID := providerScopedLogicalID(targetID, cliID)
-	if existing, found, findErr := s.findSessionForProviderAny(targetID, cliID); findErr == nil && found {
+	selectedCodexRoute := ""
+	existing, found, findErr := s.findSessionForProviderAny(targetID, cliID)
+	if findErr != nil {
+		// Persisted ownership is authoritative. If it cannot be read, fail
+		// closed instead of choosing the provider's current default route and
+		// potentially introducing a competing owner for this native thread.
+		writeError(w, http.StatusInternalServerError, findErr.Error())
+		return
+	}
+	if found {
 		if storedID := recordString(existing, "session_id"); storedID != "" {
 			logicalID = storedID
+		}
+		if targetID == "codex" {
+			selectedCodexRoute = codexControlRouteForProvider(target, existing)
+			if selectedCodexRoute == "app_server" {
+				selectedCodexRoute = codexAppServerDeliveryRoute(target)
+			}
 		}
 	}
 	if body.Fork {
 		logicalID = newID()
+	}
+	if targetID == "codex" {
+		if selectedCodexRoute == "" {
+			selectedCodexRoute = codexPreferredNativeDeliveryRoute(target)
+		}
+		// Bind the exact route that will be persisted even for a new/legacy
+		// record. Stale provider memory must not choose a different owner.
+		bindSessionTranscript(target, state.Record{
+			"provider_id":         "codex",
+			"codex_control_route": selectedCodexRoute,
+			"cwd":                 stringAny(native["cwd"]),
+		}, logicalID, cliID)
 	}
 	if waiter, ok := target.(interface{ WaitResumable(string) bool }); ok && !body.Fork {
 		if !waiter.WaitResumable(cliID) {
@@ -933,6 +998,12 @@ func (s *Server) resumeNativeSession(w http.ResponseWriter, r *http.Request) {
 	session["transcript_id"] = cliID
 	if targetID == "codex" {
 		session["transcript_id"] = backend
+		session["codex_control_route"] = selectedCodexRoute
+		if selectedCodexRoute == "shared_daemon" || selectedCodexRoute == "desktop_ipc" {
+			session["delivery_route"] = "desktop_ipc"
+		} else {
+			delete(session, "delivery_route")
+		}
 	}
 	session["state"] = "running"
 	if targetID == "codex" {

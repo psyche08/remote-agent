@@ -404,6 +404,10 @@
     .chat .bubble .md hr { border:none; border-top:1px solid var(--line); margin:12px 0; }
     .chat .bubble .md a { color:var(--accent); }
     .chat .bubble pre.raw { white-space:pre-wrap; word-break:break-word; font-family:var(--mono); font-size:12.5px; line-height:1.5; margin:0; padding:0; background:none; border:none; color:inherit; }
+    .md .mermaid-host { margin:10px 0; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:var(--inset); }
+    .md .mermaid-host iframe { display:block; width:100%; height:auto; min-height:180px; max-height:min(70vh,640px); border:0; background:transparent; }
+    .md .mermaid-fallback-note { margin:8px 0 4px; color:var(--warn); font-size:12px; }
+    .md pre.mermaid-fallback { margin-top:4px; border-left:2px solid var(--warn); }
     /* chat header tools: raw/rendered toggle + live indicator */
     .chat .ph { display:flex; align-items:center; justify-content:center; gap:8px; flex-wrap:wrap; }
     .chat .ph .md-tog { font-size:11px; padding:1px 9px; border:1px solid var(--line); border-radius:999px; background:none; color:var(--muted); cursor:pointer; }
@@ -1763,6 +1767,282 @@
       };
     })();
     function renderMd(t) { try { return MD.render(String(t == null ? "" : t)); } catch (e) { return esc(String(t == null ? "" : t)); } }
+
+    // Mermaid is a pinned, embedded asset and is loaded only when a fenced
+    // mermaid block is visible. Agent output is untrusted: markdown-it keeps
+    // raw HTML disabled, Mermaid runs in strict/no-HTML-label mode, the
+    // resulting SVG is scrubbed, then displayed in a scriptless sandbox.
+    const MERMAID_ASSET = "vendor/mermaid-11.16.0.min.js";
+    const MERMAID_ASSET_INTEGRITY = "sha256-dNfEbavKMowilHM5EKiqHtDDdFF3bo1Sldo4ordY+5s=";
+    const MERMAID_MAX_SOURCE = 40000;
+    const MERMAID_MAX_SVG = 2000000;
+    const MERMAID_SOURCES = new WeakMap();
+    let MERMAID_LOAD = null;
+    let MERMAID_QUEUE = Promise.resolve();
+    let MERMAID_SEQUENCE = 0;
+    let MERMAID_THEME_SIGNATURE = "";
+    let MERMAID_SCAN_TIMER = null;
+
+    function loadMermaid() {
+      if (window.mermaid && typeof window.mermaid.render === "function") return Promise.resolve(window.mermaid);
+      if (MERMAID_LOAD) return MERMAID_LOAD;
+      MERMAID_LOAD = new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = MERMAID_ASSET;
+        script.integrity = MERMAID_ASSET_INTEGRITY;
+        script.crossOrigin = "anonymous";
+        script.onload = () => window.mermaid && typeof window.mermaid.render === "function"
+          ? resolve(window.mermaid) : reject(new Error("embedded Mermaid unavailable"));
+        script.onerror = () => reject(new Error("embedded Mermaid failed to load"));
+        document.head.appendChild(script);
+      });
+      return MERMAID_LOAD;
+    }
+
+    function mermaidCSSVar(name, fallback) {
+      const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      return value || fallback;
+    }
+    function mermaidColorIsDark(value) {
+      let rgb = null;
+      const hex = String(value || "").match(/^#([\da-f]{3}|[\da-f]{6})$/i);
+      if (hex) {
+        const raw = hex[1].length === 3 ? [...hex[1]].map(x => x + x).join("") : hex[1];
+        rgb = [0, 2, 4].map(i => parseInt(raw.slice(i, i + 2), 16));
+      } else {
+        const match = String(value || "").match(/rgba?\(\s*(\d+)[,\s]+(\d+)[,\s]+(\d+)/i);
+        if (match) rgb = match.slice(1, 4).map(Number);
+      }
+      return !rgb || (0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]) < 128;
+    }
+    function mermaidConfig() {
+      const background = mermaidCSSVar("--bg", "#0d0d0f");
+      const darkMode = mermaidColorIsDark(background);
+      return {
+        startOnLoad: false,
+        securityLevel: "strict",
+        suppressErrorRendering: true,
+        maxTextSize: MERMAID_MAX_SOURCE,
+        theme: "base",
+        htmlLabels: false,
+        flowchart: { htmlLabels: false, useMaxWidth: true },
+        secure: [
+          "securityLevel", "startOnLoad", "suppressErrorRendering", "maxTextSize",
+          "theme", "themeVariables", "themeCSS", "fontFamily", "htmlLabels", "flowchart"
+        ],
+        themeVariables: {
+          darkMode,
+          background,
+          primaryColor: mermaidCSSVar("--panel2", "#1c1c21"),
+          primaryTextColor: mermaidCSSVar("--fg", "#ececed"),
+          primaryBorderColor: mermaidCSSVar("--line2", "#33333b"),
+          lineColor: mermaidCSSVar("--muted", "#8a8a93"),
+          secondaryColor: mermaidCSSVar("--panel", "#161619"),
+          tertiaryColor: mermaidCSSVar("--inset", "#0a0a0c"),
+          fontFamily: "-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+        }
+      };
+    }
+    function initializeMermaid(lib) {
+      const config = mermaidConfig();
+      const signature = JSON.stringify(config);
+      if (signature !== MERMAID_THEME_SIGNATURE) {
+        lib.initialize(config);
+        MERMAID_THEME_SIGNATURE = signature;
+      }
+    }
+
+    function mermaidSourceIssue(source) {
+      const text = String(source || "");
+      const scan = text.replace(/&colon;|&#0*58;|&#x0*3a;/gi, ":");
+      if (!text.trim()) return "empty";
+      if (text.length > MERMAID_MAX_SOURCE) return "too-large";
+      if (/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(text)) return "control-character";
+      if (/%%\s*\{/.test(scan)) return "configuration-directive";
+      if (/^\s*click\b/im.test(scan)) return "interactive-directive";
+      if (/@import|\burl\s*\(/i.test(scan)) return "external-style";
+      if (/(?:javascript|vbscript|data|file|blob|https?):|(?:^|[\s"'(=])\/\//im.test(scan)) return "external-reference";
+      if (/<\s*\/?\s*(?:script|style|iframe|object|embed|foreignobject|image|img|link|meta|base)\b/i.test(scan)) return "html";
+      return "";
+    }
+
+    function mermaidCSSUnescape(value) {
+      return String(value || "").replace(/\\([0-9a-f]{1,6}\s?|.)/gi, (_all, escaped) => {
+        const hex = escaped.trim();
+        if (/^[0-9a-f]+$/i.test(hex)) {
+          const code = parseInt(hex, 16);
+          return code > 0 && code <= 0x10ffff ? String.fromCodePoint(code) : "";
+        }
+        return escaped;
+      });
+    }
+    function mermaidUnsafeCSS(value) {
+      const scan = mermaidCSSUnescape(value).toLowerCase();
+      const withoutLocalRefs = scan.replace(/url\(\s*(['"]?)#[a-z0-9_.:-]+\1\s*\)/gi, "");
+      return /@import|expression\s*\(|(?:-moz-binding|behavior)\s*:|(?:javascript|vbscript|data|file|blob|https?):|(?:^|[^\w])\/\/|url\s*\(/i.test(withoutLocalRefs);
+    }
+    function mermaidSafeLocalRef(value) {
+      return /^#[a-z0-9_.:-]+$/i.test(String(value || "").trim());
+    }
+    function sanitizeMermaidSVG(svgText) {
+      if (typeof svgText !== "string" || svgText.length > MERMAID_MAX_SVG) throw new Error("invalid Mermaid output");
+      const doc = new DOMParser().parseFromString(svgText, "image/svg+xml");
+      const root = doc.documentElement;
+      if (!root || root.localName.toLowerCase() !== "svg" || root.namespaceURI !== "http://www.w3.org/2000/svg"
+          || doc.querySelector("parsererror")) throw new Error("invalid Mermaid SVG");
+      const blocked = new Set(["script", "foreignobject", "iframe", "object", "embed", "image", "audio", "video", "canvas", "link", "meta", "base"]);
+      for (const el of Array.from(root.querySelectorAll("*"))) {
+        const name = el.localName.toLowerCase();
+        if (name === "a") {
+          while (el.firstChild) el.parentNode.insertBefore(el.firstChild, el);
+          el.remove();
+          continue;
+        }
+        if (blocked.has(name) || el.namespaceURI !== "http://www.w3.org/2000/svg") {
+          el.remove();
+        }
+      }
+      for (const el of [root, ...root.querySelectorAll("*")]) {
+        if (el.localName.toLowerCase() === "style" && mermaidUnsafeCSS(el.textContent)) {
+          el.remove();
+          continue;
+        }
+        for (const attr of Array.from(el.attributes)) {
+          const name = attr.name.toLowerCase();
+          const value = attr.value;
+          if (name.startsWith("on") || name === "src" || name === "srcset") {
+            el.removeAttributeNode(attr);
+          } else if (name === "href" || name === "xlink:href") {
+            if (!mermaidSafeLocalRef(value)) el.removeAttributeNode(attr);
+          } else if (name === "style" && mermaidUnsafeCSS(value)) {
+            el.removeAttributeNode(attr);
+          } else if (/\burl\s*\(/i.test(value) && mermaidUnsafeCSS(value)) {
+            el.removeAttributeNode(attr);
+          } else if (/(?:javascript|vbscript|data|file|blob|https?):/i.test(mermaidCSSUnescape(value))) {
+            el.removeAttributeNode(attr);
+          }
+        }
+      }
+      root.setAttribute("width", "100%");
+      root.removeAttribute("height");
+      const viewBox = (root.getAttribute("viewBox") || "").trim().split(/[\s,]+/).map(Number);
+      const ratio = viewBox.length === 4 && viewBox.every(Number.isFinite) && viewBox[2] > 0 && viewBox[3] > 0
+        ? [viewBox[2], viewBox[3]] : [16, 9];
+      const svg = new XMLSerializer().serializeToString(root);
+      if (svg.length > MERMAID_MAX_SVG) throw new Error("Mermaid SVG too large");
+      return { svg, ratio };
+    }
+
+    function mermaidFrameHTML(svg) {
+      return "<!doctype html><html><head><meta charset=\"utf-8\">"
+        + "<meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:\">"
+        + "<style>html,body{margin:0;min-height:100%;color-scheme:dark;background:transparent;overflow:auto}"
+        + "body{display:flex;align-items:flex-start;justify-content:center}svg{display:block;max-width:100%;height:auto}</style>"
+        + "</head><body>" + svg + "</body></html>";
+    }
+    function makeMermaidFallback(pre, reason) {
+      if (!pre || !pre.isConnected) return;
+      pre.dataset.mermaidState = "failed";
+      pre.classList.add("mermaid-fallback");
+      if (!pre.previousElementSibling || !pre.previousElementSibling.classList.contains("mermaid-fallback-note")) {
+        const note = document.createElement("div");
+        note.className = "mermaid-fallback-note";
+        note.textContent = reason === "unsafe"
+          ? "安全策略阻止了此 Mermaid 图，已显示源码。"
+          : "Mermaid 图无法渲染，已显示源码。";
+        pre.before(note);
+      }
+    }
+    async function buildMermaidHost(source) {
+      const lib = await loadMermaid();
+      initializeMermaid(lib);
+      const id = "remote-agent-mermaid-" + (++MERMAID_SEQUENCE);
+      const rendered = await lib.render(id, source);
+      const safe = sanitizeMermaidSVG(rendered && rendered.svg);
+      const host = document.createElement("div");
+      host.className = "mermaid-host";
+      host.setAttribute("role", "group");
+      host.setAttribute("aria-label", "Mermaid diagram");
+      const frame = document.createElement("iframe");
+      frame.setAttribute("sandbox", "");
+      frame.referrerPolicy = "no-referrer";
+      frame.loading = "lazy";
+      frame.title = "Mermaid diagram";
+      frame.style.aspectRatio = safe.ratio[0] + " / " + safe.ratio[1];
+      frame.srcdoc = mermaidFrameHTML(safe.svg);
+      host.appendChild(frame);
+      MERMAID_SOURCES.set(host, source);
+      return host;
+    }
+    async function renderMermaidFence(code) {
+      const pre = code && code.parentElement;
+      if (!pre || !pre.isConnected || pre.dataset.mermaidState) return;
+      const source = code.textContent || "";
+      if (mermaidSourceIssue(source)) {
+        makeMermaidFallback(pre, "unsafe");
+        return;
+      }
+      pre.dataset.mermaidState = "queued";
+      try {
+        const host = await buildMermaidHost(source);
+        if (pre.isConnected && code.textContent === source) pre.replaceWith(host);
+      } catch (e) {
+        makeMermaidFallback(pre, "render");
+      }
+    }
+    function enqueueMermaidFence(code) {
+      MERMAID_QUEUE = MERMAID_QUEUE.then(() => renderMermaidFence(code), () => renderMermaidFence(code));
+    }
+    function processMermaidFences(root) {
+      if (RAW_MD || !root) return;
+      const codes = [];
+      if (root.matches && root.matches("pre > code")) codes.push(root);
+      if (root.querySelectorAll) codes.push(...root.querySelectorAll("pre > code"));
+      for (const code of codes) {
+        if (![...code.classList].some(name => name.toLowerCase() === "language-mermaid")) continue;
+        if (code.closest("#live-bubble, .tw-caret")) continue;
+        enqueueMermaidFence(code);
+      }
+    }
+    function scheduleMermaidScan() {
+      if (MERMAID_SCAN_TIMER) clearTimeout(MERMAID_SCAN_TIMER);
+      MERMAID_SCAN_TIMER = setTimeout(() => {
+        MERMAID_SCAN_TIMER = null;
+        // Chat refreshes append several message roots in one burst. Scanning only
+        // the last observed root would permanently miss Mermaid fences in earlier
+        // messages. The scan is idempotent because every queued/final fence gets a
+        // mermaidState marker or is replaced by its rendered host.
+        processMermaidFences(document);
+      }, 120);
+    }
+    const MERMAID_OBSERVER = new MutationObserver(mutations => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (node.nodeType === Node.ELEMENT_NODE) scheduleMermaidScan();
+        }
+      }
+    });
+    MERMAID_OBSERVER.observe(document.body, { childList: true, subtree: true });
+
+    function rerenderMermaidTheme() {
+      const signature = JSON.stringify(mermaidConfig());
+      if (!MERMAID_THEME_SIGNATURE || signature === MERMAID_THEME_SIGNATURE) return;
+      for (const host of document.querySelectorAll(".mermaid-host")) {
+        const source = MERMAID_SOURCES.get(host);
+        if (!source) continue;
+        MERMAID_QUEUE = MERMAID_QUEUE.then(async () => {
+          const replacement = await buildMermaidHost(source);
+          if (host.isConnected) host.replaceWith(replacement);
+        }).catch(() => {});
+      }
+    }
+    const MERMAID_THEME_OBSERVER = new MutationObserver(rerenderMermaidTheme);
+    MERMAID_THEME_OBSERVER.observe(document.documentElement, { attributes: true, attributeFilter: ["class", "data-theme", "style"] });
+    const MERMAID_COLOR_SCHEME = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)");
+    if (MERMAID_COLOR_SCHEME) {
+      if (MERMAID_COLOR_SCHEME.addEventListener) MERMAID_COLOR_SCHEME.addEventListener("change", rerenderMermaidTheme);
+      else if (MERMAID_COLOR_SCHEME.addListener) MERMAID_COLOR_SCHEME.addListener(rerenderMermaidTheme);
+    }
     const MSG_TIME_FMT = new Intl.DateTimeFormat(undefined, {
       month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit",
       hour12: false

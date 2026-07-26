@@ -6,7 +6,10 @@ import (
 	"time"
 )
 
-const codexDiscoveryRefreshCoalesce = 500 * time.Millisecond
+const (
+	codexDiscoveryRefreshCoalesce = 500 * time.Millisecond
+	codexThreadListTotalTimeout   = 4 * time.Second
+)
 
 var codexInteractiveSourceKinds = []string{
 	"cli",
@@ -52,10 +55,18 @@ func (c *Codex) listCodexThreads(client codexAppClient) (any, error) {
 	c.threadListMu.Lock()
 	defer c.threadListMu.Unlock()
 
-	if c.threadListLegacy {
-		return client.ThreadList(10*time.Second, nil)
+	deadline := time.Now().Add(codexThreadListTotalTimeout)
+	list := func(params map[string]any) (any, error) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, CodexAppServerError{"timeout waiting for thread/list capability fallback"}
+		}
+		return client.ThreadList(remaining, params)
 	}
-	result, err := client.ThreadList(10*time.Second, codexThreadListFastParams())
+	if c.threadListLegacy {
+		return list(nil)
+	}
+	result, err := list(codexThreadListFastParams())
 	if err == nil || !codexThreadListParamsUnsupported(err) {
 		return result, err
 	}
@@ -64,7 +75,7 @@ func (c *Codex) listCodexThreads(client codexAppClient) (any, error) {
 	// capability result for this provider process so every refresh does not
 	// pay for the same failed negotiation.
 	c.threadListLegacy = true
-	return client.ThreadList(10*time.Second, nil)
+	return list(nil)
 }
 
 func codexThreadListParamsUnsupported(err error) bool {
