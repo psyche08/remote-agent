@@ -205,7 +205,7 @@ func (c *CodexDesktopIPCClient) connect(timeout time.Duration) (net.Conn, error)
 func (c *CodexDesktopIPCClient) initialize(conn net.Conn, timeout time.Duration) error {
 	res, err := c.requestOnConn(conn, "initialize", map[string]any{
 		"clientType": c.ClientType,
-		"clientInfo": map[string]any{"name": c.ClientType, "title": c.ClientType, "version": "0.0.1"},
+		"clientInfo": map[string]any{"name": c.ClientType, "title": c.ClientType, "version": remoteCodingClientVersion()},
 	}, timeout, "initializing-client", "")
 	if err != nil {
 		return err
@@ -441,6 +441,7 @@ func desktopSnapshotLiveRows(msg map[string]any) []map[string]any {
 	if owner := stringAny(msg["sourceClientId"]); owner != "" {
 		row["desktop_owner_client_id"] = owner
 	}
+	markCodexSessionVisibility(row, state)
 	return []map[string]any{row}
 }
 

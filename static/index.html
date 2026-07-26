@@ -731,6 +731,13 @@
     const APP_STATIC_VERSION = "__REMOTE_AGENT_STATIC_VERSION__";
     let NATIVE = [];
     let LIVE_SESSIONS = [];   // currently-driven sessions (device-wide, from /live_sessions)
+    let SESSION_REFRESH_META = { source: "", refreshed_at: "", refreshing: false, refresh_error: "", device_time: null };
+    let SESSION_RENDER_SCOPE = "";
+    let SESSION_REFRESH_SEQ = 0;
+    const SESSION_REFRESH_FLIGHTS = new Map();
+    const SESSION_REFRESH_RETRY_MS = [250, 500, 1000, 2000];
+    const SESSION_REFRESH_TIMEOUT_MS = 5000;
+    const SESSION_REFRESH_POLL_MS = 5000;
     let PROVIDERS_META = [];
     let BACKEND_VERSION = null;
     let AGENT_UPDATE_STATE = null;
@@ -867,7 +874,7 @@
       CUR_DEVICE = id; stateSet("rc_device", id);
       rememberShellDevice(id, CUR_PROVIDER);
       renderDevices();
-      refreshProviders(); refreshSessions();
+      refreshProviders();   // provider refresh owns the matching session-list refresh
       if (!LIVE) refreshStatus();   // with no active tab, the header follows the chip
     }
     // Device-independent bootstrap. The UI shell is served by the relay (not any
@@ -937,7 +944,6 @@
           if (listChanged || selectionChanged) renderDevices();
           if (selectionChanged && !initial) {
             refreshProviders();
-            refreshSessions();
             refreshStatus();
           }
           return true;
@@ -1266,11 +1272,11 @@
       stateSet("rc_hidden_providers", JSON.stringify([...hidden].sort()));
       refreshProviders();
     }
-    async function refreshProviders() {
+    async function refreshProviders(options = {}) {
       try {
         const data = await (await fetch(browseUrl("/providers"), { headers: headers() })).json();
         const sel = $("provider-select"), chips = $("provider-chips");
-        sel.innerHTML = ""; chips.innerHTML = ""; let caps = {};
+        sel.innerHTML = ""; chips.innerHTML = ""; let caps = {}, actions = [];
         const order = { codex: 0, claude: 1 };
         const allProviders = (data.providers || []).slice().sort((a, b) =>
           (order[a.provider_id] ?? 99) - (order[b.provider_id] ?? 99) ||
@@ -1284,7 +1290,10 @@
         if (selectedProvider) setBrowseProvider(selectedProvider);
         providers.forEach(p => {
           const o = document.createElement("option"); o.value = p.provider_id;
-          if (p.provider_id === selectedProvider) { o.selected = true; caps = p.capabilities || {}; ACTIVE_CAPS = caps; }
+          if (p.provider_id === selectedProvider) {
+            o.selected = true; caps = p.capabilities || {}; actions = p.actions || [];
+            ACTIVE_CAPS = caps; ACTIVE_ACTIONS = actions;
+          }
           sel.appendChild(o);
           const c = document.createElement("div");
           c.className = "chip" + (p.provider_id === selectedProvider ? " active" : "");
@@ -1294,10 +1303,11 @@
           chips.appendChild(c);
         });
         ACTIVE_CAPS = caps;
+        ACTIVE_ACTIONS = actions;
         $("providers-out").textContent = JSON.stringify(allProviders, null, 2);
         renderProviderVisibility();
         syncNewProviderOptions();
-        refreshSessions();   // one list, auto per active provider
+        refreshSessions({ force: options.forceSessions === true });   // one list, auto per active provider
       } catch (e) { $("providers-out").textContent = e.message; }
     }
     async function selectProvider() {
@@ -1318,75 +1328,276 @@
 
     /* ---- sessions: ONE list, sourced from the active provider's native store ---- */
     let ACTIVE = { id: "", title: "" };
-    async function refreshSessions() {
-      // browse the CUR_DEVICE's sessions (independent of the active tab's device)
-      const prevNative = NATIVE || [];
-      const prevLive = LIVE_SESSIONS || [];
-      try {
-        const pid = $("provider-select").value || CUR_PROVIDER;
-        if (!pid) { NATIVE = []; LIVE_SESSIONS = []; renderSessions(); return; }
-        const [nres, lres] = await Promise.all([
-          fetch(browseUrl("/native_sessions?provider_id=" + encodeURIComponent(pid)), { headers: headers() }),
-          fetch(browseUrl("/live_sessions?provider_id=" + encodeURIComponent(pid)), { headers: headers() }).catch(() => null),
-        ]);
-        if (!nres.ok) throw new Error(`native_sessions ${nres.status}`);
-        NATIVE = (await nres.json()).sessions || [];
-        LIVE_SESSIONS = lres && lres.ok ? ((await lres.json()).sessions || []) : [];
-      } catch (e) {
-        NATIVE = prevNative;
-        LIVE_SESSIONS = prevLive;
-        console.warn("refresh sessions failed", e);
+    function sessionListVisible(s) {
+      return !!s && s.hidden_from_lists !== true && s.subagent !== true;
+    }
+    function sessionRefreshScope() {
+      const select = $("provider-select");
+      const provider = (select && select.value) || CUR_PROVIDER || "";
+      const device = CUR_DEVICE || "";
+      return { device, provider, key: device + "\u0000" + provider };
+    }
+    function sessionRefreshIsCurrent(flight) {
+      const current = sessionRefreshScope();
+      const active = SESSION_REFRESH_FLIGHTS.get(flight.key);
+      return current.key === flight.key && SESSION_RENDER_SCOPE === flight.key &&
+        active === flight && active.seq === flight.seq && !flight.controller.signal.aborted;
+    }
+    function cancelSessionRefreshesExcept(key = "") {
+      for (const [flightKey, flight] of SESSION_REFRESH_FLIGHTS) {
+        if (flightKey === key) continue;
+        flight.controller.abort();
+        SESSION_REFRESH_FLIGHTS.delete(flightKey);
       }
-      renderSessions();
+    }
+    function sessionRefreshDelay(ms, signal) {
+      return new Promise(resolve => {
+        if (signal.aborted) { resolve(false); return; }
+        let timer = null;
+        const aborted = () => { clearTimeout(timer); resolve(false); };
+        timer = setTimeout(() => { signal.removeEventListener("abort", aborted); resolve(true); }, ms);
+        signal.addEventListener("abort", aborted, { once: true });
+        if (signal.aborted) aborted();
+      });
+    }
+    function nativeRefreshMeta(body) {
+      const nested = body && body.meta && typeof body.meta === "object" ? body.meta : {};
+      return {
+        source: (body && body.source) || nested.source || "",
+        refreshed_at: (body && body.refreshed_at) || nested.refreshed_at || "",
+        refreshing: typeof (body && body.refreshing) === "boolean" ? body.refreshing : !!nested.refreshing,
+        refresh_error: (body && body.refresh_error) || nested.refresh_error || "",
+        generation: (body && body.generation) ?? nested.generation ?? null,
+        device_time: sessionDeviceTimeMeta(body),
+      };
+    }
+    function sessionDeviceTimeMeta(body) {
+      const raw = body && body.device_time && typeof body.device_time === "object" ? body.device_time : {};
+      const offsetValue = raw.utc_offset_minutes ?? (body && body.device_utc_offset_minutes);
+      const offset = Number(offsetValue);
+      const result = {
+        device_id: String(raw.device_id || (body && body.device_id) || ""),
+        time_zone: String(raw.time_zone || raw.timezone || (body && body.device_time_zone) || ""),
+        observed_at: String(raw.observed_at || ""),
+      };
+      if (Number.isFinite(offset)) result.utc_offset_minutes = offset;
+      return result.device_id || result.time_zone || Number.isFinite(result.utc_offset_minutes) ? result : null;
+    }
+    async function refreshLiveSessionsFor(flight) {
+      try {
+        const response = await fetch(flight.base + "live_sessions?provider_id=" + encodeURIComponent(flight.provider), {
+          headers: headers(), signal: flight.controller.signal,
+        });
+        if (!response.ok) throw new Error(`live_sessions ${response.status}`);
+        const body = await response.json();
+        if (!sessionRefreshIsCurrent(flight)) return;
+        LIVE_SESSIONS = ((body.sessions || []).filter(sessionListVisible));
+        const deviceTime = sessionDeviceTimeMeta(body);
+        if (deviceTime) SESSION_REFRESH_META = { ...SESSION_REFRESH_META, device_time: deviceTime };
+        renderSessions();   // native rows are already visible; add live rows when ready
+      } catch (e) {
+        if (!flight.controller.signal.aborted) console.warn("refresh live sessions failed", e);
+      }
+    }
+    async function runSessionRefresh(flight) {
+      const deadlineTimer = setTimeout(() => flight.controller.abort(), SESSION_REFRESH_TIMEOUT_MS);
+      let livePromise = null;
+      try {
+        for (let attempt = 0; ; attempt++) {
+          const forceQuery = flight.force && attempt === 0 ? "&refresh=1" : "";
+          const response = await fetch(flight.base + "native_sessions?provider_id=" + encodeURIComponent(flight.provider) + forceQuery, {
+            headers: headers(), signal: flight.controller.signal,
+          });
+          if (!response.ok) throw new Error(`native_sessions ${response.status}`);
+          const body = await response.json();
+          if (!sessionRefreshIsCurrent(flight)) return;
+
+          NATIVE = ((body.sessions || []).filter(sessionListVisible));
+          SESSION_REFRESH_META = nativeRefreshMeta(body);
+          renderSessions();   // stale-while-revalidate: render native snapshot immediately
+          if (!livePromise) livePromise = refreshLiveSessionsFor(flight);
+
+          if (!SESSION_REFRESH_META.refreshing || attempt >= SESSION_REFRESH_RETRY_MS.length) break;
+          if (document.visibilityState === "hidden") break;
+          const waited = await sessionRefreshDelay(SESSION_REFRESH_RETRY_MS[attempt], flight.controller.signal);
+          if (!waited || !sessionRefreshIsCurrent(flight)) return;
+        }
+        if (livePromise) await livePromise;
+      } catch (e) {
+        if (!flight.controller.signal.aborted) console.warn("refresh sessions failed", e);
+      } finally {
+        clearTimeout(deadlineTimer);
+      }
+    }
+    async function refreshSessions(options = {}) {
+      // browse the CUR_DEVICE's sessions (independent of the active tab's device)
+      const scope = sessionRefreshScope();
+      if (!scope.provider) {
+        cancelSessionRefreshesExcept();
+        SESSION_RENDER_SCOPE = "";
+        SESSION_REFRESH_META = { source: "", refreshed_at: "", refreshing: false, refresh_error: "", device_time: null };
+        NATIVE = []; LIVE_SESSIONS = []; renderSessions();
+        return;
+      }
+      const existing = SESSION_REFRESH_FLIGHTS.get(scope.key);
+      if (existing && !existing.controller.signal.aborted) {
+        if (options.force !== true) return existing.promise;
+        existing.controller.abort();
+        SESSION_REFRESH_FLIGHTS.delete(scope.key);
+      }
+
+      cancelSessionRefreshesExcept(scope.key);
+      if (SESSION_RENDER_SCOPE !== scope.key) {
+        SESSION_RENDER_SCOPE = scope.key;
+        SESSION_REFRESH_META = { source: "", refreshed_at: "", refreshing: false, refresh_error: "", device_time: null };
+        NATIVE = []; LIVE_SESSIONS = []; renderSessions();
+      }
+      const flight = {
+        key: scope.key,
+        device: scope.device,
+        provider: scope.provider,
+        base: deviceBase(scope.device),
+        seq: ++SESSION_REFRESH_SEQ,
+        controller: new AbortController(),
+        force: options.force === true,
+        promise: null,
+      };
+      SESSION_REFRESH_FLIGHTS.set(scope.key, flight);
+      flight.promise = runSessionRefresh(flight).finally(() => {
+        if (SESSION_REFRESH_FLIGHTS.get(flight.key) === flight) SESSION_REFRESH_FLIGHTS.delete(flight.key);
+      });
+      return flight.promise;
     }
     function renderSessions() {
       const q = ($("native-filter").value || "").toLowerCase();
       const pid = $("provider-select").value || CUR_PROVIDER;
-      // currently-driven sessions for this provider (device-wide; dedup from list below)
-      const live = (LIVE_SESSIONS || [])
-        .filter(s => s.provider_id === pid && s.transcript_id && s.live !== false)
-        .sort((a, b) => sessionSortAt(b).localeCompare(sessionSortAt(a)));
-      const liveTids = new Set(live.flatMap(s => [s.transcript_id, s.native_session_id, s.cli_session_id]).filter(Boolean));
-      const rows = NATIVE.filter(s => ![s.cli_session_id, s.native_session_id].some(id => id && liveTids.has(id)))
+      // Merge currently-driven and native rows first, then apply one global
+      // activity ordering. A live badge must not pin an older session above a
+      // newer inactive session.
+      const allRows = combinedVisibleSessions(pid);
+      const rows = allRows
         .filter(s => !q || [s.title, s.branch, s.cwd, s.worktree].some(v => (v || "").toLowerCase().includes(q)))
-        .sort((a, b) => sessionSortAt(b).localeCompare(sessionSortAt(a)));   // latest assistant reply first
-      $("sessions-count").textContent = NATIVE.length ? `(${rows.length}/${NATIVE.length})` : "";
+        .sort(compareSessionsNewest);   // latest assistant reply first
+      const sessionCount = $("sessions-count");
+      sessionCount.textContent = allRows.length ? `(${rows.length}/${allRows.length})${SESSION_REFRESH_META.refreshing ? " ↻" : ""}` : "";
+      sessionCount.title = [
+        SESSION_REFRESH_META.source && `source: ${SESSION_REFRESH_META.source}`,
+        SESSION_REFRESH_META.refreshed_at && `refreshed: ${SESSION_REFRESH_META.refreshed_at}`,
+        SESSION_REFRESH_META.refresh_error && `error: ${SESSION_REFRESH_META.refresh_error}`,
+      ].filter(Boolean).join(" · ");
       const list = $("session-list"); list.innerHTML = "";
-      if (live.length) {
-        const g = document.createElement("div"); g.className = "live-grp";
-        g.innerHTML = `<div class="lh">● 进行中 (${live.length})</div>`;
-        live.forEach(s => {
-          const when = sessionWhen(s);
-          const it = document.createElement("div"); it.className = "nitem clickable";
-          it.innerHTML = `<div class="t">${esc(s.title || "session")}</div><div class="m">live${when ? " · " + esc(when) : ""}</div>`;
-          it.title = "打开正在运行的会话（任意设备可见）"; it.onclick = () => openLive(s);
-          g.appendChild(it);
-        });
-        list.appendChild(g);
-      }
-      if (!rows.length) { if (!live.length) list.innerHTML = '<div class="muted" style="padding:4px 2px">no sessions — “+ New”.</div>'; return; }
+      if (!rows.length) { list.innerHTML = '<div class="muted" style="padding:4px 2px">no sessions — “+ New”.</div>'; return; }
       rows.forEach(s => {
-        const can = !!s.cli_session_id, when = sessionWhen(s), dir = (s.cwd || "").replace(/^.*\//, "");
+        const isLive = s._session_list_live === true;
+        const can = isLive || !!s.cli_session_id, when = sessionWhen(s), dir = (s.cwd || "").replace(/^.*\//, "");
         const turns = (s.completed_turns != null) ? `<b>${esc(s.completed_turns)}</b> turns · ` : "";
         const it = document.createElement("div"); it.className = "nitem" + (can ? " clickable" : "");
         it.innerHTML = `<div class="t">${esc(s.title)}${s.archived ? ' <span class="muted">· archived</span>' : ""}</div>
-          <div class="m">${esc(when)}${when ? " · " : ""}${turns}${s.branch ? esc(s.branch) + " · " : ""}${esc(dir)}</div>`;
+          <div class="m">${isLive ? "live · " : ""}${esc(when)}${when ? " · " : ""}${turns}${s.branch ? esc(s.branch) + " · " : ""}${esc(dir)}</div>`;
         // Click a session to load its conversation (read-only); sending a message
         // activates it lazily (Codex attaches, Claude resumes). No explicit buttons.
-        if (can) { it.title = `打开会话（发消息时自动${providerIsCodex(pid) ? "接入" : "恢复"}）`; it.onclick = () => previewSession(s); }
+        if (isLive) { it.title = "打开正在运行的会话（任意设备可见）"; it.onclick = () => openLive(s); }
+        else if (can) { it.title = `打开会话（发消息时自动${providerIsCodex(pid) ? "接入" : "恢复"}）`; it.onclick = () => previewSession(s); }
         else { it.title = "no transcript id"; }
         list.appendChild(it);
       });
     }
     function sessionSortAt(s) { return (s && (s.last_reply_at || s.updated_at)) || ""; }
-    function sessionWhen(s) { return sessionSortAt(s).slice(0, 16).replace("T", " "); }
+    function sessionIdentityKeys(s) {
+      return [...new Set([s && s.cli_session_id, s && s.native_session_id, s && s.transcript_id, s && s.session_id]
+        .filter(Boolean).map(String))];
+    }
+    function newerSessionTimestamp(left, right) {
+      const leftTime = sessionTimestampMillis(left), rightTime = sessionTimestampMillis(right);
+      if (rightTime > leftTime) return right;
+      if (leftTime > rightTime) return left;
+      return String(right || "") > String(left || "") ? right : left;
+    }
+    function combinedVisibleSessions(pid) {
+      const combined = [], identityIndex = new Map();
+      const add = (source, isLive) => {
+        const row = { ...source, _session_list_live: isLive };
+        const keys = sessionIdentityKeys(row);
+        const matched = keys.map(key => identityIndex.get(key)).find(index => index !== undefined);
+        if (matched !== undefined) {
+          const existing = combined[matched];
+          existing.last_reply_at = newerSessionTimestamp(existing.last_reply_at, row.last_reply_at);
+          existing.updated_at = newerSessionTimestamp(existing.updated_at, row.updated_at);
+          for (const key of ["title", "cwd", "branch", "worktree", "cli_session_id", "native_session_id", "transcript_id", "session_id"]) {
+            if (!existing[key] && row[key]) existing[key] = row[key];
+          }
+          keys.forEach(key => identityIndex.set(key, matched));
+          return;
+        }
+        const index = combined.length;
+        combined.push(row);
+        keys.forEach(key => identityIndex.set(key, index));
+      };
+      (LIVE_SESSIONS || [])
+        .filter(s => s.provider_id === pid && s.transcript_id && s.live !== false)
+        .forEach(s => add(s, true));
+      (NATIVE || []).forEach(s => add(s, false));
+      return combined;
+    }
+    function sessionTimestampHasZone(value) {
+      return /(?:Z|[+-]\d{2}:?\d{2})$/i.test(String(value || ""));
+    }
+    function sessionTimestampMillis(value) {
+      if (!value || !sessionTimestampHasZone(value)) return Number.NEGATIVE_INFINITY;
+      const parsed = Date.parse(value);
+      return Number.isFinite(parsed) ? parsed : Number.NEGATIVE_INFINITY;
+    }
+    function compareSessionsNewest(left, right) {
+      const leftTime = sessionTimestampMillis(sessionSortAt(left));
+      const rightTime = sessionTimestampMillis(sessionSortAt(right));
+      if (leftTime !== rightTime) return rightTime > leftTime ? 1 : -1;
+      return sessionIdentityKeys(left).join("\u0000").localeCompare(sessionIdentityKeys(right).join("\u0000"));
+    }
+    function timestampOwnOffsetMinutes(value) {
+      const text = String(value || "");
+      if (/Z$/i.test(text)) return 0;
+      const match = text.match(/([+-])(\d{2}):?(\d{2})$/);
+      if (!match) return null;
+      const minutes = Number(match[2]) * 60 + Number(match[3]);
+      return match[1] === "-" ? -minutes : minutes;
+    }
+    function formatUTCDateParts(date) {
+      const pad = value => String(value).padStart(2, "0");
+      return `${date.getUTCFullYear()}-${pad(date.getUTCMonth() + 1)}-${pad(date.getUTCDate())} ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+    }
+    function formatDateInTimeZone(date, timeZone) {
+      if (!timeZone) return "";
+      const parts = new Intl.DateTimeFormat("en-CA", {
+        timeZone, year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+      }).formatToParts(date);
+      const values = Object.fromEntries(parts.filter(part => part.type !== "literal").map(part => [part.type, part.value]));
+      return `${values.year}-${values.month}-${values.day} ${values.hour}:${values.minute}`;
+    }
+    function sessionWhen(s) {
+      const value = sessionSortAt(s);
+      if (!value || !sessionTimestampHasZone(value)) return "";
+      const date = new Date(value);
+      if (!Number.isFinite(date.getTime())) return "";
+      const deviceTime = SESSION_REFRESH_META.device_time || {};
+      if (deviceTime.time_zone) {
+        try { return formatDateInTimeZone(date, deviceTime.time_zone); } catch (e) {}
+      }
+      const configuredOffset = Number(deviceTime.utc_offset_minutes);
+      const offset = Number.isFinite(configuredOffset) ? configuredOffset : timestampOwnOffsetMinutes(value);
+      return formatUTCDateParts(new Date(date.getTime() + (Number.isFinite(offset) ? offset : 0) * 60000));
+    }
     function setActive(id, title) {
       const sel = $("session-select");
       if (id && ![...sel.options].some(o => o.value === id)) { const o = document.createElement("option"); o.value = id; sel.appendChild(o); }
       sel.value = id || ""; ACTIVE = { id: id || "", title: title || "" };
       $("active-title").textContent = title || id || "No session";
     }
+    function providerMeta(id) {
+      return (PROVIDERS_META || []).find(p => p && p.provider_id === id) || null;
+    }
     function providerLabel(id, meta) {
+      meta = meta || providerMeta(id);
       return ({ codex: "Codex", claude: "Claude", claude_cli: "Claude" })[id]
         || (meta && meta.status && meta.status.app_name) || id || "";
     }
@@ -1584,6 +1795,7 @@
     let LIVE = null;
     let ACTIVE_TAB_SEQ = 0;          // increments on active-tab changes; async replies must match
     let ACTIVE_CAPS = {};            // active provider's capabilities (for steer/interrupt UI)
+    let ACTIVE_ACTIONS = [];         // typed action contract for the active provider
     let LAST_ACCOUNT = null;         // active provider's codex account/usage (for the usage bar)
     const CST = { turn: null };      // running turn-grouping state for appendMessage
     const REWIND_TARGETS = new Map();
@@ -1671,7 +1883,7 @@
       else { showChat([], t.title, 0, 0, t); await loadTabChat(t); }   // lazy fetch on first activate
       if (!isActiveTab(t, seq)) return;   // user switched while the initial fetch was in flight
       persistTabs();
-      refreshStatus(); refreshProviders(); refreshSessions();
+      refreshStatus(); refreshProviders();
       openStream();   // open WS for the newly active tab (no-op if no sessionId)
       if (window.innerWidth <= 860) toggleDrawer(false);
     }
@@ -1773,7 +1985,8 @@
       const seq = ACTIVE_TAB_SEQ;
       tab._validatingSession = true; renderComposer();
       try {
-        const sr = await fetch(tabUrl(tab, "/sessions"), { headers: headers() });
+        const sq = `?provider_id=${encodeURIComponent(tab.provider || "")}&session_id=${encodeURIComponent(tab.sessionId)}`;
+        const sr = await fetch(tabUrl(tab, "/sessions" + sq), { headers: headers() });
         const sd = sr.ok ? await sr.json() : {};
         const records = sd.sessions || [];
         const rec = records.find(row => sessionMatchesTab(row, tab) && row.session_id === tab.sessionId);
@@ -2101,7 +2314,7 @@
         }
         chat.appendChild(d); maybeStickToBottom(stick); return;
       }
-      const alabel = ((tab && tab.provider) || $("provider-select").value || CUR_PROVIDER || "").startsWith("codex") ? "Codex" : "Claude";
+      const alabel = providerLabel((tab && tab.provider) || $("provider-select").value || CUR_PROVIDER || "");
       if (!CST.turn) { CST.turn = document.createElement("div"); CST.turn.className = "turn";
         CST.turn.innerHTML = roleHTML(alabel, m.ts || m.timestamp, false); chat.appendChild(CST.turn); }
       const el = renderItem(m, tab);
@@ -3052,6 +3265,17 @@
       if (isActiveTab(tab)) renderUploads();
     }
 
+    function actionSupported(id, capability) {
+      const providerID = (LIVE && LIVE.provider) || $("provider-select").value || CUR_PROVIDER;
+      const meta = providerMeta(providerID);
+      const actions = (meta && Array.isArray(meta.actions)) ? meta.actions : ACTIVE_ACTIONS;
+      const caps = (meta && meta.capabilities) || ACTIVE_CAPS;
+      if (actions && actions.length) {
+        const action = actions.find(row => row && row.id === id);
+        if (action) return action.supported === true;
+      }
+      return !!(caps && caps[capability]);
+    }
     // core send (used by manual Send and by queue-flush). Claude previews are
     // resumed explicitly; Codex previews let the provider establish Desktop
     // ownership lazily as part of the delivery attempt.
@@ -3208,7 +3432,9 @@
       try {
         const r = await (await apiForTab(LIVE, "/interrupt", { method: "POST", body: JSON.stringify({
           provider_id: LIVE.provider, session_id: LIVE.sessionId }) })).json();
-        $("send-out").textContent = r.ok ? "已发送停止 (Esc)" : ("停止失败: " + (r.detail || ""));
+        $("send-out").textContent = r.ok
+          ? (r.confirmed === false ? "已请求停止，等待 Codex 确认终态…" : "回合已停止")
+          : ("停止失败: " + (r.detail || ""));
         refreshStatus();
       } catch (e) { $("send-out").textContent = e.message; }
     }
@@ -3223,11 +3449,16 @@
       const resuming = !!(LIVE && LIVE._resuming);
       const delivering = !!(LIVE && LIVE._delivering);
       const running = !!(LIVE && LIVE._running);
-      const steer = !!(ACTIVE_CAPS && ACTIVE_CAPS.steer);
+      const steer = actionSupported("turn.steer", "steer");
+      const interrupt = actionSupported("turn.interrupt", "interrupt");
+      const attachments = actionSupported("attachment.upload", "attachments");
       const show = (id, on) => { const el = $(id); if (el) el.style.display = on ? "" : "none"; };
       const sb = $("send-btn"), pr = $("prompt");
       const attach = $("attach-btn");
-      if (attach) attach.disabled = !hasSession || validating || resuming;
+      if (attach) {
+        attach.style.display = attachments ? "" : "none";
+        attach.disabled = !attachments || !hasSession || validating || resuming;
+      }
       renderUploads();
       if (validating) {
         show("send-btn", true); show("queue-btn", false); show("insert-btn", false); show("stop-btn", false);
@@ -3255,7 +3486,7 @@
       show("send-btn", !running);
       show("queue-btn", running);
       show("insert-btn", running && steer);
-      show("stop-btn", running);
+      show("stop-btn", running && interrupt);
       const qn = $("queue-btn"); if (qn) qn.textContent = (LIVE && LIVE.queued) ? "排队 ✓" : "排队";
     }
     // Activation button: Claude previews resume explicitly; Codex previews
@@ -3298,7 +3529,9 @@
       try { const res = await fetchForTab(LIVE, "/approval", { method: "POST", body: JSON.stringify({
         task_id: tid, provider_id: prov, session_id: sid, request_id: ar.request_id || "", decision
       }) }); const r = await res.json();
-        $("send-out").textContent = r.ok ? `'${decision}' relayed.` : `error: ${r.detail || r.status || "send failed"}`;
+        $("send-out").textContent = r.ok
+          ? (r.confirmed === false ? `'${decision}' 已发送，等待 Codex 确认…` : `'${decision}' relayed.`)
+          : `error: ${r.detail || r.status || "send failed"}`;
         refreshStatus(); } catch (e) { alert(e.message); }
     }
 
@@ -3361,7 +3594,9 @@
 		  provider_id: prov, session_id: sid, request_id: ar.request_id, answers
 		}) });
 		const body = await res.json();
-		$("send-out").textContent = body.ok ? "答案已发送" : `error: ${body.detail || "send failed"}`;
+		$("send-out").textContent = body.ok
+		  ? (body.confirmed === false ? "答案已发送，等待 Codex 确认…" : "答案已发送")
+		  : `error: ${body.detail || "send failed"}`;
 		refreshStatus();
 	  } catch (e) { $("send-out").textContent = e.message; }
 	}
@@ -3485,7 +3720,7 @@
         var turn = document.createElement("div");
         turn.id = "live-bubble";
         turn.className = "turn";
-        var alabel = ((tab && tab.provider) || $("provider-select").value || CUR_PROVIDER || "").startsWith("codex") ? "Codex" : "Claude";
+        var alabel = providerLabel((tab && tab.provider) || $("provider-select").value || CUR_PROVIDER || "");
         var roleTpl = document.createElement("div");
         roleTpl.innerHTML = roleHTML(alabel, tab._liveTs || new Date().toISOString(), true);
         turn.appendChild(roleTpl.firstElementChild);
@@ -3575,7 +3810,7 @@
 
     function refreshAll(includeDevices = false) {
       if (includeDevices) refreshDevices();
-      refreshStatus(); refreshAgentUpdateInfo(); refreshProviders(); trackTask();
+      refreshStatus(); refreshAgentUpdateInfo(); refreshProviders({ forceSessions: includeDevices }); trackTask();
     }
     // ---- Web Push (PWA) ----
     function urlB64ToU8(b64) {
@@ -3659,8 +3894,16 @@
         }) });
       } catch (e) {}
     }
+    function refreshSessionsIfVisible() {
+      if (document.visibilityState === "visible") refreshSessions();
+    }
+    function handlePageVisibility() {
+      pingPresence();
+      if (document.visibilityState === "visible") refreshSessions();
+      else cancelSessionRefreshesExcept();
+    }
     setInterval(pingPresence, 12000);
-    document.addEventListener('visibilitychange', pingPresence);
+    document.addEventListener('visibilitychange', handlePageVisibility);
     function focusSession(sid, provider) {
       if (!sid) return;
       const t = TABS.find(x => (!provider || x.provider === provider) &&
@@ -3695,6 +3938,7 @@
     });
     setInterval(() => { refreshStatus(); trackTask(); }, 5000);
     setInterval(refreshDevices, 10000);
+    setInterval(refreshSessionsIfVisible, SESSION_REFRESH_POLL_MS);
     setInterval(refreshApprovalInbox, 3000);
     setInterval(liveTick, 2000);   // live-tail the open preview/activated/fork chat (typewriter on new content)
     // scroll to the top of the chat -> lazy-load older messages

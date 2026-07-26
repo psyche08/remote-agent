@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,17 +21,22 @@ type fakeCodexClient struct {
 	threadStatus   map[string]string
 	threadTurn     map[string]string
 	turns          [][2]string
+	steers         [][2]string
+	interrupts     []string
 	rollbacks      [][2]any
 	resumes        []string
 	responses      []map[string]any
 	errorResponses []map[string]any
 	respondedIDs   []any
 	listResult     any
+	listParams     []map[string]any
+	listErrors     []error
 	resumeResult   any
 	active         bool
 	lastModel      string
 	startErr       error
 	startID        string
+	interruptHook  func()
 }
 
 func newFakeCodexClient() *fakeCodexClient {
@@ -80,6 +86,21 @@ func (f *fakeCodexClient) ThreadRollback(threadID string, numTurns int, params m
 func (f *fakeCodexClient) ThreadList(timeout time.Duration, params map[string]any) (any, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var copied map[string]any
+	if params != nil {
+		copied = make(map[string]any, len(params))
+		for key, value := range params {
+			copied[key] = value
+		}
+	}
+	f.listParams = append(f.listParams, copied)
+	if len(f.listErrors) > 0 {
+		err := f.listErrors[0]
+		f.listErrors = f.listErrors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if f.listResult != nil {
 		return f.listResult, nil
 	}
@@ -98,10 +119,20 @@ func (f *fakeCodexClient) TurnStart(threadID string, prompt string, extra map[st
 }
 
 func (f *fakeCodexClient) TurnSteer(threadID string, prompt string, extra map[string]any) (any, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.steers = append(f.steers, [2]string{threadID, prompt})
 	return map[string]any{"turnId": "turn-1"}, nil
 }
 
 func (f *fakeCodexClient) TurnInterrupt(threadID string, extra map[string]any) (any, error) {
+	f.mu.Lock()
+	f.interrupts = append(f.interrupts, threadID)
+	hook := f.interruptHook
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return map[string]any{}, nil
 }
 
@@ -154,13 +185,17 @@ func (f *fakeCodexClient) LastModel() string {
 }
 
 type fakeDesktopClient struct {
-	starts         [][2]string
-	targetStarts   [][3]string
-	err            error
-	missingTargets map[string]bool
-	snapshots      []map[string]any
-	decisions      []map[string]any
-	decisionErr    error
+	starts           [][2]string
+	targetStarts     [][3]string
+	steers           [][2]string
+	targetSteers     [][3]string
+	interrupts       []string
+	targetInterrupts [][2]string
+	err              error
+	missingTargets   map[string]bool
+	snapshots        []map[string]any
+	decisions        []map[string]any
+	decisionErr      error
 }
 
 func (f *fakeDesktopClient) StartTurn(conversationID string, prompt string, opts map[string]any, timeout time.Duration) (any, error) {
@@ -178,9 +213,31 @@ func (f *fakeDesktopClient) StartTurnOnClient(conversationID string, prompt stri
 	return map[string]any{"result": map[string]any{"turn": map[string]any{"id": "desktop-turn"}}}, nil
 }
 func (f *fakeDesktopClient) SteerTurn(conversationID string, prompt string, timeout time.Duration) (any, error) {
+	return f.SteerTurnOnClient(conversationID, prompt, "", timeout)
+}
+func (f *fakeDesktopClient) SteerTurnOnClient(conversationID string, prompt string, targetClientID string, timeout time.Duration) (any, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.targetSteers = append(f.targetSteers, [3]string{conversationID, prompt, targetClientID})
+	if f.missingTargets != nil && f.missingTargets[targetClientID] {
+		return nil, CodexDesktopIPCError{"thread-follower-steer-turn failed: \"no-client-found\""}
+	}
+	f.steers = append(f.steers, [2]string{conversationID, prompt})
 	return map[string]any{}, nil
 }
 func (f *fakeDesktopClient) InterruptTurn(conversationID string, timeout time.Duration) (any, error) {
+	return f.InterruptTurnOnClient(conversationID, "", timeout)
+}
+func (f *fakeDesktopClient) InterruptTurnOnClient(conversationID string, targetClientID string, timeout time.Duration) (any, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	f.targetInterrupts = append(f.targetInterrupts, [2]string{conversationID, targetClientID})
+	if f.missingTargets != nil && f.missingTargets[targetClientID] {
+		return nil, CodexDesktopIPCError{"thread-follower-interrupt-turn failed: \"no-client-found\""}
+	}
+	f.interrupts = append(f.interrupts, conversationID)
 	return map[string]any{}, nil
 }
 func (f *fakeDesktopClient) SnapshotLiveThreads(timeout time.Duration) []map[string]any {
@@ -228,6 +285,9 @@ func testCodexWithClient(t *testing.T, fc *fakeCodexClient) *Codex {
 	c.clientFactory = func(func(string, map[string]any), func(any, string, map[string]any)) codexAppClient {
 		return fc
 	}
+	c.client = fc
+	c.clientGeneration = 1
+	c.clientSequence = 1
 	// Keep unit tests hermetic: never let a test reach the real Desktop IPC
 	// socket on the host machine.
 	c.desktopFactory = func() codexDesktopClient { return &fakeDesktopClient{} }
@@ -403,6 +463,270 @@ func TestCodexSendReattachesAfterDesktopOwnerDisappears(t *testing.T) {
 	}
 	if len(desktop.targetStarts) != 2 || desktop.targetStarts[1][2] != "owner-2" || len(fc.turns) != 0 {
 		t.Fatalf("bad Desktop/app-server sequence desktop=%#v app=%#v", desktop.targetStarts, fc.turns)
+	}
+}
+
+func TestCodexSendReattachesWhenSnapshotStillReportsStaleOwner(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindDesktopTranscript("s1", fakeCodexThreadID)
+	c.noteDesktopOwnerClients([]map[string]any{{
+		"transcript_id": fakeCodexThreadID, "desktop_owner_client_id": "stale-owner",
+	}})
+	desktop := &fakeDesktopClient{
+		missingTargets: map[string]bool{"stale-owner": true},
+		snapshots:      desktopOwnerSnapshot(fakeCodexThreadID, "stale-owner"),
+	}
+	c.desktopFactory = func() codexDesktopClient { return desktop }
+	c.desktopOpener = func(string) error {
+		desktop.snapshots = desktopOwnerSnapshot(fakeCodexThreadID, "owner-2")
+		return nil
+	}
+	res := c.SendPrompt("s1", "reattach stale snapshot")
+	if !res.OK || res.Message != "turn started via Codex Desktop" {
+		t.Fatalf("expected Desktop reattach after unchanged stale snapshot: %#v", res)
+	}
+	if len(desktop.targetStarts) != 2 ||
+		desktop.targetStarts[0][2] != "stale-owner" ||
+		desktop.targetStarts[1][2] != "owner-2" ||
+		len(fc.turns) != 0 {
+		t.Fatalf("bad stale-owner reattach sequence desktop=%#v app=%#v", desktop.targetStarts, fc.turns)
+	}
+}
+
+func TestCodexSteerDoesNotFallbackWhenDesktopOwnerMissing(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindDesktopTranscript("s1", fakeCodexThreadID)
+	c.desktopAttachTimeout = time.Millisecond
+	c.desktopOpener = func(string) error { return nil }
+	desktop := &fakeDesktopClient{}
+	c.desktopFactory = func() codexDesktopClient { return desktop }
+
+	res := c.Steer("s1", "continue")
+	if boolAny(res["ok"]) || !stringsContains(stringAny(res["detail"]), "no active Desktop IPC owner") {
+		t.Fatalf("expected missing Desktop owner: %#v", res)
+	}
+	if len(fc.steers) != 0 {
+		t.Fatalf("Desktop-bound steer must not fall back to app-server: %#v", fc.steers)
+	}
+	if len(desktop.targetSteers) != 0 {
+		t.Fatalf("steer must not be sent without an owner: %#v", desktop.targetSteers)
+	}
+}
+
+func TestCodexInterruptDoesNotFallbackWhenDesktopOwnerMissing(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindDesktopTranscript("s1", fakeCodexThreadID)
+	c.desktopAttachTimeout = time.Millisecond
+	c.desktopOpener = func(string) error { return nil }
+	desktop := &fakeDesktopClient{}
+	c.desktopFactory = func() codexDesktopClient { return desktop }
+
+	res := c.Interrupt("s1")
+	if boolAny(res["ok"]) || !stringsContains(stringAny(res["detail"]), "no active Desktop IPC owner") {
+		t.Fatalf("expected missing Desktop owner: %#v", res)
+	}
+	if len(fc.interrupts) != 0 {
+		t.Fatalf("Desktop-bound interrupt must not fall back to app-server: %#v", fc.interrupts)
+	}
+	if len(desktop.targetInterrupts) != 0 {
+		t.Fatalf("interrupt must not be sent without an owner: %#v", desktop.targetInterrupts)
+	}
+}
+
+func TestCodexSteerLazilyAttachesDesktopOwner(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindDesktopTranscript("s1", fakeCodexThreadID)
+	desktop, opener := attachableDesktop(fakeCodexThreadID, "owner-1")
+	c.desktopFactory = func() codexDesktopClient { return desktop }
+	c.desktopOpener = opener
+
+	res := c.Steer("s1", "continue")
+	if !boolAny(res["ok"]) || stringAny(res["detail"]) != "steered into running turn via Codex Desktop" {
+		t.Fatalf("expected lazy Desktop steer: %#v", res)
+	}
+	if len(desktop.targetSteers) != 1 || desktop.targetSteers[0] != [3]string{fakeCodexThreadID, "continue", "owner-1"} {
+		t.Fatalf("Desktop owner was not targeted after lazy attach: %#v", desktop.targetSteers)
+	}
+	if len(fc.steers) != 0 {
+		t.Fatalf("Desktop-bound steer must not call app-server: %#v", fc.steers)
+	}
+}
+
+func TestCodexInterruptLazilyAttachesDesktopOwner(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindDesktopTranscript("s1", fakeCodexThreadID)
+	desktop, opener := attachableDesktop(fakeCodexThreadID, "owner-1")
+	c.desktopFactory = func() codexDesktopClient { return desktop }
+	c.desktopOpener = opener
+
+	res := c.Interrupt("s1")
+	if !boolAny(res["ok"]) || res["status"] != "cancellation_requested" || boolAny(res["confirmed"]) ||
+		stringAny(res["detail"]) != "turn cancellation requested via Codex Desktop; waiting for Codex completion" {
+		t.Fatalf("expected lazy Desktop interrupt: %#v", res)
+	}
+	if len(desktop.targetInterrupts) != 1 || desktop.targetInterrupts[0] != [2]string{fakeCodexThreadID, "owner-1"} {
+		t.Fatalf("Desktop owner was not targeted after lazy attach: %#v", desktop.targetInterrupts)
+	}
+	if len(fc.interrupts) != 0 {
+		t.Fatalf("Desktop-bound interrupt must not call app-server: %#v", fc.interrupts)
+	}
+}
+
+func TestCodexInterruptWaitsForAuthoritativeTerminal(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindTranscript("s1", fakeCodexThreadID)
+	c.markAppServerThread(fakeCodexThreadID)
+	c.setThreadActive(fakeCodexThreadID, true)
+	fc.SetThreadTurn(fakeCodexThreadID, "turn-interrupt")
+	c.bindTurnThread(fakeCodexThreadID, "turn-interrupt")
+	c.onServerRequest(float64(90), "item/commandExecution/requestApproval", map[string]any{
+		"threadId": fakeCodexThreadID, "turnId": "turn-interrupt", "itemId": "exec-interrupt",
+	})
+
+	res := c.Interrupt("s1")
+	if !boolAny(res["ok"]) || res["status"] != "cancellation_requested" || boolAny(res["confirmed"]) {
+		t.Fatalf("interrupt ACK was treated as terminal: %#v", res)
+	}
+	if !c.threadActive(fakeCodexThreadID) || !c.threadInterrupting(fakeCodexThreadID) {
+		t.Fatal("interrupt ACK cleared the live route before terminal")
+	}
+	if state := c.DetectState("s1"); state != "running" {
+		t.Fatalf("interrupting thread state=%q want running", state)
+	}
+	if request := c.ApprovalRequest("s1"); request != nil {
+		t.Fatalf("cancellation-requested approval remained actionable: %#v", request)
+	}
+	c.approvalMu.Lock()
+	internalPending := len(c.approvalsByThread[fakeCodexThreadID])
+	c.approvalMu.Unlock()
+	if internalPending != 1 {
+		t.Fatal("interrupt ACK discarded the immutable approval route")
+	}
+
+	c.onNotification("turn/completed", map[string]any{
+		"threadId": fakeCodexThreadID,
+		"turn":     map[string]any{"id": "turn-interrupt", "status": "interrupted"},
+	})
+	if c.threadActive(fakeCodexThreadID) || c.threadInterrupting(fakeCodexThreadID) {
+		t.Fatal("authoritative terminal did not retire the turn route")
+	}
+	if state := c.DetectState("s1"); state != "idle" {
+		t.Fatalf("terminal state=%q want idle", state)
+	}
+	c.approvalMu.Lock()
+	internalPending = len(c.approvalsByThread[fakeCodexThreadID])
+	c.approvalMu.Unlock()
+	if internalPending != 0 {
+		t.Fatal("terminal did not clear abandoned approvals")
+	}
+}
+
+func TestCodexInterruptTerminalBeforeAckDoesNotResurrectTurn(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindTranscript("s1", fakeCodexThreadID)
+	c.markAppServerThread(fakeCodexThreadID)
+	c.setThreadActive(fakeCodexThreadID, true)
+	fc.SetThreadTurn(fakeCodexThreadID, "turn-race")
+	c.bindTurnThread(fakeCodexThreadID, "turn-race")
+	fc.interruptHook = func() {
+		c.onNotification("turn/completed", map[string]any{
+			"threadId": fakeCodexThreadID,
+			"turn":     map[string]any{"id": "turn-race", "status": "interrupted"},
+		})
+	}
+
+	res := c.Interrupt("s1")
+	if !boolAny(res["ok"]) || res["status"] != "completed" || !boolAny(res["confirmed"]) {
+		t.Fatalf("terminal-before-ack result=%#v", res)
+	}
+	if c.threadActive(fakeCodexThreadID) || c.threadInterrupting(fakeCodexThreadID) {
+		t.Fatal("late interrupt ACK resurrected an already terminal turn")
+	}
+}
+
+func TestCodexSteerRefreshesStaleDesktopOwnerOnce(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindDesktopTranscript("s1", fakeCodexThreadID)
+	c.noteDesktopOwnerClients([]map[string]any{{
+		"transcript_id": fakeCodexThreadID, "desktop_owner_client_id": "stale-owner",
+	}})
+	desktop := &fakeDesktopClient{
+		missingTargets: map[string]bool{"stale-owner": true},
+		snapshots:      desktopOwnerSnapshot(fakeCodexThreadID, "owner-2"),
+	}
+	c.desktopFactory = func() codexDesktopClient { return desktop }
+
+	res := c.Steer("s1", "continue")
+	if !boolAny(res["ok"]) {
+		t.Fatalf("steer failed after owner refresh: %#v", res)
+	}
+	if len(desktop.targetSteers) != 2 ||
+		desktop.targetSteers[0] != [3]string{fakeCodexThreadID, "continue", "stale-owner"} ||
+		desktop.targetSteers[1] != [3]string{fakeCodexThreadID, "continue", "owner-2"} {
+		t.Fatalf("bad owner refresh sequence: %#v", desktop.targetSteers)
+	}
+	if len(fc.steers) != 0 {
+		t.Fatalf("stale Desktop owner must not trigger app-server fallback: %#v", fc.steers)
+	}
+}
+
+func TestCodexTurnRoutingDoesNotGuessLastThread(t *testing.T) {
+	c := testCodexWithClient(t, newFakeCodexClient())
+	c.bindTurnThread(approvalThreadA, "turn-a")
+	if got := c.threadIDForNotification(map[string]any{"turnId": "turn-a"}); got != approvalThreadA {
+		t.Fatalf("known turn route=%q", got)
+	}
+	if got := c.threadIDForNotification(map[string]any{"turnId": "unknown-turn"}); got != "" {
+		t.Fatalf("unknown turn guessed provider-global thread %q", got)
+	}
+}
+
+func TestCodexIgnoresStaleClientGenerationRequest(t *testing.T) {
+	c := testCodexWithClient(t, newFakeCodexClient())
+	c.BindTranscript("sess-a", approvalThreadA)
+	c.onServerRequestFromClient(0, float64(1), "item/commandExecution/requestApproval", commandApprovalParams(approvalThreadA, nil))
+	c.onServerRequestFromClient(2, float64(2), "item/commandExecution/requestApproval", commandApprovalParams(approvalThreadA, nil))
+	if request := c.ApprovalRequest("sess-a"); request != nil {
+		t.Fatalf("stale generation injected an approval: %#v", request)
+	}
+	c.onServerRequestFromClient(1, float64(3), "item/commandExecution/requestApproval", commandApprovalParams(approvalThreadA, nil))
+	if request := c.ApprovalRequest("sess-a"); request == nil || request["request_id"] != "3" {
+		t.Fatalf("current generation request missing: %#v", request)
+	}
+}
+
+func TestCodexInterruptRefreshesStaleDesktopOwnerOnce(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindDesktopTranscript("s1", fakeCodexThreadID)
+	c.noteDesktopOwnerClients([]map[string]any{{
+		"transcript_id": fakeCodexThreadID, "desktop_owner_client_id": "stale-owner",
+	}})
+	desktop := &fakeDesktopClient{
+		missingTargets: map[string]bool{"stale-owner": true},
+		snapshots:      desktopOwnerSnapshot(fakeCodexThreadID, "owner-2"),
+	}
+	c.desktopFactory = func() codexDesktopClient { return desktop }
+
+	res := c.Interrupt("s1")
+	if !boolAny(res["ok"]) {
+		t.Fatalf("interrupt failed after owner refresh: %#v", res)
+	}
+	if len(desktop.targetInterrupts) != 2 ||
+		desktop.targetInterrupts[0] != [2]string{fakeCodexThreadID, "stale-owner"} ||
+		desktop.targetInterrupts[1] != [2]string{fakeCodexThreadID, "owner-2"} {
+		t.Fatalf("bad owner refresh sequence: %#v", desktop.targetInterrupts)
+	}
+	if len(fc.interrupts) != 0 {
+		t.Fatalf("stale Desktop owner must not trigger app-server fallback: %#v", fc.interrupts)
 	}
 }
 
@@ -828,6 +1152,80 @@ func TestCodexThreadListAndMessages(t *testing.T) {
 	}
 }
 
+func TestCodexThreadListUsesStateDBFastPath(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+
+	c.ListNativeSessions()
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if len(fc.listParams) != 1 {
+		t.Fatalf("thread/list calls=%d params=%#v", len(fc.listParams), fc.listParams)
+	}
+	params := fc.listParams[0]
+	if intAny(params["limit"]) != nativeSessionListLimit ||
+		!boolAny(params["useStateDbOnly"]) ||
+		stringAny(params["sortKey"]) != "recency_at" ||
+		stringAny(params["sortDirection"]) != "desc" {
+		t.Fatalf("thread/list did not use the state DB fast path: %#v", params)
+	}
+	sources := map[string]bool{}
+	for _, raw := range listAny(params["sourceKinds"]) {
+		source := stringAny(raw)
+		sources[source] = true
+		if strings.HasPrefix(normalizedCodexSource(source), "subagent") {
+			t.Fatalf("subagent source leaked into interactive thread/list: %#v", params["sourceKinds"])
+		}
+	}
+	for _, source := range codexInteractiveSourceKinds {
+		if !sources[source] {
+			t.Fatalf("interactive source %q missing from %#v", source, params["sourceKinds"])
+		}
+	}
+}
+
+func TestCodexThreadListInvalidParamsFallsBackOncePerProcess(t *testing.T) {
+	fc := newFakeCodexClient()
+	fc.listErrors = []error{
+		CodexAppServerError{Message: `thread/list failed: {"code":-32602,"message":"Invalid params"}`},
+	}
+	c := testCodexWithClient(t, fc)
+
+	c.ListNativeSessions()
+	c.ListNativeSessions()
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if len(fc.listParams) != 3 {
+		t.Fatalf("thread/list calls=%d want=3 params=%#v", len(fc.listParams), fc.listParams)
+	}
+	if fc.listParams[0] == nil || fc.listParams[1] != nil || fc.listParams[2] != nil {
+		t.Fatalf("fast-path fallback was not remembered: %#v", fc.listParams)
+	}
+	if !c.threadListLegacy {
+		t.Fatal("invalid params capability result was not remembered")
+	}
+}
+
+func TestCodexThreadListOperationalErrorDoesNotDisableFastPath(t *testing.T) {
+	fc := newFakeCodexClient()
+	fc.listErrors = []error{CodexAppServerError{Message: "timeout waiting for thread/list"}}
+	c := testCodexWithClient(t, fc)
+
+	c.ListNativeSessions()
+	c.ListNativeSessions()
+
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if len(fc.listParams) != 2 || fc.listParams[0] == nil || fc.listParams[1] == nil {
+		t.Fatalf("operational error unexpectedly disabled the fast path: %#v", fc.listParams)
+	}
+	if c.threadListLegacy {
+		t.Fatal("operational error was mistaken for unsupported params")
+	}
+}
+
 func TestCodexThreadListMergesLocalRollouts(t *testing.T) {
 	fc := newFakeCodexClient()
 	appID := "019ef111-1111-7111-8111-111111111111"
@@ -914,6 +1312,38 @@ func TestCodexSessionMessagesReturnsFullHistoryForStablePreviewOffsets(t *testin
 	}
 	if len(msgs) != len(records) {
 		t.Fatalf("SessionMessages len=%d want=%d; capped history makes preview offsets slide", len(msgs), len(records))
+	}
+}
+
+func TestResolveDesktopCodexSupportsChatGPTBundle(t *testing.T) {
+	root := t.TempDir()
+	chatGPT := filepath.Join(root, "ChatGPT.app")
+	codexApp := filepath.Join(root, "Codex.app")
+	for _, app := range []string{chatGPT, codexApp} {
+		resources := filepath.Join(app, "Contents", "Resources")
+		if err := os.MkdirAll(resources, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(resources, "codex"), []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want := filepath.Join(chatGPT, "Contents", "Resources", "codex")
+	if got := resolveDesktopCodex([]string{chatGPT, codexApp}); got != want {
+		t.Fatalf("resolved bundled Codex=%q want=%q", got, want)
+	}
+}
+
+func TestCodexResumeRejectsThreadAndCwdRouteMismatch(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	fc.resumeResult = map[string]any{"thread": map[string]any{"id": approvalThreadB, "cwd": "/repo"}}
+	if _, err := c.resumeThread(fc, "s1", approvalThreadA, "/repo"); err == nil || !strings.Contains(err.Error(), "route mismatch") {
+		t.Fatalf("thread mismatch was accepted: %v", err)
+	}
+	fc.resumeResult = map[string]any{"thread": map[string]any{"id": approvalThreadA, "cwd": "/other"}}
+	if _, err := c.resumeThread(fc, "s1", approvalThreadA, "/repo"); err == nil || !strings.Contains(err.Error(), "cwd mismatch") {
+		t.Fatalf("cwd mismatch was accepted: %v", err)
 	}
 }
 

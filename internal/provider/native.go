@@ -1144,9 +1144,35 @@ func referencedFilesFromMessages(messages []map[string]any) map[string]bool {
 	return out
 }
 
+type codexRolloutSummary struct {
+	Path        string
+	UpdatedAt   string
+	Cwd         string
+	LastReplyAt string
+	Hidden      bool
+}
+
 func codexSessions(indexPath string, sessionsDirs []string, limit int) []map[string]any {
-	indexPath = expandUser(firstNonEmpty(indexPath, codexIndexDefaultPath))
 	rollouts := codexRolloutPaths(sessionsDirs)
+	summaries := make(map[string]codexRolloutSummary, len(rollouts))
+	for id, path := range rollouts {
+		cwd, hidden := codexRolloutDiscoveryMetadata(path)
+		summary := codexRolloutSummary{
+			Path:        path,
+			Cwd:         cwd,
+			LastReplyAt: codexRolloutLastReplyAt(path),
+			Hidden:      hidden,
+		}
+		if mt := fileMTime(path); !mt.IsZero() {
+			summary.UpdatedAt = epochToISO(float64(mt.UnixNano()) / 1e9)
+		}
+		summaries[id] = summary
+	}
+	return codexSessionsFromSummaries(indexPath, summaries, limit)
+}
+
+func codexSessionsFromSummaries(indexPath string, rollouts map[string]codexRolloutSummary, limit int) []map[string]any {
+	indexPath = expandUser(firstNonEmpty(indexPath, codexIndexDefaultPath))
 	byID := map[string]map[string]any{}
 	if f, err := os.Open(indexPath); err == nil {
 		defer f.Close()
@@ -1184,29 +1210,32 @@ func codexSessions(indexPath string, sessionsDirs []string, limit int) []map[str
 			}
 		}
 	}
-	for id, path := range rollouts {
+	for id, summary := range rollouts {
 		row := byID[id]
 		if row == nil {
 			row = codexNativeSessionRow(id)
 			byID[id] = row
 		}
-		if mt := fileMTime(path); !mt.IsZero() {
-			row["updated_at"] = epochToISO(float64(mt.UnixNano()) / 1e9)
+		if summary.UpdatedAt != "" {
+			row["updated_at"] = summary.UpdatedAt
 		}
 		if stringAny(row["cwd"]) == "" {
-			row["cwd"] = nullableNonEmpty(codexRolloutCwd(path))
+			row["cwd"] = nullableNonEmpty(summary.Cwd)
 		}
-		row["last_reply_at"] = nullableNonEmpty(codexRolloutLastReplyAt(path))
+		if summary.LastReplyAt != "" {
+			row["last_reply_at"] = summary.LastReplyAt
+		}
+		if summary.Hidden {
+			row[hiddenFromSessionListsKey] = true
+			row["subagent"] = true
+		}
 	}
 	out := make([]map[string]any, 0, len(byID))
 	for _, row := range byID {
 		out = append(out, row)
 	}
 	sortByUpdated(out)
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out
+	return limitCodexSessionsByVisibility(out, limit)
 }
 
 func codexNativeSessionRow(id string) map[string]any {

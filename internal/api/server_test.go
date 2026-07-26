@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +36,80 @@ func (f *blockingNativeProvider) ListNativeSessions() []map[string]any {
 	}
 	<-f.release
 	return f.rows
+}
+
+type nativeListResult struct {
+	rows     []map[string]any
+	err      error
+	panicNow bool
+}
+
+type sessionListResponse struct {
+	Sessions   []map[string]any `json:"sessions"`
+	DeviceTime map[string]any   `json:"device_time"`
+}
+
+type scriptedNativeProvider struct {
+	fakePushProvider
+	mu      sync.Mutex
+	results []nativeListResult
+	calls   int
+}
+
+func (f *scriptedNativeProvider) ID() string { return "codex" }
+
+func (f *scriptedNativeProvider) ListNativeSessions() []map[string]any {
+	rows, _ := f.ListNativeSessionsWithError()
+	return rows
+}
+
+func (f *scriptedNativeProvider) ListNativeSessionsWithError() ([]map[string]any, error) {
+	f.mu.Lock()
+	index := f.calls
+	f.calls++
+	if index >= len(f.results) {
+		index = len(f.results) - 1
+	}
+	result := f.results[index]
+	f.mu.Unlock()
+	if result.panicNow {
+		panic("native discovery test panic")
+	}
+	return result.rows, result.err
+}
+
+type refreshGateNativeProvider struct {
+	fakePushProvider
+	mu      sync.Mutex
+	calls   int
+	started chan struct{}
+	release chan struct{}
+	initial []map[string]any
+	fresh   []map[string]any
+}
+
+func (f *refreshGateNativeProvider) ID() string { return "codex" }
+
+func (f *refreshGateNativeProvider) ListNativeSessions() []map[string]any {
+	f.mu.Lock()
+	f.calls++
+	call := f.calls
+	f.mu.Unlock()
+	if call == 1 {
+		return f.initial
+	}
+	select {
+	case f.started <- struct{}{}:
+	default:
+	}
+	<-f.release
+	return f.fresh
+}
+
+func (f *refreshGateNativeProvider) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 type blockingSendProvider struct {
@@ -202,6 +278,39 @@ func TestUploadIsSessionScopedAndDeliveredAsAttachment(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusNotFound {
 		t.Fatalf("cross-session status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestUploadRejectsProviderWithoutAttachmentCapability(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.SaveSessions([]state.Record{{"session_id": "logical-1", "provider_id": "terminal-agent"}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"terminal-agent": {}}}
+	config.ApplyDefaults(cfg)
+	srv := NewServer(cfg, provider.Registry{"terminal-agent": &fakePushProvider{id: "terminal-agent"}}, st)
+
+	var body bytes.Buffer
+	mw := multipart.NewWriter(&body)
+	_ = mw.WriteField("provider_id", "terminal-agent")
+	_ = mw.WriteField("session_id", "logical-1")
+	part, err := mw.CreateFormFile("file", "unused.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = part.Write([]byte("must not be persisted"))
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/upload", &body)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "does not support attachments") {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if _, err := os.Stat(srv.uploadDir("terminal-agent", "logical-1")); !os.IsNotExist(err) {
+		t.Fatalf("unsupported upload created persistent data: %v", err)
 	}
 }
 
@@ -630,6 +739,13 @@ func TestSendPromptNativePreviewUpgradesExistingCodexRouteToDesktop(t *testing.T
 	if err != nil || !found || recordString(rec, "delivery_route") != "desktop_ipc" {
 		t.Fatalf("record=%#v found=%v err=%v", rec, found, err)
 	}
+	deadline := time.Now().Add(time.Second)
+	for srv.isSendInFlight("codex", "logical-app-server") && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if srv.isSendInFlight("codex", "logical-app-server") {
+		t.Fatal("native preview send did not finish")
+	}
 }
 
 func TestSendPromptRejectsUnknownNativeCodexSession(t *testing.T) {
@@ -860,6 +976,89 @@ func TestSessionsReadsStore(t *testing.T) {
 	}
 }
 
+func TestSessionRowsSortByLastReplyThenUpdatedAcrossOffsets(t *testing.T) {
+	rows := []map[string]any{
+		{
+			"native_session_id": "reply-older",
+			"last_reply_at":     "2026-07-03T10:00:00+08:00",
+			"updated_at":        "2026-07-03T23:00:00Z",
+		},
+		{
+			"native_session_id": "reply-newer",
+			"last_reply_at":     "2026-07-03T03:00:00Z",
+			"updated_at":        "2026-07-03T01:00:00Z",
+		},
+		{
+			"native_session_id": "updated-fallback",
+			"updated_at":        "2026-07-03T04:00:00Z",
+		},
+	}
+
+	sortSessionRowsNewest(rows)
+
+	got := []string{
+		stringAny(rows[0]["native_session_id"]),
+		stringAny(rows[1]["native_session_id"]),
+		stringAny(rows[2]["native_session_id"]),
+	}
+	want := []string{"updated-fallback", "reply-newer", "reply-older"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("session order=%v want=%v", got, want)
+		}
+	}
+}
+
+func TestSessionListEndpointsExposeDeviceTimeMetadata(t *testing.T) {
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &fakePushProvider{
+		id:    "codex",
+		state: "idle",
+		native: []map[string]any{{
+			"native_session_id": "thread-1",
+			"updated_at":        "2026-07-03T04:00:00Z",
+		}},
+	}
+	srv := NewServer(cfg, provider.Registry{"codex": fp}, state.New(filepath.Join(t.TempDir(), "data")))
+
+	for _, path := range []string{
+		"/native_sessions?provider_id=codex&sync=1",
+		"/live_sessions?provider_id=codex",
+	} {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, path, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("%s status=%d body=%s", path, rr.Code, rr.Body.String())
+		}
+		var body sessionListResponse
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if body.DeviceTime["device_id"] != "device-a" {
+			t.Fatalf("%s missing device identity: %#v", path, body.DeviceTime)
+		}
+		if _, ok := body.DeviceTime["utc_offset_minutes"].(float64); !ok {
+			t.Fatalf("%s missing numeric UTC offset: %#v", path, body.DeviceTime)
+		}
+		if observed := stringAny(body.DeviceTime["observed_at"]); observed == "" {
+			t.Fatalf("%s missing observation time: %#v", path, body.DeviceTime)
+		} else if _, err := time.Parse(time.RFC3339Nano, observed); err != nil {
+			t.Fatalf("%s bad observation time %q: %v", path, observed, err)
+		}
+	}
+}
+
+func TestLocalTimeZoneIDUsesNamedLocation(t *testing.T) {
+	location, err := time.LoadLocation("Asia/Kathmandu")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := localTimeZoneID(location); got != "Asia/Kathmandu" {
+		t.Fatalf("time zone=%q want Asia/Kathmandu", got)
+	}
+}
+
 func TestNativeSessionsReturnsStoredSnapshotWhileProviderRefreshBlocks(t *testing.T) {
 	dir := t.TempDir()
 	st := state.New(filepath.Join(dir, "data"))
@@ -925,6 +1124,210 @@ func TestNativeSessionsReturnsStoredSnapshotWhileProviderRefreshBlocks(t *testin
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("cache did not publish refreshed native sessions: %s", rr.Body.String())
+}
+
+func TestNativeSessionsFailedRefreshPreservesLastGoodSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &scriptedNativeProvider{
+		fakePushProvider: fakePushProvider{state: "idle"},
+		results: []nativeListResult{
+			{rows: []map[string]any{{
+				"native_session_id": "thread-old", "title": "last good",
+				"updated_at": "2026-07-03T10:00:00Z",
+			}}},
+			{rows: []map[string]any{{
+				"native_session_id": "thread-partial", "title": "partial result",
+			}}, err: errors.New("native discovery failed")},
+			{panicNow: true},
+			{rows: []map[string]any{{
+				"native_session_id": "thread-fresh", "title": "fresh result",
+				"updated_at": "2026-07-03T10:01:00Z",
+			}}},
+		},
+	}
+	srv := NewServer(cfg, provider.Registry{"codex": fp}, state.New(filepath.Join(dir, "data")))
+	h := srv.Handler()
+
+	type response struct {
+		Sessions     []map[string]any `json:"sessions"`
+		Generation   uint64           `json:"generation"`
+		RefreshedAt  string           `json:"refreshed_at"`
+		Refreshing   bool             `json:"refreshing"`
+		RefreshError string           `json:"refresh_error"`
+		Meta         map[string]any   `json:"meta"`
+	}
+	get := func(query string) response {
+		t.Helper()
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/native_sessions?provider_id=codex&"+query, nil))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+		}
+		var body response
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+
+	first := get("sync=1")
+	if first.Generation != 1 || first.RefreshedAt == "" || first.Refreshing || first.RefreshError != "" {
+		t.Fatalf("bad initial cache metadata: %#v", first)
+	}
+	if len(first.Sessions) != 1 || first.Sessions[0]["native_session_id"] != "thread-old" {
+		t.Fatalf("bad initial sessions: %#v", first.Sessions)
+	}
+	if first.Meta["generation"] != float64(1) || first.Meta["has_snapshot"] != true {
+		t.Fatalf("bad nested metadata: %#v", first.Meta)
+	}
+
+	failed := get("sync=1")
+	if failed.Generation != 1 || failed.RefreshedAt != first.RefreshedAt || failed.RefreshError != "native discovery failed" {
+		t.Fatalf("failed refresh advanced last-good metadata: %#v", failed)
+	}
+	if len(failed.Sessions) != 1 || failed.Sessions[0]["native_session_id"] != "thread-old" {
+		t.Fatalf("failed refresh replaced last-good sessions: %#v", failed.Sessions)
+	}
+
+	panicked := get("sync=1")
+	if panicked.Generation != 1 || panicked.RefreshedAt != first.RefreshedAt ||
+		panicked.RefreshError != "panic while listing native sessions" {
+		t.Fatalf("panic advanced last-good metadata: %#v", panicked)
+	}
+	if len(panicked.Sessions) != 1 || panicked.Sessions[0]["native_session_id"] != "thread-old" {
+		t.Fatalf("panic replaced last-good sessions: %#v", panicked.Sessions)
+	}
+
+	recovered := get("include_stale=0")
+	if recovered.Generation != 2 || recovered.RefreshError != "" {
+		t.Fatalf("successful recovery did not publish a new generation: %#v", recovered)
+	}
+	if len(recovered.Sessions) != 1 || recovered.Sessions[0]["native_session_id"] != "thread-fresh" {
+		t.Fatalf("successful recovery did not replace snapshot: %#v", recovered.Sessions)
+	}
+}
+
+func TestNativeSessionRefreshIntervalKeepsCodexFastPathScoped(t *testing.T) {
+	if got := nativeSessionRefreshInterval("codex"); got != 5*time.Second {
+		t.Fatalf("codex refresh interval=%s", got)
+	}
+	for _, providerID := range []string{"claude", "claude-proxy", "terminal-agent"} {
+		if got := nativeSessionRefreshInterval(providerID); got != 15*time.Second {
+			t.Fatalf("%s refresh interval=%s", providerID, got)
+		}
+	}
+}
+
+func TestNativeSessionsForceRefreshReturnsImmediatelyAndSingleFlights(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &refreshGateNativeProvider{
+		fakePushProvider: fakePushProvider{state: "idle"},
+		started:          make(chan struct{}, 1),
+		release:          make(chan struct{}),
+		initial: []map[string]any{{
+			"native_session_id": "thread-old", "title": "last good",
+			"updated_at": "2026-07-03T10:00:00Z",
+		}},
+		fresh: []map[string]any{{
+			"native_session_id": "thread-fresh", "title": "fresh result",
+			"updated_at": "2026-07-03T10:01:00Z",
+		}},
+	}
+	released := false
+	defer func() {
+		if !released {
+			close(fp.release)
+		}
+	}()
+	srv := NewServer(cfg, provider.Registry{"codex": fp}, state.New(filepath.Join(dir, "data")))
+	h := srv.Handler()
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/native_sessions?provider_id=codex&sync=1", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("initial status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	type asyncResponse struct {
+		code int
+		body []byte
+	}
+	responseCh := make(chan asyncResponse, 1)
+	go func() {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/native_sessions?provider_id=codex&refresh=1", nil))
+		responseCh <- asyncResponse{code: rec.Code, body: rec.Body.Bytes()}
+	}()
+	var refreshResponse asyncResponse
+	select {
+	case refreshResponse = <-responseCh:
+	case <-time.After(300 * time.Millisecond):
+		close(fp.release)
+		released = true
+		t.Fatal("refresh=1 blocked on provider discovery")
+	}
+	if refreshResponse.code != http.StatusOK {
+		t.Fatalf("refresh status=%d body=%s", refreshResponse.code, refreshResponse.body)
+	}
+	var refreshing struct {
+		Sessions   []map[string]any `json:"sessions"`
+		Generation uint64           `json:"generation"`
+		Refreshing bool             `json:"refreshing"`
+		Meta       map[string]any   `json:"meta"`
+	}
+	if err := json.Unmarshal(refreshResponse.body, &refreshing); err != nil {
+		t.Fatal(err)
+	}
+	if refreshing.Generation != 1 || !refreshing.Refreshing ||
+		len(refreshing.Sessions) != 1 || refreshing.Sessions[0]["native_session_id"] != "thread-old" {
+		t.Fatalf("refresh request did not immediately return last-good snapshot: %#v", refreshing)
+	}
+	if refreshing.Meta["generation"] != float64(1) || refreshing.Meta["refreshing"] != true {
+		t.Fatalf("bad refresh metadata: %#v", refreshing.Meta)
+	}
+	select {
+	case <-fp.started:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("forced refresh was not started")
+	}
+
+	rr = httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/native_sessions?provider_id=codex&refresh=1", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("second refresh status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if calls := fp.callCount(); calls != 2 {
+		t.Fatalf("concurrent force refreshes were not single-flight: calls=%d", calls)
+	}
+
+	close(fp.release)
+	released = true
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		rr = httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/native_sessions?provider_id=codex", nil))
+		var body struct {
+			Sessions   []map[string]any `json:"sessions"`
+			Generation uint64           `json:"generation"`
+			Refreshing bool             `json:"refreshing"`
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if !body.Refreshing && body.Generation == 2 &&
+			len(body.Sessions) == 1 && body.Sessions[0]["native_session_id"] == "thread-fresh" {
+			if calls := fp.callCount(); calls != 2 {
+				t.Fatalf("refresh completion started an extra discovery: calls=%d", calls)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("forced refresh did not publish fresh generation: %s", rr.Body.String())
 }
 
 func TestCreateAndCloseSession(t *testing.T) {
@@ -1099,15 +1502,15 @@ func TestLiveSessionsUseRuntimeSourceNotPersistedRunningState(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	var body map[string][]map[string]any
+	var body sessionListResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body["sessions"]) != 1 {
-		t.Fatalf("live sessions=%#v", body["sessions"])
+	if len(body.Sessions) != 1 {
+		t.Fatalf("live sessions=%#v", body.Sessions)
 	}
-	if body["sessions"][0]["session_id"] != "live-claude" || body["sessions"][0]["provider_id"] != "claude" {
-		t.Fatalf("bad live session: %#v", body["sessions"][0])
+	if body.Sessions[0]["session_id"] != "live-claude" || body.Sessions[0]["provider_id"] != "claude" {
+		t.Fatalf("bad live session: %#v", body.Sessions[0])
 	}
 }
 
@@ -1128,14 +1531,14 @@ func TestLiveSessionsPreserveRuntimeTranscriptWithoutRecord(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	var body map[string][]map[string]any
+	var body sessionListResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body["sessions"]) != 1 {
-		t.Fatalf("live sessions=%#v", body["sessions"])
+	if len(body.Sessions) != 1 {
+		t.Fatalf("live sessions=%#v", body.Sessions)
 	}
-	row := body["sessions"][0]
+	row := body.Sessions[0]
 	if row["transcript_id"] != "thread-1" || row["cwd"] != "/repo" || row["updated_at"] != "2026-06-24T10:00:00Z" {
 		t.Fatalf("runtime fields not preserved: %#v", row)
 	}
@@ -1161,12 +1564,12 @@ func TestLiveSessionsSkipsRuntimeRowsMarkedNotLiveByDefault(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	var body map[string][]map[string]any
+	var body sessionListResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body["sessions"]) != 0 {
-		t.Fatalf("runtime rows marked live=false should be hidden by default: %#v", body["sessions"])
+	if len(body.Sessions) != 0 {
+		t.Fatalf("runtime rows marked live=false should be hidden by default: %#v", body.Sessions)
 	}
 }
 
@@ -1193,14 +1596,14 @@ func TestLiveSessionsMapsRuntimeTranscriptToStoredLogicalSession(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	var body map[string][]map[string]any
+	var body sessionListResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body["sessions"]) != 1 {
-		t.Fatalf("live sessions=%#v", body["sessions"])
+	if len(body.Sessions) != 1 {
+		t.Fatalf("live sessions=%#v", body.Sessions)
 	}
-	row := body["sessions"][0]
+	row := body.Sessions[0]
 	if row["session_id"] != "logical-1" || row["transcript_id"] != "transcript-1" || row["title"] != "stored" || row["cwd"] != "/repo" {
 		t.Fatalf("runtime transcript not mapped to stored session: %#v", row)
 	}
@@ -1229,12 +1632,12 @@ func TestLiveSessionsSkipsInactiveNativeSessionsByDefault(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	var body map[string][]map[string]any
+	var body sessionListResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body["sessions"]) != 0 {
-		t.Fatalf("inactive native sessions should be hidden by default: %#v", body["sessions"])
+	if len(body.Sessions) != 0 {
+		t.Fatalf("inactive native sessions should be hidden by default: %#v", body.Sessions)
 	}
 }
 
@@ -1255,14 +1658,14 @@ func TestLiveSessionsIncludesInactiveNativeSessions(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	var body map[string][]map[string]any
+	var body sessionListResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body["sessions"]) != 1 {
-		t.Fatalf("sessions=%#v", body["sessions"])
+	if len(body.Sessions) != 1 {
+		t.Fatalf("sessions=%#v", body.Sessions)
 	}
-	row := body["sessions"][0]
+	row := body.Sessions[0]
 	if row["transcript_id"] != "thread-1" || row["title"] != "inactive" || row["live"] != false || row["status"] != "notLoaded" {
 		t.Fatalf("bad inactive native row: %#v", row)
 	}
@@ -1301,12 +1704,12 @@ func TestLiveSessionsUsesStoredSnapshotWhenNativeRefreshBlocks(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	var body map[string][]map[string]any
+	var body sessionListResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body["sessions"]) != 1 || body["sessions"][0]["title"] != "stored inactive" {
-		t.Fatalf("did not use stored snapshot: %#v", body["sessions"])
+	if len(body.Sessions) != 1 || body.Sessions[0]["title"] != "stored inactive" {
+		t.Fatalf("did not use stored snapshot: %#v", body.Sessions)
 	}
 }
 
@@ -1320,11 +1723,12 @@ func TestLiveSessionsIncludeInactivePromotesDuplicateLiveNative(t *testing.T) {
 		live: []map[string]any{{
 			"session_id": "thread-1", "provider_id": "codex", "native_session_id": "thread-1",
 			"transcript_id": "thread-1", "title": "runtime idle", "live": false,
-			"updated_at": "2026-06-24T09:00:00Z",
+			"updated_at": "2026-06-24T09:00:00Z", "last_reply_at": "2026-06-24T08:00:00Z",
 		}},
 		native: []map[string]any{{
 			"cli_session_id": "thread-1", "native_session_id": "thread-1", "title": "native live",
-			"cwd": "/repo", "updated_at": "2026-06-24T10:00:00Z", "status": "active", "live": true,
+			"cwd": "/repo", "updated_at": "2026-06-24T10:00:00Z", "last_reply_at": "2026-06-24T11:00:00Z",
+			"status": "active", "live": true,
 		}},
 	}
 	srv := NewServer(cfg, provider.Registry{"codex": fp}, st)
@@ -1335,15 +1739,16 @@ func TestLiveSessionsIncludeInactivePromotesDuplicateLiveNative(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
-	var body map[string][]map[string]any
+	var body sessionListResponse
 	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
 		t.Fatal(err)
 	}
-	if len(body["sessions"]) != 1 {
-		t.Fatalf("sessions=%#v", body["sessions"])
+	if len(body.Sessions) != 1 {
+		t.Fatalf("sessions=%#v", body.Sessions)
 	}
-	row := body["sessions"][0]
-	if row["live"] != true || row["status"] != "active" || row["state"] != "running" || row["updated_at"] != "2026-06-24T10:00:00Z" {
+	row := body.Sessions[0]
+	if row["live"] != true || row["status"] != "active" || row["state"] != "running" ||
+		row["updated_at"] != "2026-06-24T10:00:00Z" || row["last_reply_at"] != "2026-06-24T11:00:00Z" {
 		t.Fatalf("duplicate live native row should promote inactive runtime row: %#v", row)
 	}
 }
@@ -1382,7 +1787,7 @@ func (f *fakeControlProvider) BindTranscript(sessionID string, transcriptID stri
 
 func (f *fakeControlProvider) RelayApprovalRequest(sessionID string, requestID string, decision string) map[string]any {
 	f.sessionID, f.requestID, f.decision = sessionID, requestID, decision
-	return map[string]any{"ok": true, "detail": "relayed"}
+	return map[string]any{"ok": true, "status": "responding", "confirmed": false, "detail": "written"}
 }
 
 func (f *fakeControlProvider) AnswerQuestion(sessionID string, requestID string, answers map[string]string) map[string]any {
@@ -1417,6 +1822,13 @@ func TestRequestScopedApprovalWithoutTask(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK || fp.sessionID != "session-1" || fp.requestID != "request-1" || fp.decision != "allow" {
 		t.Fatalf("status=%d body=%s provider=%#v", rr.Code, rr.Body.String(), fp)
+	}
+	var approvalResponse map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &approvalResponse); err != nil {
+		t.Fatal(err)
+	}
+	if approvalResponse["status"] != "responding" || truthy(approvalResponse["confirmed"], false) {
+		t.Fatalf("approval source-confirmation state was lost: %#v", approvalResponse)
 	}
 
 	rr = httptest.NewRecorder()
@@ -1711,7 +2123,10 @@ func TestProvidersHideUninstalled(t *testing.T) {
 	if body["active_provider"] != "claude" {
 		t.Fatalf("active_provider must fall back to an installed provider: %v", body["active_provider"])
 	}
-
+	row := rows[0].(map[string]any)
+	if actions, ok := row["actions"].([]any); !ok || len(actions) == 0 {
+		t.Fatalf("typed provider actions missing: %#v", row)
+	}
 	body = fetch("/providers?include_uninstalled=1")
 	if rows := body["providers"].([]any); len(rows) != 2 {
 		t.Fatalf("include_uninstalled must list everything: %#v", rows)

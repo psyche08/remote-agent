@@ -25,16 +25,20 @@ var codexThreadIDRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[
 // ("app_server") or a Desktop-owned turn mirrored over the Desktop IPC
 // bridge ("desktop_ipc").
 type codexPendingApproval struct {
-	RequestID  any
-	Key        string
-	Method     string
-	Params     map[string]any
-	ThreadID   string
-	TurnID     string
-	ItemID     string
-	ApprovalID string
-	Source     string
-	CreatedAt  time.Time
+	RequestID            any
+	Key                  string
+	RouteKey             string
+	Method               string
+	Params               map[string]any
+	ThreadID             string
+	TurnID               string
+	ItemID               string
+	ApprovalID           string
+	Source               string
+	CreatedAt            time.Time
+	Instance             string
+	ConnectionGeneration uint64
+	Responding           bool
 }
 
 const (
@@ -59,6 +63,13 @@ type Codex struct {
 	desktopIPCHostID     string
 	client               codexAppClient
 	clientMu             sync.Mutex
+	connectMu            sync.Mutex
+	clientGeneration     uint64
+	clientSequence       uint64
+	threadListMu         sync.Mutex
+	threadListLegacy     bool
+	discoveryMu          sync.Mutex
+	discovery            *codexDiscoveryCatalog
 	sessMu               sync.Mutex
 	threads              map[string]string
 	sessionStartOptions  map[string]map[string]any
@@ -75,9 +86,10 @@ type Codex struct {
 	streamPublisher      func(target string, frame map[string]any)
 	runtimeMu            sync.Mutex
 	activeThreads        map[string]time.Time
+	appServerThreads     map[string]bool
+	interruptingThreads  map[string]string
 	pendingTools         map[string]map[string]map[string]any
 	turnThreads          map[string]string
-	lastThreadID         string
 	planType             string
 	lastState            string
 	lastError            string
@@ -109,6 +121,8 @@ func NewCodex(id string, cfg config.ProviderConfig) *Codex {
 		desktopOwnerClients:  map[string]string{},
 		approvalsByThread:    map[string][]*codexPendingApproval{},
 		activeThreads:        map[string]time.Time{},
+		appServerThreads:     map[string]bool{},
+		interruptingThreads:  map[string]string{},
 		pendingTools:         map[string]map[string]map[string]any{},
 		turnThreads:          map[string]string{},
 		desktopRefreshAt:     map[string]time.Time{},
@@ -148,7 +162,7 @@ func (c *Codex) Status() Status {
 			"streaming": true, "steer": true, "interrupt": true, "rewind_user_message": true, "create_session": true,
 		},
 		Backend: "codex_app_server_go",
-		Command: c.command,
+		Command: firstNonEmpty(cli, c.command),
 		Cwd:     c.cwd,
 		Account: c.accountBlock(),
 	}
@@ -170,14 +184,17 @@ func (c *Codex) ModelSelect() ModelSelect {
 }
 
 func (c *Codex) ListNativeSessions() []map[string]any {
-	localRows := codexSessions(stringExtra(c.cfg.Extra, "codex_session_index", ""), stringSliceExtra(c.cfg.Extra, "codex_sessions_dirs", nil), nativeSessionListLimit)
+	var primary []map[string]any
 	if client, err := c.ensureClient(); err == nil {
-		if res, err := client.ThreadList(10*time.Second, nil); err == nil {
-			rows := mergeCodexNativeSessions(codexThreadListToSessions(res), localRows, nativeSessionListLimit)
-			c.mergeRuntimeStatus(rows)
-			c.enrichThreadListReplyTimes(rows)
-			return rows
+		if res, err := c.listCodexThreads(client); err == nil {
+			primary = codexThreadListToSessions(res)
 		}
+	}
+	localRows := c.localCodexSessions()
+	if primary != nil {
+		rows := mergeCodexNativeSessions(primary, localRows, nativeSessionListLimit)
+		c.mergeRuntimeStatus(rows)
+		return rows
 	}
 	return localRows
 }
@@ -217,8 +234,28 @@ func mergeCodexNativeSessions(primary, local []map[string]any, limit int) []map[
 		add(row, true)
 	}
 	sortByUpdated(out)
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
+	return limitCodexSessionsByVisibility(out, limit)
+}
+
+func limitCodexSessionsByVisibility(rows []map[string]any, visibleLimit int) []map[string]any {
+	if visibleLimit <= 0 {
+		return rows
+	}
+	out := make([]map[string]any, 0, len(rows))
+	visible := 0
+	for _, row := range rows {
+		if boolAny(row[hiddenFromSessionListsKey]) || boolAny(row["subagent"]) {
+			// Hidden child threads stay in the provider's internal catalog so
+			// exact-ID preview/resume/control remains possible, but they must
+			// never consume the user-facing session budget.
+			out = append(out, row)
+			continue
+		}
+		if visible >= visibleLimit {
+			continue
+		}
+		out = append(out, row)
+		visible++
 	}
 	return out
 }
@@ -242,26 +279,6 @@ func newerCodexTimestamp(left, right string) string {
 		return right
 	}
 	return left
-}
-
-func (c *Codex) enrichThreadListReplyTimes(rows []map[string]any) {
-	paths := codexRolloutPaths(stringSliceExtra(c.cfg.Extra, "codex_sessions_dirs", nil))
-	if len(paths) == 0 {
-		return
-	}
-	for _, row := range rows {
-		if stringAny(row["last_reply_at"]) != "" {
-			continue
-		}
-		tid := firstNonEmpty(stringAny(row["cli_session_id"]), stringAny(row["native_session_id"]))
-		if tid == "" {
-			continue
-		}
-		if ts := codexRolloutLastReplyAt(paths[tid]); ts != "" {
-			row["last_reply_at"] = ts
-		}
-	}
-	sortByUpdated(rows)
 }
 
 func (c *Codex) SessionMessages(sessionID string) ([]map[string]any, error) {
@@ -400,6 +417,7 @@ func (c *Codex) OpenOrCreateSession(sessionID string, opts StartOptions) (string
 		return "", err
 	}
 	c.bindThread(sessionID, tid)
+	c.markAppServerThread(tid)
 	c.setStartOptions(sessionID, startOpts)
 	c.setLastError("")
 	c.setLastState("idle")
@@ -514,9 +532,11 @@ func (c *Codex) RewindUserMessage(opts RewindUserMessageOptions) (RewindUserMess
 	if turnID != "" {
 		client.SetThreadTurn(opts.ThreadID, turnID)
 	}
-	c.setThreadActive(opts.ThreadID, true)
-	c.setLastError("")
-	c.setLastState("running")
+	if route != "Codex app-server" {
+		c.setThreadActive(opts.ThreadID, true)
+		c.setLastError("")
+		c.setLastState("running")
+	}
 	return RewindUserMessageResult{
 		SessionID:    opts.SessionID,
 		ThreadID:     opts.ThreadID,
@@ -551,6 +571,7 @@ func (c *Codex) BindTranscript(sessionID string, transcriptID string) {
 // app-server threads use the same UUID format and must remain on app-server.
 func (c *Codex) BindDesktopTranscript(sessionID string, transcriptID string) {
 	c.BindTranscript(sessionID, transcriptID)
+	c.markDesktopOwnedThread(transcriptID)
 	c.markDesktopSyncCandidate(sessionID, transcriptID)
 }
 
@@ -586,9 +607,11 @@ func (c *Codex) SendPromptWithAttachments(sessionID string, prompt string, attac
 				client.SetThreadTurn(tid, turnID)
 			}
 		}
-		c.setThreadActive(tid, true)
-		c.setLastError("")
-		c.setLastState("running")
+		if route != "Codex app-server" {
+			c.setThreadActive(tid, true)
+			c.setLastError("")
+			c.setLastState("running")
+		}
 		return SendResult{OK: true, State: "running", Message: "turn started via " + route, NativeTaskID: tid}
 	}
 }
@@ -645,10 +668,15 @@ func (c *Codex) RelayApprovalRequest(sessionID string, requestID string, decisio
 		return c.RelayApproval(sessionID, decision)
 	}
 	_, pending := c.pendingApprovalsForSession(sessionID)
-	for _, req := range pending {
-		if req.Key == requestID {
-			return c.relayApprovalDecision(sessionID, req, decision)
+	match, ambiguous := codexPendingByDisplayID(pending, requestID)
+	if ambiguous {
+		return map[string]any{
+			"ok": false, "status": "ambiguous", "request_id": requestID,
+			"detail": "multiple typed Codex requests share this display id; refresh before responding",
 		}
+	}
+	if match != nil {
+		return c.relayApprovalDecision(sessionID, match, decision)
 	}
 	return map[string]any{"ok": false, "status": "stale", "request_id": requestID,
 		"detail": "approval request not found (already resolved elsewhere?)"}
@@ -672,23 +700,79 @@ func (c *Codex) relayApprovalDecision(sessionID string, req *codexPendingApprova
 		return map[string]any{"ok": false, "detail": err.Error(), "request_id": req.Key}
 	}
 	c.settleAfterApproval(sessionID)
-	return map[string]any{"ok": true, "status": "relayed", "decision": decision, "method": req.Method, "request_id": req.Key}
+	status := "relayed"
+	confirmed := true
+	if req.Source == codexApprovalSourceAppServer {
+		// A successful stdin write is only transport acceptance. Keep the
+		// immutable request route until serverRequest/resolved or turn terminal.
+		status = "responding"
+		confirmed = false
+	}
+	return map[string]any{
+		"ok": true, "status": status, "confirmed": confirmed,
+		"decision": decision, "method": req.Method, "request_id": req.Key,
+	}
 }
 
 func (c *Codex) relayAppServerApproval(req *codexPendingApproval, decision string) error {
-	client, err := c.ensureClient()
-	if err != nil {
-		return err
-	}
 	body, err := codexApprovalResponseBody(req.Method, decision == "allow", req.Params)
 	if err != nil {
 		return err
 	}
-	if err := client.Respond(req.RequestID, body); err != nil {
+	return c.relayAppServerResponse(req, body)
+}
+
+func (c *Codex) relayAppServerResponse(req *codexPendingApproval, body map[string]any) error {
+	client, err := c.beginAppServerResponse(req)
+	if err != nil {
 		return err
 	}
-	c.removeAppServerApproval(req.ThreadID, req.Key)
+	if err := client.Respond(req.RequestID, body); err != nil {
+		c.rollbackAppServerResponse(req)
+		return err
+	}
+	c.publishApprovalChanged(req.ThreadID)
 	return nil
+}
+
+func (c *Codex) beginAppServerResponse(req *codexPendingApproval) (codexAppClient, error) {
+	if req == nil || req.Source != codexApprovalSourceAppServer {
+		return nil, errors.New("invalid Codex app-server request route")
+	}
+	if c.threadInterrupting(req.ThreadID) {
+		return nil, errors.New("Codex turn cancellation is already requested")
+	}
+	client, generation := c.currentClientRoute()
+	if client == nil || generation == 0 || req.ConnectionGeneration != generation {
+		return nil, errors.New("Codex approval belongs to a stale app-server connection")
+	}
+	c.approvalMu.Lock()
+	defer c.approvalMu.Unlock()
+	for _, candidate := range c.approvalsByThread[req.ThreadID] {
+		if candidate.Instance != req.Instance || candidate.RouteKey != req.RouteKey {
+			continue
+		}
+		if candidate.Responding {
+			return nil, errors.New("Codex approval response is already awaiting source confirmation")
+		}
+		candidate.Responding = true
+		return client, nil
+	}
+	return nil, errors.New("Codex approval request is no longer pending")
+}
+
+func (c *Codex) rollbackAppServerResponse(req *codexPendingApproval) {
+	if req == nil {
+		return
+	}
+	c.approvalMu.Lock()
+	defer c.approvalMu.Unlock()
+	for _, candidate := range c.approvalsByThread[req.ThreadID] {
+		if candidate.Instance == req.Instance && candidate.RouteKey == req.RouteKey {
+			candidate.Responding = false
+			return
+		}
+	}
 }
 
 func (c *Codex) relayDesktopApproval(req *codexPendingApproval, decision string) error {
@@ -750,11 +834,11 @@ func (c *Codex) settleAfterApproval(sessionID string) {
 // text, or zero-based index.
 func (c *Codex) AnswerQuestion(sessionID string, requestID string, answers map[string]string) map[string]any {
 	_, pending := c.pendingApprovalsForSession(sessionID)
-	var req *codexPendingApproval
-	for _, cand := range pending {
-		if cand.Key == requestID {
-			req = cand
-			break
+	req, ambiguous := codexPendingByDisplayID(pending, requestID)
+	if ambiguous {
+		return map[string]any{
+			"ok": false, "status": "ambiguous", "request_id": requestID,
+			"detail": "multiple typed Codex requests share this display id; refresh before responding",
 		}
 	}
 	if req == nil {
@@ -782,17 +866,18 @@ func (c *Codex) AnswerQuestion(sessionID string, requestID string, answers map[s
 			return map[string]any{"ok": false, "detail": err.Error(), "request_id": requestID}
 		}
 	} else {
-		client, err := c.ensureClient()
-		if err != nil {
-			return map[string]any{"ok": false, "detail": err.Error()}
-		}
-		if err := client.Respond(req.RequestID, body); err != nil {
+		if err := c.relayAppServerResponse(req, body); err != nil {
 			return map[string]any{"ok": false, "detail": err.Error(), "request_id": requestID}
 		}
-		c.removeAppServerApproval(req.ThreadID, req.Key)
 	}
 	c.settleAfterApproval(sessionID)
-	return map[string]any{"ok": true, "status": "relayed", "request_id": requestID}
+	status := "relayed"
+	confirmed := true
+	if req.Source == codexApprovalSourceAppServer {
+		status = "responding"
+		confirmed = false
+	}
+	return map[string]any{"ok": true, "status": status, "confirmed": confirmed, "request_id": requestID}
 }
 
 // ApprovalRequest describes the oldest pending approval for the session; the
@@ -817,29 +902,70 @@ func (c *Codex) Interrupt(sessionID string) map[string]any {
 	if err != nil {
 		return map[string]any{"ok": false, "detail": err.Error()}
 	}
+	if c.threadInterrupting(tid) {
+		return map[string]any{
+			"ok": true, "status": "cancellation_requested", "confirmed": false,
+			"detail": "turn cancellation is already pending authoritative Codex completion",
+		}
+	}
+	// Register cancellation before issuing the RPC. turn/completed can race
+	// ahead of the RPC response; a terminal notification must be able to retire
+	// this marker and must never be overwritten by a later transport ACK.
+	c.markThreadInterrupting(tid, "")
 	route := "Codex app-server"
-	if c.shouldTryDesktopSync(sessionID, tid) && c.ensureDesktopOwnerClient(tid) != "" {
+	if c.shouldTryDesktopSync(sessionID, tid) {
+		if c.ensureDesktopOwnerClient(tid) == "" {
+			if err = c.attachDesktopOwner(tid); err != nil {
+				c.rollbackThreadInterrupting(tid)
+				return map[string]any{"ok": false, "detail": err.Error()}
+			}
+		}
 		err = c.tryDesktopInterruptTurn(sessionID, tid)
 		if err == nil {
 			route = "Codex Desktop"
-		} else if !isNoDesktopOwnerClient(err) {
+		} else if isNoDesktopOwnerClient(err) {
+			// no-client-found proves the previous targeted request was not
+			// delivered. Reopen the Desktop thread and retry once on its
+			// newly registered owner; never cross the ownership boundary by
+			// falling back to app-server.
+			if err = c.attachDesktopOwner(tid); err == nil {
+				err = c.tryDesktopInterruptTurn(sessionID, tid)
+			}
+			if err == nil {
+				route = "Codex Desktop"
+			}
+		}
+		if err != nil {
+			c.rollbackThreadInterrupting(tid)
 			return map[string]any{"ok": false, "detail": err.Error()}
 		}
 	}
 	if route == "Codex app-server" {
 		client, clientErr := c.ensureClient()
 		if clientErr != nil {
+			c.rollbackThreadInterrupting(tid)
 			return map[string]any{"ok": false, "detail": clientErr.Error()}
 		}
 		if _, err = client.TurnInterrupt(tid, nil); err != nil {
+			c.rollbackThreadInterrupting(tid)
 			return map[string]any{"ok": false, "detail": err.Error()}
 		}
 	}
-	c.setThreadActive(tid, false)
-	// An interrupted turn abandons its approval callbacks.
-	c.clearAppServerApprovalsForThread(tid)
-	c.setLastState("idle")
-	return map[string]any{"ok": true, "detail": "turn interrupted via " + route}
+	// turn/interrupt and Desktop IPC responses only acknowledge delivery of the
+	// cancellation request. Keep the thread live until the owning Codex
+	// runtime publishes its authoritative terminal state.
+	c.publishApprovalChanged(tid)
+	if !c.threadInterrupting(tid) {
+		return map[string]any{
+			"ok": true, "status": "completed", "confirmed": true,
+			"detail": "Codex reached an authoritative terminal state while cancellation was acknowledged",
+		}
+	}
+	c.setLastState("running")
+	return map[string]any{
+		"ok": true, "status": "cancellation_requested", "confirmed": false,
+		"detail": "turn cancellation requested via " + route + "; waiting for Codex completion",
+	}
 }
 
 func (c *Codex) Steer(sessionID string, prompt string) map[string]any {
@@ -851,11 +977,27 @@ func (c *Codex) Steer(sessionID string, prompt string) map[string]any {
 		return map[string]any{"ok": false, "detail": err.Error()}
 	}
 	route := "Codex app-server"
-	if c.shouldTryDesktopSync(sessionID, tid) && c.ensureDesktopOwnerClient(tid) != "" {
+	if c.shouldTryDesktopSync(sessionID, tid) {
+		if c.ensureDesktopOwnerClient(tid) == "" {
+			if err = c.attachDesktopOwner(tid); err != nil {
+				return map[string]any{"ok": false, "detail": err.Error()}
+			}
+		}
 		err = c.tryDesktopSteerTurn(sessionID, tid, prompt)
 		if err == nil {
 			route = "Codex Desktop"
-		} else if !isNoDesktopOwnerClient(err) {
+		} else if isNoDesktopOwnerClient(err) {
+			// As with start/interrupt, a Desktop-bound session remains on
+			// its persisted delivery route even while the renderer is
+			// reattaching.
+			if err = c.attachDesktopOwner(tid); err == nil {
+				err = c.tryDesktopSteerTurn(sessionID, tid, prompt)
+			}
+			if err == nil {
+				route = "Codex Desktop"
+			}
+		}
+		if err != nil {
 			return map[string]any{"ok": false, "detail": err.Error()}
 		}
 	}
@@ -1025,11 +1167,18 @@ func (c *Codex) RuntimeSessions() []map[string]any {
 }
 
 func (c *Codex) PendingApprovalSessionIDs() []string {
+	interrupting := c.interruptingThreadSet()
 	c.approvalMu.Lock()
 	ids := make([]string, 0, len(c.approvalsByThread))
 	for threadID, pending := range c.approvalsByThread {
-		if threadID != "" && len(pending) > 0 {
-			ids = append(ids, threadID)
+		if threadID == "" || interrupting[threadID] {
+			continue
+		}
+		for _, req := range pending {
+			if !req.Responding {
+				ids = append(ids, threadID)
+				break
+			}
 		}
 	}
 	c.approvalMu.Unlock()
@@ -1099,6 +1248,167 @@ func (c *Codex) clearDesktopOwnerClient(threadID string) {
 	delete(c.desktopOwnerClients, threadID)
 }
 
+func (c *Codex) isCurrentClientGeneration(generation uint64) bool {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+	return generation != 0 && c.client != nil && c.clientGeneration == generation
+}
+
+func (c *Codex) currentClientRoute() (codexAppClient, uint64) {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+	return c.client, c.clientGeneration
+}
+
+func (c *Codex) clientForGeneration(generation uint64) codexAppClient {
+	c.clientMu.Lock()
+	defer c.clientMu.Unlock()
+	if c.client == nil || generation == 0 || c.clientGeneration != generation {
+		return nil
+	}
+	return c.client
+}
+
+func (c *Codex) activateAppServerTurn(client codexAppClient, generation uint64, threadID string, turnID string) bool {
+	if client == nil || generation == 0 || threadID == "" {
+		return false
+	}
+	// Keep route activation atomic with respect to the exit callback. Once
+	// clientMu is released, a later child exit will clear this exact active
+	// route; an earlier exit makes the activation fail.
+	c.clientMu.Lock()
+	if c.client != client || c.clientGeneration != generation {
+		c.clientMu.Unlock()
+		return false
+	}
+	c.runtimeMu.Lock()
+	c.appServerThreads[threadID] = true
+	c.activeThreads[threadID] = time.Now()
+	if turnID != "" {
+		c.turnThreads[turnID] = threadID
+	}
+	c.runtimeMu.Unlock()
+	c.sessMu.Lock()
+	c.lastError = ""
+	c.lastState = "running"
+	c.lastChange = time.Now()
+	c.sessMu.Unlock()
+	c.clientMu.Unlock()
+	return true
+}
+
+func (c *Codex) markAppServerThread(threadID string) {
+	if threadID == "" {
+		return
+	}
+	c.runtimeMu.Lock()
+	c.appServerThreads[threadID] = true
+	c.runtimeMu.Unlock()
+}
+
+func (c *Codex) markDesktopOwnedThread(threadID string) {
+	if threadID == "" {
+		return
+	}
+	c.runtimeMu.Lock()
+	delete(c.appServerThreads, threadID)
+	c.runtimeMu.Unlock()
+}
+
+func (c *Codex) markThreadInterrupting(threadID string, turnID string) {
+	if threadID == "" {
+		return
+	}
+	c.runtimeMu.Lock()
+	c.interruptingThreads[threadID] = turnID
+	c.runtimeMu.Unlock()
+}
+
+func (c *Codex) rollbackThreadInterrupting(threadID string) {
+	if threadID == "" {
+		return
+	}
+	c.runtimeMu.Lock()
+	delete(c.interruptingThreads, threadID)
+	c.runtimeMu.Unlock()
+	c.publishApprovalChanged(threadID)
+}
+
+func (c *Codex) threadInterrupting(threadID string) bool {
+	if threadID == "" {
+		return false
+	}
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	_, ok := c.interruptingThreads[threadID]
+	return ok
+}
+
+func (c *Codex) interruptingThreadSet() map[string]bool {
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	out := make(map[string]bool, len(c.interruptingThreads))
+	for threadID := range c.interruptingThreads {
+		out[threadID] = true
+	}
+	return out
+}
+
+func (c *Codex) finishThreadRoute(threadID string, turnID string) {
+	if threadID == "" && turnID == "" {
+		return
+	}
+	c.runtimeMu.Lock()
+	if threadID == "" && turnID != "" {
+		threadID = c.turnThreads[turnID]
+	}
+	if threadID != "" {
+		delete(c.interruptingThreads, threadID)
+	}
+	if turnID != "" {
+		delete(c.turnThreads, turnID)
+	} else if threadID != "" {
+		for candidate, owner := range c.turnThreads {
+			if owner == threadID {
+				delete(c.turnThreads, candidate)
+			}
+		}
+	}
+	c.runtimeMu.Unlock()
+	if threadID != "" {
+		c.sessMu.Lock()
+		delete(c.pendingTools, threadID)
+		c.sessMu.Unlock()
+	}
+}
+
+func (c *Codex) clearAppServerRuntime() []string {
+	c.runtimeMu.Lock()
+	affected := []string{}
+	owned := []string{}
+	for threadID := range c.appServerThreads {
+		owned = append(owned, threadID)
+		if _, ok := c.activeThreads[threadID]; ok {
+			affected = append(affected, threadID)
+		}
+		delete(c.activeThreads, threadID)
+		delete(c.interruptingThreads, threadID)
+	}
+	for turnID, threadID := range c.turnThreads {
+		if c.appServerThreads[threadID] {
+			delete(c.turnThreads, turnID)
+		}
+	}
+	c.runtimeMu.Unlock()
+	c.sessMu.Lock()
+	for _, threadID := range owned {
+		delete(c.pendingTools, threadID)
+	}
+	c.sessMu.Unlock()
+	sort.Strings(affected)
+	return affected
+}
+
 func (c *Codex) setThreadActive(threadID string, active bool) {
 	if threadID == "" {
 		return
@@ -1130,6 +1440,20 @@ func (c *Codex) threadActive(threadID string) bool {
 	return true
 }
 
+func (c *Codex) hasActiveThread() bool {
+	now := time.Now()
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
+	for threadID, at := range c.activeThreads {
+		if codexActiveExpired(now, at) {
+			delete(c.activeThreads, threadID)
+			continue
+		}
+		return true
+	}
+	return false
+}
+
 func (c *Codex) mergeRuntimeStatus(rows []map[string]any) {
 	for _, row := range rows {
 		tid := firstNonEmpty(stringAny(row["cli_session_id"]), stringAny(row["native_session_id"]))
@@ -1154,10 +1478,22 @@ func codexActiveExpired(now time.Time, at time.Time) bool {
 	return !at.IsZero() && now.Sub(at) > 48*time.Hour
 }
 
+type codexAppClientLifecycle interface {
+	Done() <-chan struct{}
+	ExitError() error
+}
+
+type codexAppClientExitHandler interface {
+	SetExitHandler(func(error))
+}
+
 func (c *Codex) Shutdown() {
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
 	c.clientMu.Lock()
 	client := c.client
 	c.client = nil
+	c.clientGeneration = 0
 	c.clientMu.Unlock()
 	if client != nil {
 		_ = client.Close()
@@ -1175,31 +1511,132 @@ func (c *Codex) Shutdown() {
 }
 
 func (c *Codex) ensureClient() (codexAppClient, error) {
-	c.clientMu.Lock()
-	defer c.clientMu.Unlock()
-	if c.client != nil {
-		return c.client, nil
-	}
-	var client codexAppClient
-	if c.clientFactory != nil {
-		client = c.clientFactory(c.onNotification, c.onServerRequest)
-	} else {
-		bin := c.resolveCommand()
-		if bin == "" {
-			return nil, CodexAppServerError{"codex binary not found in Codex.app or PATH: " + c.command}
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+
+	for {
+		c.clientMu.Lock()
+		if c.client != nil {
+			if lifecycle, ok := c.client.(codexAppClientLifecycle); ok {
+				select {
+				case <-lifecycle.Done():
+					lost := c.client
+					generation := c.clientGeneration
+					err := lifecycle.ExitError()
+					c.client = nil
+					c.clientGeneration = 0
+					c.clientMu.Unlock()
+					// connectMu prevents a replacement generation from being
+					// installed until all state owned by this generation is
+					// cleared.
+					c.handleAppServerLoss(generation, lost, err)
+					continue
+				default:
+				}
+			}
+			client := c.client
+			c.clientMu.Unlock()
+			return client, nil
 		}
-		client = NewCodexAppServerClient([]string{bin, "app-server"}, c.cwd, c.onNotification, c.onServerRequest)
+		c.clientSequence++
+		generation := c.clientSequence
+		c.clientMu.Unlock()
+
+		var client codexAppClient
+		onNotification := func(method string, params map[string]any) {
+			c.onNotificationFromClient(generation, method, params)
+		}
+		onServerRequest := func(requestID any, method string, params map[string]any) {
+			c.onServerRequestFromClient(generation, requestID, method, params)
+		}
+		if c.clientFactory != nil {
+			client = c.clientFactory(onNotification, onServerRequest)
+		} else {
+			bin := c.resolveCommand()
+			if bin == "" {
+				return nil, CodexAppServerError{"codex binary not found in ChatGPT.app, Codex.app, or PATH: " + c.command}
+			}
+			client = NewCodexAppServerClient([]string{bin, "app-server"}, c.cwd, onNotification, onServerRequest)
+		}
+		if lifecycle, ok := client.(codexAppClientExitHandler); ok {
+			lifecycle.SetExitHandler(func(err error) {
+				// Exit handlers may be invoked synchronously by a client while
+				// the connection single-flight is still installing it.
+				go c.onAppServerExit(generation, client, err)
+			})
+		}
+		if err := client.Start(); err != nil {
+			return nil, err
+		}
+
+		// Publish the generation before initialize so handshake notifications
+		// can be handled. clientMu must not be held across Initialize: the read
+		// loop invokes callbacks synchronously and would otherwise deadlock
+		// before it could deliver the initialize response.
+		c.clientMu.Lock()
+		c.client = client
+		c.clientGeneration = generation
+		c.clientMu.Unlock()
+
+		if err := client.Initialize("remote-agent"); err != nil {
+			c.clientMu.Lock()
+			detached := c.client == client && c.clientGeneration == generation
+			if detached {
+				c.client = nil
+				c.clientGeneration = 0
+			}
+			c.clientMu.Unlock()
+			_ = client.Close()
+			if detached {
+				c.handleAppServerLoss(generation, client, err)
+			}
+			return nil, err
+		}
+
+		c.setLastError("")
+		if c.getLastState() == "error" {
+			if c.hasActiveThread() {
+				c.setLastState("running")
+			} else {
+				c.setLastState("idle")
+			}
+		}
+		go c.seedAccount(client)
+		return client, nil
 	}
-	if err := client.Start(); err != nil {
-		return nil, err
+}
+
+func (c *Codex) onAppServerExit(generation uint64, client codexAppClient, err error) {
+	c.connectMu.Lock()
+	defer c.connectMu.Unlock()
+	c.clientMu.Lock()
+	if c.client != client || c.clientGeneration != generation {
+		c.clientMu.Unlock()
+		return
 	}
-	if err := client.Initialize("remote-agent"); err != nil {
-		_ = client.Close()
-		return nil, err
+	c.client = nil
+	c.clientGeneration = 0
+	c.clientMu.Unlock()
+	c.handleAppServerLoss(generation, client, err)
+}
+
+func (c *Codex) handleAppServerLoss(generation uint64, client codexAppClient, err error) {
+	affected := c.clearAppServerRuntime()
+	approvalThreads := c.appServerApprovalThreadIDs()
+	c.clearAllAppServerApprovals()
+	for _, threadID := range approvalThreads {
+		c.publishApprovalChanged(threadID)
 	}
-	c.client = client
-	go c.seedAccount(client)
-	return client, nil
+	if err == nil {
+		err = CodexAppServerError{"codex app-server exited"}
+	}
+	c.setLastError("codex app-server connection lost: " + err.Error())
+	c.setLastState("error")
+	for _, threadID := range affected {
+		if !stringIn(approvalThreads, threadID) {
+			c.publishApprovalChanged(threadID)
+		}
+	}
 }
 
 func (c *Codex) seedAccount(client codexAppClient) {
@@ -1236,7 +1673,18 @@ func (c *Codex) resumeThread(client codexAppClient, sessionID string, threadID s
 	if err != nil {
 		return "", err
 	}
-	tid := firstNonEmpty(stringAny(mapAny(mapAny(res)["thread"])["id"]), threadID)
+	thread := mapAny(mapAny(res)["thread"])
+	tid := stringAny(thread["id"])
+	if tid == "" {
+		return "", errors.New("thread/resume returned no thread id")
+	}
+	if tid != threadID {
+		return "", fmt.Errorf("thread/resume route mismatch: requested %s, received %s", threadID, tid)
+	}
+	if returnedCwd := stringAny(thread["cwd"]); returnedCwd != "" &&
+		filepath.Clean(expandUser(returnedCwd)) != filepath.Clean(expandUser(targetCwd)) {
+		return "", fmt.Errorf("thread/resume cwd mismatch for %s", threadID)
+	}
 	c.bindThread(sessionID, tid)
 	opts := c.startOptionsFor(sessionID)
 	if opts == nil {
@@ -1307,11 +1755,14 @@ func (c *Codex) resolveCommand() string {
 
 func resolveDesktopCodex(candidates []string) string {
 	if len(candidates) == 0 {
-		candidates = []string{"/Applications/Codex.app", "~/Applications/Codex.app"}
+		candidates = []string{
+			"/Applications/ChatGPT.app", "~/Applications/ChatGPT.app",
+			"/Applications/Codex.app", "~/Applications/Codex.app",
+		}
 	}
 	for _, app := range candidates {
 		bin := filepath.Join(expandUser(app), "Contents", "Resources", "codex")
-		if st, err := os.Stat(bin); err == nil && !st.IsDir() {
+		if st, err := os.Stat(bin); err == nil && st.Mode().IsRegular() && st.Mode().Perm()&0o111 != 0 {
 			return bin
 		}
 	}
@@ -1343,7 +1794,9 @@ func (c *Codex) tryDesktopStartTurnWithAttachments(sessionID string, threadID st
 			refreshed := c.refreshDesktopOwnerClient(threadID)
 			if refreshed != "" && refreshed != owner {
 				res, err = targeted.StartTurnOnClientWithAttachments(threadID, prompt, attachments, startOpts, refreshed, c.desktopIPCTimeout)
-			} else if refreshed == "" {
+			}
+			if err != nil && isDesktopNoClientFound(err) {
+				c.clearDesktopOwnerClient(threadID)
 				err = errNoDesktopOwnerClient()
 			}
 		}
@@ -1359,12 +1812,14 @@ func (c *Codex) tryDesktopStartTurnWithAttachments(sessionID string, threadID st
 			refreshed := c.refreshDesktopOwnerClient(threadID)
 			if refreshed != "" && refreshed != owner {
 				res, err = targeted.StartTurnOnClient(threadID, prompt, startOpts, refreshed, c.desktopIPCTimeout)
-			} else if refreshed == "" {
+			}
+			if err != nil && isDesktopNoClientFound(err) {
+				c.clearDesktopOwnerClient(threadID)
 				err = errNoDesktopOwnerClient()
 			}
 		}
 	} else {
-		res, err = client.StartTurn(threadID, prompt, startOpts, c.desktopIPCTimeout)
+		err = errors.New("Codex Desktop IPC does not support owner-targeted start")
 	}
 	if err != nil {
 		return "", err
@@ -1387,12 +1842,14 @@ func (c *Codex) tryDesktopSteerTurn(sessionID string, threadID string, prompt st
 			refreshed := c.refreshDesktopOwnerClient(threadID)
 			if refreshed != "" && refreshed != owner {
 				_, err = targeted.SteerTurnOnClient(threadID, prompt, refreshed, c.desktopIPCTimeout)
-			} else if refreshed == "" {
+			}
+			if err != nil && isDesktopNoClientFound(err) {
+				c.clearDesktopOwnerClient(threadID)
 				err = errNoDesktopOwnerClient()
 			}
 		}
 	} else {
-		_, err = client.SteerTurn(threadID, prompt, c.desktopIPCTimeout)
+		err = errors.New("Codex Desktop IPC does not support owner-targeted steer")
 	}
 	if err != nil {
 		return err
@@ -1415,12 +1872,14 @@ func (c *Codex) tryDesktopInterruptTurn(sessionID string, threadID string) error
 			refreshed := c.refreshDesktopOwnerClient(threadID)
 			if refreshed != "" && refreshed != owner {
 				_, err = targeted.InterruptTurnOnClient(threadID, refreshed, c.desktopIPCTimeout)
-			} else if refreshed == "" {
+			}
+			if err != nil && isDesktopNoClientFound(err) {
+				c.clearDesktopOwnerClient(threadID)
 				err = errNoDesktopOwnerClient()
 			}
 		}
 	} else {
-		_, err = client.InterruptTurn(threadID, c.desktopIPCTimeout)
+		err = errors.New("Codex Desktop IPC does not support owner-targeted interrupt")
 	}
 	if err != nil {
 		return err
@@ -1542,6 +2001,8 @@ func (c *Codex) startTurnWithAttachments(sessionID string, threadID string, prom
 		}
 		turnID, err := c.tryDesktopStartTurnWithAttachments(sessionID, threadID, prompt, attachments)
 		if err == nil {
+			c.markDesktopOwnedThread(threadID)
+			c.bindTurnThread(threadID, turnID)
 			return turnID, "Codex Desktop", nil
 		}
 		// The cached owner can disappear between discovery and the targeted
@@ -1553,6 +2014,8 @@ func (c *Codex) startTurnWithAttachments(sessionID string, threadID string, prom
 			}
 			turnID, err = c.tryDesktopStartTurnWithAttachments(sessionID, threadID, prompt, attachments)
 			if err == nil {
+				c.markDesktopOwnedThread(threadID)
+				c.bindTurnThread(threadID, turnID)
 				return turnID, "Codex Desktop", nil
 			}
 		}
@@ -1562,6 +2025,8 @@ func (c *Codex) startTurnWithAttachments(sessionID string, threadID string, prom
 	if err != nil {
 		return "", "", err
 	}
+	_, generation := c.currentClientRoute()
+	c.markAppServerThread(threadID)
 	start := func() (any, error) {
 		if len(attachments) == 0 {
 			return client.TurnStart(threadID, prompt, c.startOptionsFor(sessionID))
@@ -1588,6 +2053,9 @@ func (c *Codex) startTurnWithAttachments(sessionID string, threadID string, prom
 	if turnID != "" {
 		client.SetThreadTurn(threadID, turnID)
 	}
+	if !c.activateAppServerTurn(client, generation, threadID, turnID) {
+		return "", "", errors.New("Codex app-server exited after turn/start acknowledgement; terminal state is unknown")
+	}
 	return turnID, "Codex app-server", nil
 }
 
@@ -1601,6 +2069,13 @@ func (c *Codex) markDesktopSyncCandidate(sessionID string, threadID string) {
 	}
 }
 
+func (c *Codex) onNotificationFromClient(generation uint64, method string, params map[string]any) {
+	if !c.isCurrentClientGeneration(generation) {
+		return
+	}
+	c.onNotification(method, params)
+}
+
 func (c *Codex) onNotification(method string, params map[string]any) {
 	threadID := c.threadIDForNotification(params)
 	c.trackThreadRuntime(method, params, threadID)
@@ -1610,18 +2085,30 @@ func (c *Codex) onNotification(method string, params map[string]any) {
 		status := stringAny(mapAny(params["status"])["type"])
 		if status == "active" {
 			c.setLastState("running")
-		} else {
+		} else if codexThreadStatusTerminal(status) {
 			c.setLastState("idle")
 			// Scope cleanup to the thread that went idle; approvals pending
 			// on other threads must survive.
-			if status == "idle" || status == "completed" {
-				c.clearAppServerApprovalsForThread(stringAny(params["threadId"]))
-			}
+			c.clearAppServerApprovalsForThread(firstNonEmpty(stringAny(params["threadId"]), threadID))
 		}
 	case "serverRequest/resolved":
 		// The server resolved one of its own requests (answered elsewhere,
 		// auto-reviewed, or cancelled): drop exactly that approval.
-		c.removeAppServerApproval(stringAny(params["threadId"]), canonicalRequestKey(params["requestId"]))
+		resolvedThread := firstNonEmpty(stringAny(params["threadId"]), threadID)
+		if c.removeAppServerApproval(resolvedThread, typedCodexRequestKey(params["requestId"])) != nil {
+			c.publishApprovalChanged(resolvedThread)
+		}
+	case "turn/completed":
+		status := codexTurnCompletionStatus(params)
+		if status == "failed" {
+			c.setLastState("error")
+			if message := codexTurnCompletionError(params); message != "" {
+				c.setLastError(message)
+			}
+		} else {
+			c.setLastError("")
+			c.setLastState("idle")
+		}
 	case "account/rateLimits/updated":
 		if rl := mapAny(params["rateLimits"]); len(rl) > 0 {
 			c.sessMu.Lock()
@@ -1643,14 +2130,40 @@ func (c *Codex) trackThreadRuntime(method string, params map[string]any, threadI
 		status := stringAny(mapAny(params["status"])["type"])
 		if status == "active" {
 			c.setThreadActive(threadID, true)
-		} else if status == "idle" || status == "completed" {
+		} else if codexThreadStatusTerminal(status) {
 			c.setThreadActive(threadID, false)
+			c.finishThreadRoute(threadID, "")
 		}
 	case "turn/completed":
 		c.setThreadActive(threadID, false)
+		turnID := firstNonEmpty(stringAny(params["turnId"]), stringAny(mapAny(params["turn"])["id"]))
+		c.finishThreadRoute(threadID, turnID)
 		// A finished turn cannot have live approval callbacks.
 		c.clearAppServerApprovalsForThread(firstNonEmpty(stringAny(params["threadId"]), threadID))
 	}
+}
+
+func codexThreadStatusTerminal(status string) bool {
+	switch strings.ToLower(status) {
+	case "idle", "completed", "failed", "canceled", "cancelled", "interrupted":
+		return true
+	default:
+		return false
+	}
+}
+
+func codexTurnCompletionStatus(params map[string]any) string {
+	turn := mapAny(params["turn"])
+	return strings.ToLower(firstNonEmpty(stringAny(turn["status"]), stringAny(params["status"])))
+}
+
+func codexTurnCompletionError(params map[string]any) string {
+	turn := mapAny(params["turn"])
+	errPayload := firstValue(turn["error"], params["error"])
+	if message := stringAny(mapAny(errPayload)["message"]); message != "" {
+		return message
+	}
+	return stringAny(errPayload)
 }
 
 func (c *Codex) publishStreamNotification(method string, params map[string]any, threadID string) {
@@ -1682,21 +2195,24 @@ func (c *Codex) threadIDForNotification(params map[string]any) string {
 		firstNonEmpty(stringAny(params["threadId"]), stringAny(params["thread_id"])),
 		firstNonEmpty(stringAny(item["threadId"]), stringAny(item["thread_id"])),
 	)
-	c.sessMu.Lock()
-	defer c.sessMu.Unlock()
+	c.runtimeMu.Lock()
+	defer c.runtimeMu.Unlock()
 	if threadID == "" && turnID != "" {
 		threadID = c.turnThreads[turnID]
-	}
-	if threadID == "" {
-		threadID = c.lastThreadID
 	}
 	if threadID != "" && turnID != "" {
 		c.turnThreads[turnID] = threadID
 	}
-	if threadID != "" {
-		c.lastThreadID = threadID
-	}
 	return threadID
+}
+
+func (c *Codex) bindTurnThread(threadID string, turnID string) {
+	if threadID == "" || turnID == "" {
+		return
+	}
+	c.runtimeMu.Lock()
+	c.turnThreads[turnID] = threadID
+	c.runtimeMu.Unlock()
 }
 
 func (c *Codex) framesForNotification(method string, params map[string]any, threadID string) []map[string]any {
@@ -1746,10 +2262,10 @@ func (c *Codex) framesForItem(item map[string]any, threadID string, turnID strin
 		c.pendingTools[threadID] = map[string]map[string]any{}
 	}
 	pending := c.pendingTools[threadID]
-	c.sessMu.Unlock()
 	cid := codexCallID(item)
 	target := pending[cid]
 	messages := codexItemToMessages(item, "", pending, "", threadID, firstNonEmpty(turnID, stringAny(item["turnId"])))
+	c.sessMu.Unlock()
 	if target != nil {
 		return []map[string]any{{"type": "item_update", "item": target}}
 	}
@@ -1760,9 +2276,21 @@ func (c *Codex) framesForItem(item map[string]any, threadID string, turnID strin
 	return out
 }
 
+func (c *Codex) onServerRequestFromClient(generation uint64, requestID any, method string, params map[string]any) {
+	if !c.isCurrentClientGeneration(generation) {
+		return
+	}
+	c.handleServerRequest(generation, requestID, method, params)
+}
+
 func (c *Codex) onServerRequest(requestID any, method string, params map[string]any) {
+	_, generation := c.currentClientRoute()
+	c.handleServerRequest(generation, requestID, method, params)
+}
+
+func (c *Codex) handleServerRequest(generation uint64, requestID any, method string, params map[string]any) {
 	if method == "item/tool/call" {
-		_ = c.answerDynamicTool(requestID, params)
+		_ = c.answerDynamicTool(generation, requestID, params)
 		return
 	}
 	// Only genuine human requests become approvals. Machine requests (token
@@ -1770,9 +2298,7 @@ func (c *Codex) onServerRequest(requestID any, method string, params map[string]
 	// "method not found" so the server neither blocks nor shows up as a
 	// phantom approval.
 	if !codexHumanRequestMethod(method) {
-		c.clientMu.Lock()
-		client := c.client
-		c.clientMu.Unlock()
+		client := c.clientForGeneration(generation)
 		if client != nil {
 			_ = client.RespondError(requestID, -32601, "method not supported by remote-agent: "+method)
 		}
@@ -1792,15 +2318,21 @@ func (c *Codex) onServerRequest(requestID any, method string, params map[string]
 			params = copyParams
 		}
 	}
-	threadID := c.addAppServerApproval(requestID, method, params)
+	if threadID := codexRequestThreadID(params); c.threadInterrupting(threadID) {
+		if client := c.clientForGeneration(generation); client != nil {
+			_ = client.RespondError(requestID, -32800, "turn cancellation already requested")
+		}
+		return
+	}
+	threadID := c.addAppServerApproval(generation, requestID, method, params)
 	c.setLastState("waiting_approval")
 	c.publishApprovalChanged(threadID)
 }
 
-func (c *Codex) answerDynamicTool(requestID any, params map[string]any) error {
-	client, err := c.ensureClient()
-	if err != nil {
-		return err
+func (c *Codex) answerDynamicTool(generation uint64, requestID any, params map[string]any) error {
+	client := c.clientForGeneration(generation)
+	if client == nil {
+		return errors.New("codex app-server request belongs to a stale connection")
 	}
 	ns := stringAny(params["namespace"])
 	tool := stringAny(params["tool"])
@@ -2035,6 +2567,36 @@ func canonicalRequestKey(v any) string {
 	}
 }
 
+// typedCodexRequestKey preserves the JSON-RPC id type. Codex may legally use
+// both numeric 7 and string "7" on one connection; collapsing them can resolve
+// or answer the wrong server request.
+func typedCodexRequestKey(v any) string {
+	switch v.(type) {
+	case string:
+		return "s:" + canonicalRequestKey(v)
+	case float64, float32, int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64, json.Number:
+		return "n:" + canonicalRequestKey(v)
+	case nil:
+		return ""
+	default:
+		return "j:" + canonicalRequestKey(v)
+	}
+}
+
+func codexPendingByDisplayID(pending []*codexPendingApproval, requestID string) (*codexPendingApproval, bool) {
+	var match *codexPendingApproval
+	for _, req := range pending {
+		if req == nil || req.Key != requestID {
+			continue
+		}
+		if match != nil {
+			return nil, true
+		}
+		match = req
+	}
+	return match, false
+}
+
 // codexRequestThreadID correlates old- and new-protocol identifier spellings.
 func codexRequestThreadID(params map[string]any) string {
 	return firstNonEmpty(
@@ -2047,6 +2609,7 @@ func newCodexPendingApproval(requestID any, method string, params map[string]any
 	return &codexPendingApproval{
 		RequestID:  requestID,
 		Key:        canonicalRequestKey(requestID),
+		RouteKey:   typedCodexRequestKey(requestID),
 		Method:     method,
 		Params:     params,
 		ThreadID:   codexRequestThreadID(params),
@@ -2055,24 +2618,26 @@ func newCodexPendingApproval(requestID any, method string, params map[string]any
 		ApprovalID: firstNonEmpty(stringAny(params["approvalId"]), stringAny(params["approval_id"])),
 		Source:     source,
 		CreatedAt:  time.Now(),
+		Instance:   newUUID(),
 	}
 }
 
-func (c *Codex) addAppServerApproval(requestID any, method string, params map[string]any) string {
+func (c *Codex) addAppServerApproval(generation uint64, requestID any, method string, params map[string]any) string {
 	req := newCodexPendingApproval(requestID, method, params, codexApprovalSourceAppServer)
+	req.ConnectionGeneration = generation
 	c.approvalMu.Lock()
 	defer c.approvalMu.Unlock()
 	c.approvalsByThread[req.ThreadID] = append(c.approvalsByThread[req.ThreadID], req)
 	return req.ThreadID
 }
 
-func (c *Codex) removeAppServerApproval(threadID string, key string) *codexPendingApproval {
+func (c *Codex) removeAppServerApproval(threadID string, routeKey string) *codexPendingApproval {
 	c.approvalMu.Lock()
 	defer c.approvalMu.Unlock()
 	remove := func(tid string) *codexPendingApproval {
 		list := c.approvalsByThread[tid]
 		for i, req := range list {
-			if req.Key == key {
+			if req.RouteKey == routeKey {
 				c.approvalsByThread[tid] = append(list[:i], list[i+1:]...)
 				if len(c.approvalsByThread[tid]) == 0 {
 					delete(c.approvalsByThread, tid)
@@ -2113,12 +2678,28 @@ func (c *Codex) clearAllAppServerApprovals() {
 	c.approvalsByThread = map[string][]*codexPendingApproval{}
 }
 
+func (c *Codex) appServerApprovalThreadIDs() []string {
+	c.approvalMu.Lock()
+	defer c.approvalMu.Unlock()
+	out := make([]string, 0, len(c.approvalsByThread))
+	for threadID, pending := range c.approvalsByThread {
+		if threadID != "" && len(pending) > 0 {
+			out = append(out, threadID)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (c *Codex) anyAppServerApprovals() bool {
+	interrupting := c.interruptingThreadSet()
 	c.approvalMu.Lock()
 	defer c.approvalMu.Unlock()
 	for _, list := range c.approvalsByThread {
-		if len(list) > 0 {
-			return true
+		for _, req := range list {
+			if !req.Responding && !interrupting[req.ThreadID] {
+				return true
+			}
 		}
 	}
 	return false
@@ -2132,14 +2713,27 @@ func (c *Codex) pendingApprovalsForSession(sessionID string) (string, []*codexPe
 	threadID := ""
 	out := []*codexPendingApproval{}
 	seen := map[string]bool{}
+	interrupting := c.interruptingThreadSet()
+	if sessionID != "" {
+		threadID = c.threadForSession(sessionID)
+	}
 	c.approvalMu.Lock()
 	if sessionID == "" {
 		for _, list := range c.approvalsByThread {
-			out = append(out, list...)
+			for _, req := range list {
+				if !req.Responding && !interrupting[req.ThreadID] {
+					out = append(out, req)
+				}
+			}
 		}
 	} else {
-		threadID = c.threadForSession(sessionID)
-		out = append(out, c.approvalsByThread[threadID]...)
+		if !interrupting[threadID] {
+			for _, req := range c.approvalsByThread[threadID] {
+				if !req.Responding {
+					out = append(out, req)
+				}
+			}
+		}
 	}
 	c.approvalMu.Unlock()
 	for _, req := range out {
@@ -2149,6 +2743,7 @@ func (c *Codex) pendingApprovalsForSession(sessionID string) (string, []*codexPe
 		if b := c.desktopBridge(); b != nil {
 			for _, breq := range b.PendingHumanRequests(threadID) {
 				req := newCodexPendingApproval(breq.ID, breq.Method, breq.Params, codexApprovalSourceDesktop)
+				req.Instance = breq.Instance
 				if req.ThreadID == "" {
 					req.ThreadID = threadID
 				}
@@ -2188,11 +2783,12 @@ func codexApprovalKind(method string) string {
 func codexApprovalView(req *codexPendingApproval) map[string]any {
 	kind := codexApprovalKind(req.Method)
 	out := map[string]any{
-		"type":       kind,
-		"request_id": req.Key,
-		"thread_id":  req.ThreadID,
-		"method":     req.Method,
-		"source":     req.Source,
+		"type":             kind,
+		"request_id":       req.Key,
+		"thread_id":        req.ThreadID,
+		"method":           req.Method,
+		"source":           req.Source,
+		"request_instance": req.Instance,
 	}
 	if req.Source == codexApprovalSourceDesktop && !codexDesktopApprovalMethodSupported(req.Method) {
 		// The Desktop follower IPC has method-specific response routes. Keep
@@ -2208,6 +2804,9 @@ func codexApprovalView(req *codexPendingApproval) map[string]any {
 	}
 	if req.ApprovalID != "" {
 		out["approval_id"] = req.ApprovalID
+	}
+	if req.Source != codexApprovalSourceDesktop || int64Any(req.Params["startedAtMs"]) > 0 {
+		out["created_at"] = req.CreatedAt.UTC().Format(time.RFC3339Nano)
 	}
 	if decisions := codexStringDecisions(req.Params); len(decisions) > 0 {
 		out["decisions"] = decisions

@@ -16,6 +16,7 @@ layer:
 |--------|-----------|-------------------------|---------------------|
 | **Claude** | `claude` | creates/resumes the real CLI as a managed `stream-json` child | live NDJSON events + merged Desktop/CLI transcript metadata |
 | **Codex Desktop/app-server** | `codex` | maps each logical session to a Codex thread and binds it to either Desktop owner/follower IPC or its own headless `codex app-server` (`turn/start`, `turn/steer`, `turn/interrupt`) | merged app-server/local discovery, app-server notifications for headless turns, and rollout preview tailing for Desktop-owned turns |
+| **Generic terminal fallback** | configured `"type": "pty"` providers | starts one fixed executable + args in one PTY per logical session; no shell expansion | bounded, terminal-control-sanitized memory + WebSocket deltas |
 
 > **Account isolation is solved at the device layer.** One Mac ≈ one Claude
 > account or one Codex account. The agent never switches or logs into accounts.
@@ -68,6 +69,36 @@ and model selection. Small optional interfaces add attachments, transcript
 assets, runtime sessions, native resume/fork, precise request-scoped approvals,
 Desktop delivery binding and Codex message rewind without bloating the base
 contract.
+
+### Generic PTY providers
+
+Use `"type": "pty"` only when an interactive agent has no structured protocol.
+`command` and `args` are executed directly, never through a shell, and each
+logical session owns one child process and one PTY:
+
+```json
+"terminal-agent": {
+  "type": "pty",
+  "app_name": "Terminal Agent",
+  "command": "agent-cli",
+  "args": ["--interactive"],
+  "cwd": "~/Developer",
+  "prompt_suffix": "\r",
+  "interrupt_sequence": "\u0003",
+  "idle_timeout_ms": 1500,
+  "ready_pattern": "(?m)^> $",
+  "allow_raw_keys": false,
+  "max_output_bytes": 262144,
+  "max_sessions": 32
+}
+```
+
+This adapter intentionally advertises fewer capabilities: no native resume,
+structured approvals/questions, attachments, steer, or model controls. Output
+and preview history are memory-bounded and are not a durable transcript.
+Completion is best-effort, based on `ready_pattern` or output quiet time.
+Prefer native Claude/Codex providers whenever their structured protocol is
+available.
 
 ### claude provider — stream-json
 
@@ -124,6 +155,16 @@ The registered `codex` provider is the Go `provider.Codex`.
   local Codex index/rollouts. `/session_preview` reads rollout JSONL first and
   only uses a bounded `thread/resume` fallback when the rollout is not yet on
   disk.
+  Session discovery asks app-server for the 200 most recent interactive threads
+  from its state DB, then incrementally indexes rollout metadata by
+  path/size/mtime. Subagent rows remain internally addressable but do not
+  consume the visible-session budget.
+* **Convergent list refresh**: `/native_sessions` keeps a last-good snapshot.
+  `refresh=1` starts a single background refresh and immediately returns that
+  snapshot with `generation`, `refreshing`, `refreshed_at`, and
+  `refresh_error`. The PWA renders native rows before live-session enrichment,
+  follows `refreshing` with bounded retries, ignores superseded
+  device/provider requests, and refreshes every five seconds while visible.
 * **Live output**: headless turns publish app-server `item/agentMessage/delta`
   and `thread/status/changed` notifications to both the logical session id and
   native thread id. The PWA live-tails Desktop-owned turns by polling
@@ -145,10 +186,18 @@ The registered `codex` provider is the Go `provider.Codex`.
   `approvalsReviewer=auto_review` turns are guardian-reviewed server-side and
   never surface fake web approvals. Approvals are tracked per thread +
   request id: one thread going idle no longer clears another thread's queue.
-* **Binary selection**: by default it prefers
-  `/Applications/Codex.app/Contents/Resources/codex` (or the same under
-  `~/Applications`) and falls back to `$PATH`; set
+* **Binary selection**: by default it prefers the Codex executable bundled in
+  `/Applications/ChatGPT.app` (or the same under `~/Applications`), then checks
+  the legacy standalone `Codex.app`, and finally falls back to `$PATH`; set
   `extra.prefer_desktop_codex=false` to opt out.
+* **Owned app-server lifecycle**: the provider assigns every child a connection
+  generation. EOF, malformed JSON, or process exit immediately fails pending
+  RPCs, retires only that generation's routes, and reaps the owned process
+  group. An old exit callback cannot clear a newer connection.
+* **Authoritative completion**: approval/question response writes remain
+  non-terminal until the matching typed `serverRequest/resolved` arrives.
+  Likewise, `turn/interrupt` reports `cancellation_requested`; the session
+  remains running until Codex publishes a terminal event.
 * **Per-turn usage**: completed `task_started` / `task_complete` boundaries use
   Codex's native duration and the delta of cumulative token counters, so a
   session total is never repeated as an individual turn's usage.
@@ -172,7 +221,7 @@ path.
 | Method | Path | Purpose |
 |--------|------|---------|
 | GET  | `/status` | device, active provider/session, state, last prompt/shot/clip, last error, (approval_request when waiting) |
-| GET  | `/providers` | all providers + ProviderStatus + capabilities |
+| GET  | `/providers` | providers + status + boolean capabilities + typed actions |
 | POST | `/provider/select` | switch active provider |
 | POST | `/send_prompt` | `{provider_id?, session_id, prompt, attachments?}` → drive provider, task → running |
 | POST | `/upload` | multipart `provider_id`, `session_id`, `file` → opaque session-scoped attachment (25 MB max) |
@@ -191,6 +240,12 @@ path.
 | POST | `/approval` | `{provider_id, session_id, request_id, decision}` for a Claude or Codex request |
 | POST | `/question_answer` | `{provider_id, session_id, request_id, answers}` for provider user-input questions |
 
+Typed actions give clients a closed operation id plus `endpoint`, `scope`,
+`risk`, and `supported`; legacy boolean capabilities remain for older clients.
+Codex subagent threads remain directly addressable by exact id for preview and
+control, but are filtered from normal stored/native/live session lists and the
+unscoped task list.
+
 ## Setup
 
 ### 1. Install
@@ -201,12 +256,15 @@ make go-build
 cp config.example.json config.json       # edit device_id, cwd, providers
 ```
 
-Requires a runnable standalone `claude` CLI for the `claude` provider. Codex prefers the
-binary bundled inside Codex.app and only falls back to PATH:
+Requires a runnable standalone `claude` CLI for the `claude` provider. Codex
+prefers the binary bundled inside ChatGPT.app, then the legacy Codex.app, and
+only then falls back to PATH:
 
 ```bash
 which claude
-test -x /Applications/Codex.app/Contents/Resources/codex || which codex
+test -x /Applications/ChatGPT.app/Contents/Resources/codex \
+  || test -x /Applications/Codex.app/Contents/Resources/codex \
+  || which codex
 ```
 
 ### 2. macOS permissions

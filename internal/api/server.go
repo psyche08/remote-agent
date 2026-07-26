@@ -57,6 +57,7 @@ type Server struct {
 type nativeSessionCacheEntry struct {
 	sessions    []map[string]any
 	refreshedAt time.Time
+	generation  uint64
 	refreshing  bool
 	done        chan struct{}
 	err         string
@@ -65,13 +66,23 @@ type nativeSessionCacheEntry struct {
 type nativeSessionMeta struct {
 	Source      string
 	RefreshedAt string
+	Generation  uint64
+	HasSnapshot bool
 	Refreshing  bool
 	Error       string
 }
 
+// nativeSessionErrorLister lets providers surface discovery failures without
+// changing the Provider compatibility contract. Providers that only implement
+// ListNativeSessions retain the existing behavior.
+type nativeSessionErrorLister interface {
+	ListNativeSessionsWithError() ([]map[string]any, error)
+}
+
 const (
-	nativeSessionRefreshMin = 15 * time.Second
-	nativeSessionBriefWait  = 150 * time.Millisecond
+	nativeSessionRefreshDefault = 15 * time.Second
+	nativeSessionRefreshCodex   = 5 * time.Second
+	nativeSessionBriefWait      = 150 * time.Millisecond
 )
 
 func NewServer(cfg *config.Config, registry provider.Registry, store *state.Store) *Server {
@@ -108,12 +119,18 @@ func (s *Server) StartBackground() {
 }
 
 func (s *Server) StartBackgroundWithAutoUpdate(autoUpdate bool) {
+	s.StartBackgroundWithOptions(autoUpdate, true)
+}
+
+func (s *Server) StartBackgroundWithOptions(autoUpdate bool, watchdog bool) {
 	s.pushOnce.Do(func() {
 		go s.pushMonitorLoop()
 		if autoUpdate {
 			go s.autoUpdateLoop()
 		}
-		go s.watchdogLoop()
+		if watchdog {
+			go s.watchdogLoop()
+		}
 		s.pricing.Start(s.pushStop)
 	})
 }
@@ -324,6 +341,7 @@ func (s *Server) providers(w http.ResponseWriter, r *http.Request) {
 			"provider_id":  id,
 			"status":       st,
 			"capabilities": st.Capabilities,
+			"actions":      provider.Actions(p),
 			"model_select": p.ModelSelect(),
 		})
 	}
@@ -380,6 +398,11 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
+		records = s.visibleStoredSessions(
+			records,
+			strings.TrimSpace(r.URL.Query().Get("provider_id")),
+			strings.TrimSpace(r.URL.Query().Get("session_id")),
+		)
 		writeJSON(w, http.StatusOK, map[string]any{"sessions": records})
 	case http.MethodPost:
 		var body createSessionIn
@@ -795,11 +818,18 @@ func (s *Server) prepareDirectCodexSession(p provider.Provider, providerID strin
 	if threadID == "" {
 		return nil, fmt.Errorf("native Codex session has no thread id")
 	}
+	hidden := sessionHiddenFromLists(native, nil)
+	if !hidden {
+		hidden = sessionHiddenFromLists(native, s.hiddenSessionIDs(providerID))
+	}
 	logicalID := providerScopedLogicalID(providerID, threadID)
 	if existing, found, err := s.findSessionForProviderAny(providerID, threadID); err != nil {
 		return nil, err
 	} else if found {
 		existing["delivery_route"] = "desktop_ipc"
+		if hidden {
+			existing[hiddenFromSessionListsKey] = true
+		}
 		if err := s.store.UpsertSession(existing); err != nil {
 			return nil, err
 		}
@@ -811,6 +841,9 @@ func (s *Server) prepareDirectCodexSession(p provider.Provider, providerID strin
 	session["native_session_id"] = threadID
 	session["transcript_id"] = threadID
 	session["delivery_route"] = "desktop_ipc"
+	if hidden {
+		session[hiddenFromSessionListsKey] = true
+	}
 	if err := s.store.UpsertSession(session); err != nil {
 		return nil, err
 	}
@@ -905,6 +938,10 @@ func (s *Server) resumeNativeSession(w http.ResponseWriter, r *http.Request) {
 	if targetID == "codex" {
 		session["state"] = "idle"
 	}
+	if !body.Fork && (sessionHiddenFromLists(native, nil) ||
+		sessionHiddenFromLists(native, s.hiddenSessionIDs(srcID))) {
+		session[hiddenFromSessionListsKey] = true
+	}
 	if err := s.store.UpsertSession(session); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -955,18 +992,37 @@ func (s *Server) nativeSessions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider_id")
 		return
 	}
-	if queryBool(r.URL.Query().Get("sync")) || r.URL.Query().Get("include_stale") == "0" {
+	syncRefresh := queryBool(r.URL.Query().Get("sync")) || r.URL.Query().Get("include_stale") == "0"
+	forceRefresh := queryBool(r.URL.Query().Get("refresh"))
+	if syncRefresh {
 		s.refreshNativeSessionCacheSync(providerID, p)
+	} else if forceRefresh {
+		// A user-initiated refresh is still stale-while-revalidate: start the
+		// refresh immediately, but never hold the HTTP request on discovery.
+		s.ensureNativeSessionRefresh(providerID, p, true)
 	}
-	sessions, meta := s.nativeSessionsForProvider(providerID, p, true)
+	sessions, meta := s.nativeSessionsForProvider(providerID, p, !forceRefresh)
+	sessions = visibleSessionRows(sessions, s.hiddenSessionIDs(providerID))
+	metaBody := map[string]any{
+		"source":        meta.Source,
+		"refreshed_at":  meta.RefreshedAt,
+		"generation":    meta.Generation,
+		"has_snapshot":  meta.HasSnapshot,
+		"refreshing":    meta.Refreshing,
+		"refresh_error": meta.Error,
+	}
+	deviceTime := currentDeviceTimeMetadata(s.cfg.DeviceID)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"provider_id":   providerID,
 		"count":         len(sessions),
 		"sessions":      sessions,
+		"device_time":   deviceTime,
 		"source":        meta.Source,
 		"refreshed_at":  meta.RefreshedAt,
+		"generation":    meta.Generation,
 		"refreshing":    meta.Refreshing,
 		"refresh_error": meta.Error,
+		"meta":          metaBody,
 	})
 }
 
@@ -1009,7 +1065,7 @@ func (s *Server) ensureNativeSessionRefresh(providerID string, p provider.Provid
 		s.nativeMu.Unlock()
 		return done, hadSnapshot
 	}
-	if !force && hadSnapshot && time.Since(entry.refreshedAt) < nativeSessionRefreshMin {
+	if !force && hadSnapshot && time.Since(entry.refreshedAt) < nativeSessionRefreshInterval(providerID) {
 		s.nativeMu.Unlock()
 		return nil, hadSnapshot
 	}
@@ -1021,6 +1077,13 @@ func (s *Server) ensureNativeSessionRefresh(providerID string, p provider.Provid
 	return done, hadSnapshot
 }
 
+func nativeSessionRefreshInterval(providerID string) time.Duration {
+	if canonicalProviderID(providerID) == "codex" {
+		return nativeSessionRefreshCodex
+	}
+	return nativeSessionRefreshDefault
+}
+
 func (s *Server) refreshNativeSessionCacheSync(providerID string, p provider.Provider) {
 	done, _ := s.ensureNativeSessionRefresh(providerID, p, true)
 	if done != nil {
@@ -1029,35 +1092,49 @@ func (s *Server) refreshNativeSessionCacheSync(providerID string, p provider.Pro
 }
 
 func (s *Server) refreshNativeSessionCache(providerID string, p provider.Provider, done chan struct{}) {
-	rows := []map[string]any{}
-	errText := ""
-	func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				errText = "panic while listing native sessions"
-				rows = nil
-			}
-		}()
-		rows = cloneNativeSessionRows(providerID, p.ListNativeSessions())
-		sort.Slice(rows, func(i, j int) bool {
-			return sessionSortAt(rows[i]) > sessionSortAt(rows[j])
-		})
-	}()
+	rows, refreshErr := listNativeSessions(providerID, p)
 	s.nativeMu.Lock()
 	entry := s.nativeCache[providerID]
 	if entry == nil {
 		entry = &nativeSessionCacheEntry{}
 		s.nativeCache[providerID] = entry
 	}
-	entry.sessions = rows
-	entry.refreshedAt = time.Now()
+	if refreshErr == nil {
+		entry.sessions = rows
+		entry.refreshedAt = time.Now()
+		entry.generation++
+		entry.err = ""
+	} else {
+		entry.err = refreshErr.Error()
+	}
 	entry.refreshing = false
-	entry.err = errText
 	if entry.done == done {
 		entry.done = nil
 	}
-	close(done)
 	s.nativeMu.Unlock()
+	close(done)
+}
+
+func listNativeSessions(providerID string, p provider.Provider) (rows []map[string]any, refreshErr error) {
+	defer func() {
+		if recover() != nil {
+			rows = nil
+			refreshErr = fmt.Errorf("panic while listing native sessions")
+		}
+	}()
+	var raw []map[string]any
+	if lister, ok := p.(nativeSessionErrorLister); ok {
+		var err error
+		raw, err = lister.ListNativeSessionsWithError()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		raw = p.ListNativeSessions()
+	}
+	rows = cloneNativeSessionRows(providerID, raw)
+	sortSessionRowsNewest(rows)
+	return rows, nil
 }
 
 func (s *Server) nativeSessionCacheSnapshot(providerID string) ([]map[string]any, nativeSessionMeta) {
@@ -1067,7 +1144,12 @@ func (s *Server) nativeSessionCacheSnapshot(providerID string) ([]map[string]any
 	if entry == nil {
 		return nil, nativeSessionMeta{}
 	}
-	meta := nativeSessionMeta{Refreshing: entry.refreshing, Error: entry.err}
+	meta := nativeSessionMeta{
+		Generation:  entry.generation,
+		HasSnapshot: !entry.refreshedAt.IsZero(),
+		Refreshing:  entry.refreshing,
+		Error:       entry.err,
+	}
 	if !entry.refreshedAt.IsZero() {
 		meta.RefreshedAt = entry.refreshedAt.UTC().Format(time.RFC3339Nano)
 	}
@@ -1094,9 +1176,7 @@ func (s *Server) mergeStoredNativeSessions(providerID string, rows []map[string]
 		seen[key] = len(out)
 		out = append(out, stored)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return sessionSortAt(out[i]) > sessionSortAt(out[j])
-	})
+	sortSessionRowsNewest(out)
 	return out
 }
 
@@ -1116,7 +1196,7 @@ func (s *Server) storedNativeSessions(providerID string) []map[string]any {
 			continue
 		}
 		nativeID := firstNonEmpty(recordString(rec, "native_session_id"), transcript)
-		rows = append(rows, map[string]any{
+		row := map[string]any{
 			"session_id":        sessionID,
 			"cli_session_id":    transcript,
 			"native_session_id": nativeID,
@@ -1130,11 +1210,13 @@ func (s *Server) storedNativeSessions(providerID string) []map[string]any {
 			"status":            firstNonEmpty(recordString(rec, "state"), "stored"),
 			"stored":            true,
 			"source":            "stored",
-		})
+		}
+		if truthy(rec[hiddenFromSessionListsKey], false) {
+			row[hiddenFromSessionListsKey] = true
+		}
+		rows = append(rows, row)
 	}
-	sort.Slice(rows, func(i, j int) bool {
-		return sessionSortAt(rows[i]) > sessionSortAt(rows[j])
-	})
+	sortSessionRowsNewest(rows)
 	return rows
 }
 
@@ -1170,13 +1252,17 @@ func nativeSessionKey(row map[string]any) string {
 }
 
 func mergeStoredNativeRow(row map[string]any, stored map[string]any) {
-	for _, key := range []string{"session_id", "title", "cwd", "updated_at", "last_reply_at", "transcript_id", "native_session_id"} {
+	for _, key := range []string{"session_id", "title", "cwd", "transcript_id", "native_session_id"} {
 		if stringAny(row[key]) == "" && stringAny(stored[key]) != "" {
 			row[key] = stored[key]
 		}
 	}
+	mergeSessionActivity(row, stored)
 	if truthy(stored["stored"], false) {
 		row["stored"] = true
+	}
+	if truthy(stored[hiddenFromSessionListsKey], false) {
+		row[hiddenFromSessionListsKey] = true
 	}
 	if stringAny(row["source"]) == "" {
 		row["source"] = stringAny(stored["source"])
@@ -1454,6 +1540,16 @@ func (s *Server) tasks(w http.ResponseWriter, r *http.Request) {
 		}
 		records = filtered
 	}
+	if taskID == "" && sessionID == "" {
+		hiddenSessions := s.hiddenStoredSessionKeys()
+		filtered := make([]state.Record, 0, len(records))
+		for _, rec := range records {
+			if !taskHiddenFromLists(rec, hiddenSessions) {
+				filtered = append(filtered, rec)
+			}
+		}
+		records = filtered
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"tasks": records})
 }
 
@@ -1607,7 +1703,8 @@ func (s *Server) setModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown effort: "+body.Effort)
 		return
 	}
-	writeJSON(w, http.StatusOK, p.SetSessionModel(body.SessionID, body.Model, body.Effort))
+	res := p.SetSessionModel(body.SessionID, body.Model, body.Effort)
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) steer(w http.ResponseWriter, r *http.Request) {
@@ -1742,7 +1839,7 @@ func (s *Server) approval(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, code, map[string]any{
 		"ok": truthy(relay["ok"], false), "status": firstNonEmpty(stringAny(relay["status"]), "relayed"),
 		"detail": stringAny(relay["detail"]), "request_id": stringAny(relay["request_id"]),
-		"decision": body.Decision, "task": updated,
+		"decision": body.Decision, "confirmed": relay["confirmed"], "task": updated,
 	})
 }
 
@@ -2012,6 +2109,10 @@ func (s *Server) liveSessions(w http.ResponseWriter, r *http.Request) {
 			return false
 		}
 		prev := out[idx]
+		previousActivity := map[string]any{
+			"last_reply_at": stringAny(prev["last_reply_at"]),
+			"updated_at":    stringAny(prev["updated_at"]),
+		}
 		if isLiveRow(row) && !isLiveRow(prev) {
 			for _, k := range []string{
 				"session_id", "transcript_id", "native_session_id", "title", "provider_id", "cwd",
@@ -2025,15 +2126,16 @@ func (s *Server) liveSessions(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			prev["live"] = true
-		} else if updated := stringAny(row["updated_at"]); updated > stringAny(prev["updated_at"]) {
-			prev["updated_at"] = updated
 		}
+		mergeSessionActivity(prev, previousActivity)
+		mergeSessionActivity(prev, row)
 		return true
 	}
 	for _, pid := range s.registry.IDs() {
 		if filterProvider != "" && pid != filterProvider {
 			continue
 		}
+		hiddenIDs := s.hiddenSessionIDs(pid)
 		runtime, ok := s.registry[pid].(interface{ RuntimeSessions() []map[string]any })
 		if ok {
 			for _, row := range runtime.RuntimeSessions() {
@@ -2055,6 +2157,9 @@ func (s *Server) liveSessions(w http.ResponseWriter, r *http.Request) {
 				}
 				if rec == nil {
 					rec = state.Record{}
+				}
+				if sessionHiddenFromLists(row, hiddenIDs) || sessionHiddenFromLists(map[string]any(rec), hiddenIDs) {
+					continue
 				}
 				row["session_id"] = sid
 				if recordSid := recordString(rec, "session_id"); recordSid != "" {
@@ -2085,11 +2190,17 @@ func (s *Server) liveSessions(w http.ResponseWriter, r *http.Request) {
 		}
 		nativeRows, _ := s.nativeSessionsForProvider(pid, s.registry[pid], true)
 		for _, native := range nativeRows {
+			if sessionHiddenFromLists(native, hiddenIDs) {
+				continue
+			}
 			transcript := firstNonEmpty(stringAny(native["cli_session_id"]), stringAny(native["native_session_id"]))
 			if transcript == "" {
 				continue
 			}
 			rec := byProviderTranscript[pid+":"+transcript]
+			if sessionHiddenFromLists(map[string]any(rec), hiddenIDs) {
+				continue
+			}
 			live := truthy(native["live"], false)
 			if !live && !includeInactive {
 				continue
@@ -2116,10 +2227,11 @@ func (s *Server) liveSessions(w http.ResponseWriter, r *http.Request) {
 			remember(pid+":"+transcript, row)
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		return sessionSortAt(out[i]) > sessionSortAt(out[j])
+	sortSessionRowsNewest(out)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"sessions":    out,
+		"device_time": currentDeviceTimeMetadata(s.cfg.DeviceID),
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"sessions": out})
 }
 
 type closeSessionIn struct {
@@ -2489,6 +2601,103 @@ func queryBool(v string) bool {
 
 func sessionSortAt(row map[string]any) string {
 	return firstNonEmpty(stringAny(row["last_reply_at"]), stringAny(row["updated_at"]))
+}
+
+func sortSessionRowsNewest(rows []map[string]any) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		left, leftOK := parseSessionTime(sessionSortAt(rows[i]))
+		right, rightOK := parseSessionTime(sessionSortAt(rows[j]))
+		switch {
+		case leftOK && rightOK && !left.Equal(right):
+			return left.After(right)
+		case leftOK != rightOK:
+			return leftOK
+		}
+		leftRaw, rightRaw := sessionSortAt(rows[i]), sessionSortAt(rows[j])
+		if leftRaw != rightRaw {
+			return leftRaw > rightRaw
+		}
+		return nativeSessionKey(rows[i]) < nativeSessionKey(rows[j])
+	})
+}
+
+func parseSessionTime(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	return parsed, err == nil
+}
+
+func newerSessionTime(left, right string) string {
+	leftTime, leftOK := parseSessionTime(left)
+	rightTime, rightOK := parseSessionTime(right)
+	switch {
+	case leftOK && rightOK:
+		if rightTime.After(leftTime) {
+			return right
+		}
+		return left
+	case rightOK:
+		return right
+	case leftOK:
+		return left
+	case right > left:
+		return right
+	default:
+		return left
+	}
+}
+
+func mergeSessionActivity(target, source map[string]any) {
+	target["last_reply_at"] = newerSessionTime(stringAny(target["last_reply_at"]), stringAny(source["last_reply_at"]))
+	target["updated_at"] = newerSessionTime(stringAny(target["updated_at"]), stringAny(source["updated_at"]))
+}
+
+func currentDeviceTimeMetadata(deviceID string) map[string]any {
+	now := time.Now()
+	_, offsetSeconds := now.Zone()
+	return map[string]any{
+		"device_id":          deviceID,
+		"time_zone":          localTimeZoneID(now.Location()),
+		"utc_offset_minutes": offsetSeconds / 60,
+		"observed_at":        now.UTC().Format(time.RFC3339Nano),
+	}
+}
+
+func localTimeZoneID(location *time.Location) string {
+	if location != nil {
+		if name := usableTimeZoneID(location.String()); name != "" {
+			return name
+		}
+	}
+	if name := usableTimeZoneID(os.Getenv("TZ")); name != "" {
+		return name
+	}
+	if target, err := filepath.EvalSymlinks("/etc/localtime"); err == nil {
+		if marker := strings.LastIndex(target, "/zoneinfo/"); marker >= 0 {
+			if name := usableTimeZoneID(target[marker+len("/zoneinfo/"):]); name != "" {
+				return name
+			}
+		}
+	}
+	if raw, err := os.ReadFile("/etc/timezone"); err == nil {
+		if name := usableTimeZoneID(string(raw)); name != "" {
+			return name
+		}
+	}
+	return ""
+}
+
+func usableTimeZoneID(value string) string {
+	value = strings.TrimPrefix(strings.TrimSpace(value), ":")
+	if value == "" || value == "Local" || filepath.IsAbs(value) {
+		return ""
+	}
+	if _, err := time.LoadLocation(value); err != nil {
+		return ""
+	}
+	return value
 }
 
 func splitFields(s string) []string {

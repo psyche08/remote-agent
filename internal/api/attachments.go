@@ -82,7 +82,10 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider_id")
 		return
 	}
-	_ = p
+	if _, ok := p.(provider.AttachmentSender); !ok {
+		writeError(w, http.StatusBadRequest, "provider does not support attachments")
+		return
+	}
 	session, found, err := s.findSessionForProviderAny(resolvedProviderID, sessionID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

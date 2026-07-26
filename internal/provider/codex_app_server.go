@@ -47,6 +47,7 @@ type CodexAppServerClient struct {
 	Cwd             string
 	OnNotification  func(method string, params map[string]any)
 	OnServerRequest func(requestID any, method string, params map[string]any)
+	OnExit          func(error)
 
 	cmd          *exec.Cmd
 	stdin        io.WriteCloser
@@ -58,6 +59,10 @@ type CodexAppServerClient struct {
 	threadTurn   map[string]string
 	lastModel    string
 	closed       bool
+	exited       bool
+	exitErr      error
+	done         chan struct{}
+	doneOnce     sync.Once
 }
 
 func NewCodexAppServerClient(command []string, cwd string, onNotification func(string, map[string]any), onServerRequest func(any, string, map[string]any)) *CodexAppServerClient {
@@ -67,10 +72,16 @@ func NewCodexAppServerClient(command []string, cwd string, onNotification func(s
 	return &CodexAppServerClient{
 		Command: command, Cwd: cwd, OnNotification: onNotification, OnServerRequest: onServerRequest,
 		pending: map[int64]chan map[string]any{}, threadStatus: map[string]string{}, threadTurn: map[string]string{},
+		done: make(chan struct{}),
 	}
 }
 
 func (c *CodexAppServerClient) Start() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return CodexAppServerError{"client closed"}
+	}
 	if c.cmd != nil {
 		return nil
 	}
@@ -78,6 +89,7 @@ func (c *CodexAppServerClient) Start() error {
 	cmd := exec.CommandContext(ctx, c.Command[0], c.Command[1:]...)
 	cmd.Dir = c.Cwd
 	cmd.Stderr = io.Discard
+	configureCodexOwnedProcess(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -91,7 +103,7 @@ func (c *CodexAppServerClient) Start() error {
 	}
 	c.cmd = cmd
 	c.stdin = stdin
-	go c.readLoop(stdout)
+	go c.readLoop(stdout, cmd)
 	return nil
 }
 
@@ -99,16 +111,52 @@ func (c *CodexAppServerClient) Close() error {
 	c.mu.Lock()
 	c.closed = true
 	cmd := c.cmd
+	stdin := c.stdin
 	c.mu.Unlock()
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if cmd == nil || cmd.Process == nil {
+		c.finish(CodexAppServerError{"client closed"})
+		return nil
+	}
+	_ = signalCodexOwnedProcess(cmd.Process, false)
+	select {
+	case <-c.done:
+		return nil
+	case <-time.After(2 * time.Second):
+	}
 	if cmd != nil && cmd.Process != nil {
-		_ = cmd.Process.Kill()
+		_ = signalCodexOwnedProcess(cmd.Process, true)
+	}
+	select {
+	case <-c.done:
+	case <-time.After(2 * time.Second):
 	}
 	return nil
 }
 
+func (c *CodexAppServerClient) SetExitHandler(handler func(error)) {
+	c.mu.Lock()
+	c.OnExit = handler
+	exited, err := c.exited, c.exitErr
+	c.mu.Unlock()
+	if exited && handler != nil {
+		go handler(err)
+	}
+}
+
+func (c *CodexAppServerClient) Done() <-chan struct{} { return c.done }
+
+func (c *CodexAppServerClient) ExitError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.exitErr
+}
+
 func (c *CodexAppServerClient) Initialize(name string) error {
 	_, err := c.request("initialize", map[string]any{
-		"clientInfo":   map[string]any{"name": name, "title": name, "version": "0.0.1"},
+		"clientInfo":   map[string]any{"name": name, "title": name, "version": remoteCodingClientVersion()},
 		"capabilities": nil,
 	}, 30*time.Second)
 	if err != nil {
@@ -281,24 +329,39 @@ func (c *CodexAppServerClient) notify(method string, params map[string]any) erro
 }
 
 func (c *CodexAppServerClient) write(obj map[string]any) error {
-	if c.stdin == nil {
-		return CodexAppServerError{"client not started"}
-	}
 	b, err := json.Marshal(obj)
 	if err != nil {
 		return err
 	}
+	payload := append(b, '\n')
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	if _, err := c.stdin.Write(append(b, '\n')); err != nil {
-		return err
+	c.mu.Lock()
+	stdin, closed := c.stdin, c.closed
+	c.mu.Unlock()
+	if stdin == nil {
+		return CodexAppServerError{"client not started"}
+	}
+	if closed {
+		return CodexAppServerError{"client closed"}
+	}
+	for len(payload) > 0 {
+		n, err := stdin.Write(payload)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		payload = payload[n:]
 	}
 	return nil
 }
 
-func (c *CodexAppServerClient) readLoop(r io.Reader) {
+func (c *CodexAppServerClient) readLoop(r io.Reader, cmd *exec.Cmd) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+	var readErr error
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -306,7 +369,8 @@ func (c *CodexAppServerClient) readLoop(r io.Reader) {
 		}
 		var msg map[string]any
 		if err := json.Unmarshal(line, &msg); err != nil {
-			continue
+			readErr = CodexAppServerError{"invalid JSON from codex app-server: " + err.Error()}
+			break
 		}
 		if msg["id"] != nil && (msg["result"] != nil || msg["error"] != nil) {
 			if id, ok := numericID(msg["id"]); ok {
@@ -336,6 +400,48 @@ func (c *CodexAppServerClient) readLoop(r io.Reader) {
 			c.OnNotification(method, params)
 		}
 	}
+	if readErr == nil {
+		readErr = scanner.Err()
+	}
+	if readErr != nil && cmd.Process != nil {
+		_ = signalCodexOwnedProcess(cmd.Process, true)
+	}
+	waitErr := cmd.Wait()
+	if readErr == nil {
+		readErr = waitErr
+	}
+	if readErr == nil {
+		readErr = CodexAppServerError{"codex app-server exited"}
+	}
+	c.finish(readErr)
+}
+
+func (c *CodexAppServerClient) finish(err error) {
+	if err == nil {
+		err = CodexAppServerError{"codex app-server exited"}
+	}
+	c.doneOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		c.exited = true
+		c.exitErr = err
+		pending := c.pending
+		c.pending = map[int64]chan map[string]any{}
+		handler := c.OnExit
+		c.mu.Unlock()
+
+		msg := map[string]any{"error": map[string]any{"code": -32099, "message": err.Error()}}
+		for _, waiter := range pending {
+			select {
+			case waiter <- msg:
+			default:
+			}
+		}
+		close(c.done)
+		if handler != nil {
+			handler(err)
+		}
+	})
 }
 
 func (c *CodexAppServerClient) track(method string, params map[string]any) {

@@ -12,7 +12,7 @@ func TestLoadConfigKeepsUnknownProviderFields(t *testing.T) {
 	err := os.WriteFile(path, []byte(`{
 	  "device_id": "device-a",
 	  "providers": {
-	    "codex": {"app_name": "Codex", "command": "codex", "cwd": "~/Developer", "approval_policy": "never"}
+	    "codex": {"type": "codex", "app_name": "Codex", "command": "codex", "args": ["app-server"], "cwd": "~/Developer", "approval_policy": "never"}
 	  }
 	}`), 0o644)
 	if err != nil {
@@ -27,6 +27,13 @@ func TestLoadConfigKeepsUnknownProviderFields(t *testing.T) {
 	}
 	if got := cfg.Providers["codex"].Extra["approval_policy"]; got != "never" {
 		t.Fatalf("unknown provider field not preserved: %#v", got)
+	}
+	pc := cfg.Providers["codex"]
+	if pc.Type != "codex" || len(pc.Args) != 1 || pc.Args[0] != "app-server" {
+		t.Fatalf("typed provider fields not decoded: %#v", pc)
+	}
+	if _, ok := pc.Extra["type"]; ok {
+		t.Fatalf("typed provider field leaked into Extra: %#v", pc.Extra)
 	}
 }
 

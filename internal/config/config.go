@@ -23,8 +23,10 @@ type Config struct {
 }
 
 type ProviderConfig struct {
+	Type    string         `json:"type"`
 	AppName string         `json:"app_name"`
 	Command string         `json:"command"`
+	Args    []string       `json:"args"`
 	Cwd     string         `json:"cwd"`
 	Extra   map[string]any `json:"-"`
 }
@@ -39,8 +41,10 @@ func (p *ProviderConfig) UnmarshalJSON(b []byte) error {
 	if err := json.Unmarshal(b, &a); err != nil {
 		return err
 	}
+	delete(raw, "type")
 	delete(raw, "app_name")
 	delete(raw, "command")
+	delete(raw, "args")
 	delete(raw, "cwd")
 	*p = ProviderConfig(a)
 	p.Extra = raw

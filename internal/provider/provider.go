@@ -140,6 +140,13 @@ func BuildRegistry(cfg *config.Config) Registry {
 		}
 		if id == "codex" {
 			reg[id] = NewCodex(id, pc)
+			continue
+		}
+		if pc.Type == "pty" {
+			if pc.AppName == "" {
+				pc.AppName = id
+			}
+			reg[id] = NewPTYProvider(id, pc)
 		}
 	}
 	// Claude Desktop and standalone CLI transcripts share the same Claude
@@ -181,6 +188,20 @@ func (r Registry) IDs() []string {
 		return ids[i] < ids[j]
 	})
 	return ids
+}
+
+// Shutdown closes every provider-owned background process and connection.
+// Providers use an optional lifecycle interface so the public delivery
+// contract does not force implementations to allocate long-lived resources.
+func (r Registry) Shutdown() {
+	for _, id := range r.IDs() {
+		switch p := r[id].(type) {
+		case interface{ Shutdown() }:
+			p.Shutdown()
+		case interface{ StopCLIStream() }:
+			p.StopCLIStream()
+		}
+	}
 }
 
 func firstNonEmpty(a, b string) string {

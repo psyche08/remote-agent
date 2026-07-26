@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -66,14 +67,16 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	if err := applyListenerOverrides(cfg, *listen, *uds); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
 	stateDir := config.ResolveStateDir(cfg, baseDir)
 	store := state.New(filepath.Join(stateDir, "data"))
 	registry := provider.BuildRegistry(cfg)
+	defer registry.Shutdown()
 	apiSrv := api.NewServer(cfg, registry, store)
-	if claude, ok := registry["claude"].(interface{ StopCLIStream() }); ok {
-		defer claude.StopCLIStream()
-	}
-	apiSrv.StartBackgroundWithAutoUpdate(*listen == "")
+	apiSrv.StartBackgroundWithOptions(*listen == "", *listen == "" || *uds != "")
 	defer apiSrv.StopBackground()
 	srv := &http.Server{Handler: apiSrv.Handler()}
 
@@ -87,6 +90,33 @@ func run(args []string) int {
 		return serveUnix(srv, cfg.UDS)
 	}
 	return serveTCP(srv, cfg.Host+":"+strconv.Itoa(cfg.Port))
+}
+
+func applyListenerOverrides(cfg *config.Config, listen string, uds string) error {
+	if cfg == nil {
+		return errors.New("nil config")
+	}
+	if uds != "" {
+		cfg.UDS = uds
+		return nil
+	}
+	if listen == "" {
+		return nil
+	}
+	cfg.UDS = ""
+	host, portText, err := net.SplitHostPort(listen)
+	if err != nil {
+		return fmt.Errorf("invalid -listen address: %w", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 0 || port > 65535 {
+		return fmt.Errorf("invalid -listen port: %s", portText)
+	}
+	cfg.Host = host
+	if port != 0 {
+		cfg.Port = port
+	}
+	return nil
 }
 
 func runUpdate(args []string) int {

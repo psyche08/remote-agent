@@ -6,7 +6,9 @@ Python provider、Claude Desktop wrapper/broker 和 tmux backend 已从仓库删
 
 ## 结论先行
 
-- 生产 registry 对外只有两个完整 provider：`claude` 和 `codex`。
+- 生产 registry 始终提供内置 `claude` 和 `codex`，并可从配置注册能力受限的
+  generic PTY provider。每个自定义 provider 都拥有独立的 provider id 和会话
+  命名空间。
 - `claude_cli`、`claude_desktop` 是旧数据和旧客户端的兼容别名，API 会把它们
   归一化为 `claude`；它们不是独立 provider，也不拥有独立会话命名空间。
 - Claude Desktop 和 CLI 的发现数据按同一个 Claude transcript UUID 合并，但
@@ -38,6 +40,9 @@ flowchart LR
     Codex --> DesktopIPC["Codex Desktop owner/follower IPC"]
     AppServer --> Rollout["~/.codex rollout JSONL"]
     DesktopIPC --> Rollout
+
+    Registry --> GenericPTY["configured generic PTY provider"]
+    GenericPTY --> PTYChild["one fixed CLI + PTY per logical session"]
 ```
 
 `cmd/remote-agent/main.go` 只负责加载 config/state、调用
@@ -52,9 +57,10 @@ tab 状态。
 1. 配置中的 `claude`、`claude_cli`、`claude_desktop` 不逐个注册。
 2. 优先读取旧的 `claude_cli` 配置，否则读取 `claude` 配置，最终只注册
    `reg["claude"] = NewClaudeCLI(...)`。
-3. `codex` 注册为 Go `NewCodex(...)`；未配置时也会补一个默认实例。
-4. 其他自定义 id 不注册；当前 registry contract 明确只支持 Claude 和 Codex。
-5. provider 展示顺序固定为 `codex`、`claude`。
+3. 其他配置项声明 `"type": "pty"` 时，注册 generic PTY provider；只执行固定
+   `command` + `args`，不经 shell，也不会继承 structured approval/steer 等能力。
+4. `codex` 注册为 Go `NewCodex(...)`；未配置时也会补一个默认实例。
+5. provider 展示顺序为 `codex`、`claude`，随后按 id 排列自定义 provider。
 
 API 层的 `canonicalProviderID` 把旧 id `claude_cli` / `claude_desktop` 映射到
 `claude`。兼容只发生在边界层；新配置、新 session record 和新前端状态都应写
@@ -84,6 +90,11 @@ Go `Provider` 接口要求实现：
 | 消息回退重发 | `UserMessageRewinder` | Codex thread rollback 后创建新 logical session |
 | 实时事件 | `SetStreamPublisher(...)` | provider event 转到 session-scoped WebSocket |
 
+`/providers` 同时返回旧的 boolean `capabilities` 和闭集的 typed `actions`。每个
+action 明确 `endpoint`、`scope`、`risk`、`supported`；PWA 的 steer/interrupt 等
+控件优先按 typed action 渲染。这样 generic PTY 不会因为实现了基础接口，就被误认
+为支持审批、问题、附件或 model 操作。
+
 ## 会话身份与数据层
 
 一个用户可见会话同时存在三类 id。它们不能混用：
@@ -91,7 +102,7 @@ Go `Provider` 接口要求实现：
 | 字段 | 所有者 | 作用 |
 |---|---|---|
 | `device_id` | 部署实例 | Mac/账号隔离边界 |
-| `provider_id` | registry | canonical provider：`claude` 或 `codex` |
+| `provider_id` | registry | canonical provider：内置 `claude` / `codex` 或配置的 PTY provider id |
 | `session_id` | remote-agent | PWA/API 使用的 logical session id，也是任务、附件和控制操作的主键 |
 | `native_session_id` | provider runtime | Claude transcript UUID 或 Codex thread UUID；表示可激活的 native handle |
 | `transcript_id` | durable read side | transcript/rollout 的合并键；通常与 native id 相同，但语义上是持久读侧 |
@@ -125,6 +136,12 @@ API 查找和所有 mutating control 仍必须带 provider scope，并在调用 
 优先，stored record 的 logical `session_id`、title、cwd 等用户状态优先。这样重启后
 即使 provider 内存映射丢失，仍能把运行中的 native owner 归回原 logical session。
 
+Codex rollout/app-server/Desktop metadata 若声明 `source.subagent`、
+`parent_thread_id` / `parentThreadId` 或 `thread_source=subagent`，该 child thread
+会标记 `hidden_from_lists`。普通 `/sessions`、`/native_sessions`、
+`/live_sessions` 和无精确 task/session id 的 `/tasks` 不展示它；带精确 id 的查询、
+preview、恢复、发送与控制仍保留。
+
 `active_provider` / `active_session_id` 只表示该 agent 当前 UI 默认选择，不是 owner
 或授权边界。多 tab 和多设备请求应始终显式传 `provider_id`、`session_id`。
 
@@ -133,7 +150,11 @@ API 查找和所有 mutating control 仍必须带 provider scope，并在调用 
 ### 读路径
 
 1. `/providers` 从 registry 读取安装状态、capabilities 和 model selector。
-2. `/native_sessions` 调 provider discovery，并使用短时 cache 避免昂贵扫描阻塞请求。
+2. `/native_sessions` 调 provider discovery，并使用 last-good cache 避免昂贵扫描
+   阻塞请求（Codex 5 秒 refresh cadence，其他 provider 15 秒）。`refresh=1` 只启动
+   single-flight 后台刷新并立即返回旧快照；
+   `generation`、`refreshing`、`refreshed_at`、`refresh_error` 让客户端完成
+   stale-while-revalidate。失败或 panic 不替换 last-good 数据，也不推进 generation。
 3. `/session_preview` 先恢复 logical/native 绑定，再从 provider 的 durable read side
    读取规范化消息。
 4. `/status?provider_id=&session_id=` 以 pending request 和 session-running 结果覆盖
@@ -197,20 +218,57 @@ Claude discovery 同时读取：
 - transcript 中遗留但原 stdio callback 已消失的问题可以展示，但必须标记为不可操作，
   不能把答案发给一个新 owner 冒充旧 callback。
 
+## Generic PTY provider
+
+`"type":"pty"` 是没有 structured API 时的 fallback，不替代 Claude stream-json 或
+Codex app-server/Desktop IPC：
+
+- 一个 logical session 只拥有一个固定 `command` + `args` child 和一个 PTY；
+  provider 使用 `exec.Command`，不执行 shell expansion。
+- prompt 追加配置的 `prompt_suffix` 后写入 PTY；output 会移除终端 control
+  sequence，并限制总字节与 preview history。
+- 同一 session 在当前 turn 未完成时拒绝第二次 prompt；child 退出后关闭 master
+  fd，退出后的 preview 仅按 `max_sessions` 有界保留。
+- turn completion 没有协议级确认，只能以 `ready_pattern` 或
+  `idle_timeout_ms` 的静默窗口做 best-effort 判断。
+- structured approval/question、attachment、steer、native resume 和 model control
+  都不支持。raw keys 默认关闭；interrupt 只发送配置的
+  `interrupt_sequence`。
+
 ## Codex provider
 
 ### Discovery 与 read side
 
 生产实例是 `NewCodex("codex", ...)`，backend 为 `codex_app_server_go`。
-默认优先使用 Codex.app 内置 binary，然后才是 `$PATH`。
+默认优先使用 ChatGPT.app 内置 Codex binary，其次兼容旧的 Codex.app，最后才是
+`$PATH`。
 
 - `/native_sessions` 以 app-server `thread/list` 为主，再按 thread UUID 合并本地
   `~/.codex` index 和 rollout JSONL；app-server 不可用时仍返回本地结果。
+- `thread/list` 优先使用
+  `limit=200,useStateDbOnly=true,sortKey=recency_at,sortDirection=desc`，并只请求
+  interactive source kinds；旧版本明确返回 invalid params 时才降级一次并记忆。
+- rollout discovery 以 `{path,size,mtime}` 增量缓存 cwd/subagent metadata，只读文件
+  头部，不在列表热路径解析每个 rollout tail，也不为 `HiddenSessionIDs` 重复扫描。
 - `/session_preview` 先读本地 rollout，避免轮询请求被 app-server resume 卡住；仅当
   rollout 尚未落盘时才做最多 2 秒的 `thread/resume` fallback。
 - headless app-server notification 会发布到 logical `session_id` 和 native thread id。
 - Desktop-owned turn 的正文由 PWA 定时 live-tail `/session_preview`；Desktop follower
   bridge 负责 owner、running、settings 和 pending human request，不伪造正文 delta。
+
+### App-server 连接与终态
+
+- 每个 owned `codex app-server` 子进程都有单调递增的 connection generation。
+  EOF、非法 JSON 或进程退出会立即唤醒所有 pending RPC、回收进程组，并只清理同一
+  代 client；旧 read loop/exit callback 不能污染新连接。
+- `turn/start` 返回后会登记 `turn_id → thread_id`。缺少 thread id 的通知只能通过
+  这个精确映射恢复，不能回退到 provider-global “最后一个 thread”。
+- approval/question 的 JSON-RPC response 写入仅代表传输完成。内部请求从
+  `pending` 进入 `responding`，只有同类型 request id 的
+  `serverRequest/resolved` 或 thread terminal 才会删除路由；数字 `7` 与字符串
+  `"7"` 保持为不同 request id。
+- `turn/interrupt` ACK 只进入 `cancellation_requested`，active route 保留到
+  `turn/completed` 或 terminal thread status。
 
 ### 两条 delivery route
 
@@ -270,6 +328,10 @@ request。两条 route 最终都以 `(thread_id, request_id)` 跟踪，某个 th
    兼容 fallback，不能成为新调用方式。
 7. provider 的 durable read side 与 live control side 可以不同，但必须通过同一个
    transcript/thread id 汇合，并在重启后可由 stored record 恢复。
+8. generic PTY 只能声明自己实际支持的受限 action；best-effort terminal control
+   不得冒充 structured approval、owner routing 或 durable transcript。
+9. subagent session 只从普通列表隐藏，不删除、不改变 owner，也不阻断精确 id
+   的内部/直接访问。
 
 ## 代码导航
 
@@ -279,6 +341,8 @@ request。两条 route 最终都以 `(thread_id, request_id)` 跟踪，某个 th
 | provider id 兼容、logical/native hydration | `internal/api/helpers.go` |
 | session、send、resume、live merge、WebSocket | `internal/api/server.go` |
 | pending approval 聚合 | `internal/api/approvals.go` |
+| typed actions、generic PTY | `internal/provider/actions.go`、`internal/provider/pty.go` |
+| subagent session visibility | `internal/provider/codex_visibility.go`、`internal/api/session_visibility.go` |
 | Claude discovery、handoff、控制 | `internal/provider/claude.go`、`internal/provider/claude_process.go`、`internal/provider/claude_stream.go` |
 | Codex discovery、route、app-server | `internal/provider/codex.go`、`internal/provider/codex_app_server.go` |
 | Codex Desktop owner/follower | `internal/provider/codex_desktop_ipc.go`、`internal/provider/codex_desktop_bridge.go` |

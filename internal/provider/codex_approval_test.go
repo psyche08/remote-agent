@@ -122,6 +122,92 @@ func TestCodexRequestScopedApprovalAndStale(t *testing.T) {
 	}
 }
 
+func TestCodexAppServerResponseWaitsForSourceResolution(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindTranscript("sess-a", approvalThreadA)
+	c.onServerRequest(float64(13), "item/commandExecution/requestApproval", commandApprovalParams(approvalThreadA, nil))
+
+	res := c.RelayApprovalRequest("sess-a", "13", "allow")
+	if !boolAny(res["ok"]) || res["status"] != "responding" || boolAny(res["confirmed"]) {
+		t.Fatalf("response write was reported as source-confirmed: %#v", res)
+	}
+	if request := c.ApprovalRequest("sess-a"); request != nil {
+		t.Fatalf("responding request must not remain actionable: %#v", request)
+	}
+	c.approvalMu.Lock()
+	pending := append([]*codexPendingApproval(nil), c.approvalsByThread[approvalThreadA]...)
+	c.approvalMu.Unlock()
+	if len(pending) != 1 || !pending[0].Responding {
+		t.Fatalf("request route was discarded before serverRequest/resolved: %#v", pending)
+	}
+
+	c.onNotification("serverRequest/resolved", map[string]any{
+		"threadId": approvalThreadA, "requestId": float64(13),
+	})
+	c.approvalMu.Lock()
+	remaining := len(c.approvalsByThread[approvalThreadA])
+	c.approvalMu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("source-confirmed request was not removed: %d", remaining)
+	}
+}
+
+func TestCodexTypedRequestIDsDoNotCollide(t *testing.T) {
+	c := testCodexWithClient(t, newFakeCodexClient())
+	c.BindTranscript("sess-a", approvalThreadA)
+	c.onServerRequest(float64(7), "item/commandExecution/requestApproval", commandApprovalParams(approvalThreadA, map[string]any{"itemId": "numeric"}))
+	c.onServerRequest("7", "item/commandExecution/requestApproval", commandApprovalParams(approvalThreadA, map[string]any{"itemId": "string"}))
+
+	if res := c.RelayApprovalRequest("sess-a", "7", "allow"); res["status"] != "ambiguous" || boolAny(res["ok"]) {
+		t.Fatalf("display-id collision must fail closed: %#v", res)
+	}
+	c.onNotification("serverRequest/resolved", map[string]any{
+		"threadId": approvalThreadA, "requestId": float64(7),
+	})
+	c.approvalMu.Lock()
+	pending := append([]*codexPendingApproval(nil), c.approvalsByThread[approvalThreadA]...)
+	c.approvalMu.Unlock()
+	if len(pending) != 1 || pending[0].RouteKey != "s:7" || pending[0].ItemID != "string" {
+		t.Fatalf("numeric resolution removed the string request: %#v", pending)
+	}
+}
+
+func TestCodexTypedQuestionIDsFailClosedWhenDisplayIDAmbiguous(t *testing.T) {
+	fc := newFakeCodexClient()
+	c := testCodexWithClient(t, fc)
+	c.BindTranscript("sess-a", approvalThreadA)
+	question := func(itemID string) map[string]any {
+		return map[string]any{
+			"threadId": approvalThreadA, "turnId": "turn-a", "itemId": itemID,
+			"questions": []any{map[string]any{
+				"id": "q-color", "header": "Color", "question": "Pick a color",
+			}},
+		}
+	}
+	c.onServerRequest(float64(7), "item/tool/requestUserInput", question("numeric"))
+	c.onServerRequest("7", "item/tool/requestUserInput", question("string"))
+
+	res := c.AnswerQuestion("sess-a", "7", map[string]string{"q-color": "red"})
+	if res["status"] != "ambiguous" || boolAny(res["ok"]) {
+		t.Fatalf("display-id collision must fail closed: %#v", res)
+	}
+	if len(fc.respondedIDs) != 0 {
+		t.Fatalf("ambiguous question reached app-server: %#v", fc.respondedIDs)
+	}
+
+	c.onNotification("serverRequest/resolved", map[string]any{
+		"threadId": approvalThreadA, "requestId": float64(7),
+	})
+	res = c.AnswerQuestion("sess-a", "7", map[string]string{"q-color": "red"})
+	if !boolAny(res["ok"]) {
+		t.Fatalf("remaining typed question was not answerable: %#v", res)
+	}
+	if len(fc.respondedIDs) != 1 || fc.respondedIDs[0] != "7" {
+		t.Fatalf("answer used the wrong typed request id: %#v", fc.respondedIDs)
+	}
+}
+
 // Requirement: allow/deny wire shapes for the new protocol, including
 // availableDecisions constraints.
 func TestCodexApprovalResponseShapes(t *testing.T) {
@@ -294,6 +380,16 @@ func TestCodexDesktopBridgeApprovalLifecycle(t *testing.T) {
 	got := b.PendingHumanRequests(approvalThreadA)
 	if len(got) != 1 || canonicalRequestKey(got[0].ID) != "47" || got[0].Method != "item/commandExecution/requestApproval" {
 		t.Fatalf("approval request not mirrored from patches: %#v", got)
+	}
+	if got[0].Instance == "" || b.PendingHumanRequests(approvalThreadA)[0].Instance != got[0].Instance {
+		t.Fatalf("approval request instance must be non-empty and stable: %#v", got)
+	}
+	firstInstance := got[0].Instance
+	b.mu.Lock()
+	b.clientID = "reconnected-client"
+	b.mu.Unlock()
+	if reconnected := b.PendingHumanRequests(approvalThreadA); len(reconnected) != 1 || reconnected[0].Instance == firstInstance {
+		t.Fatalf("bridge reconnect must create a new request instance: %#v", reconnected)
 	}
 	if b.OwnerClient(approvalThreadA) != owner {
 		t.Fatalf("owner not tracked")

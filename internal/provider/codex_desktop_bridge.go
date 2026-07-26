@@ -1,6 +1,8 @@
 package provider
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"math"
 	"net"
@@ -177,7 +179,7 @@ func codexBridgeInitialize(conn net.Conn) (string, []map[string]any, error) {
 		"version": 0, "method": "initialize",
 		"params": map[string]any{
 			"clientType": "remote-agent",
-			"clientInfo": map[string]any{"name": "remote-agent", "title": "remote-agent", "version": "0.0.1"},
+			"clientInfo": map[string]any{"name": "remote-agent", "title": "remote-agent", "version": remoteCodingClientVersion()},
 		},
 	}); err != nil {
 		return "", nil, err
@@ -459,9 +461,10 @@ func (b *codexDesktopBridge) HasThread(threadID string) bool {
 // codexBridgeRequest is one pending human request mirrored from the owner's
 // conversation state.
 type codexBridgeRequest struct {
-	ID     any
-	Method string
-	Params map[string]any
+	ID       any
+	Method   string
+	Params   map[string]any
+	Instance string
 }
 
 // PendingHumanRequests lists the thread's outstanding approval/input server
@@ -481,9 +484,19 @@ func (b *codexDesktopBridge) PendingHumanRequests(threadID string) []codexBridge
 		if !codexHumanRequestMethod(method) {
 			continue
 		}
-		out = append(out, codexBridgeRequest{ID: req["id"], Method: method, Params: mapAny(req["params"])})
+		params := mapAny(req["params"])
+		out = append(out, codexBridgeRequest{
+			ID: req["id"], Method: method, Params: params,
+			Instance: codexBridgeRequestInstance(b.clientID, th.owner, req["id"], method, params),
+		})
 	}
 	return out
+}
+
+func codexBridgeRequestInstance(connectionID string, owner string, id any, method string, params map[string]any) string {
+	payload, _ := json.Marshal([]any{connectionID, owner, id, method, params})
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:16])
 }
 
 // ThreadSettings reports the thread's real effective settings as owned by
@@ -588,6 +601,7 @@ func (b *codexDesktopBridge) LiveThreadRows() []map[string]any {
 		if th.owner != "" {
 			row["desktop_owner_client_id"] = th.owner
 		}
+		markCodexSessionVisibility(row, th.state)
 		rows = append(rows, row)
 	}
 	sortByUpdated(rows)

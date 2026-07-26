@@ -4,9 +4,19 @@ import (
 	"errors"
 	"sort"
 	"strings"
+
+	"github.com/psyche08/remote-agent/internal/buildinfo"
 )
 
 const codexAppServerSource = "codex_app_server"
+
+func remoteCodingClientVersion() string {
+	version := strings.TrimSpace(buildinfo.Version)
+	if version == "" {
+		return "dev"
+	}
+	return version
+}
 
 func codexThreadListToSessions(result any) []map[string]any {
 	out := []map[string]any{}
@@ -38,7 +48,7 @@ func codexThreadToSession(thread map[string]any) map[string]any {
 	gitInfo := mapAny(thread["gitInfo"])
 	status := codexThreadStatus(thread)
 	lastReplyAt := codexThreadLastReplyAt(turns)
-	return map[string]any{
+	row := map[string]any{
 		"native_session_id": tid,
 		"cli_session_id":    tid,
 		"title":             codexThreadTitle(thread),
@@ -52,12 +62,14 @@ func codexThreadToSession(thread map[string]any) map[string]any {
 		"live":              status == "active",
 		"created_at":        codexTimestampISO(thread["createdAt"]),
 		"updated_at": codexTimestampISO(firstValue(
-			firstValue(thread["updatedAt"], thread["recencyAt"]),
+			firstValue(thread["recencyAt"], thread["updatedAt"]),
 			thread["createdAt"],
 		)),
 		"last_reply_at": nullableString(lastReplyAt),
 		"source":        codexAppServerSource,
 	}
+	markCodexSessionVisibility(row, thread)
+	return row
 }
 
 func codexThreadLastReplyAt(turns []map[string]any) string {

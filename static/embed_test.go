@@ -95,6 +95,97 @@ func TestDeviceUISynchronizesSessionDeviceAndProvider(t *testing.T) {
 	}
 }
 
+func TestDeviceUISessionRefreshConvergesWithoutStaleOverwrite(t *testing.T) {
+	body, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := string(body)
+	for _, want := range []string{
+		`const SESSION_REFRESH_FLIGHTS = new Map()`,
+		`const SESSION_REFRESH_RETRY_MS = [250, 500, 1000, 2000]`,
+		`const SESSION_REFRESH_TIMEOUT_MS = 5000`,
+		`const SESSION_REFRESH_POLL_MS = 5000`,
+		`controller: new AbortController()`,
+		`force: options.force === true`,
+		`flight.force && attempt === 0 ? "&refresh=1" : ""`,
+		`function sessionRefreshIsCurrent(flight)`,
+		`SESSION_REFRESH_META = nativeRefreshMeta(body)`,
+		`body && body.refreshed_at`,
+		`body && body.source`,
+		`SESSION_REFRESH_META.refreshing`,
+		`livePromise = refreshLiveSessionsFor(flight)`,
+		`setInterval(refreshSessionsIfVisible, SESSION_REFRESH_POLL_MS)`,
+		`document.visibilityState === "visible"`,
+		`s.hidden_from_lists !== true && s.subagent !== true`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Fatalf("device UI missing convergent session refresh behavior %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		`const [nres, lres] = await Promise.all`,
+		`refreshProviders(); refreshSessions();`,
+	} {
+		if strings.Contains(ui, forbidden) {
+			t.Fatalf("device UI retains duplicate/blocking session refresh behavior %q", forbidden)
+		}
+	}
+}
+
+func TestDeviceUISortsAllSessionsGloballyAndUsesDeviceTimeZone(t *testing.T) {
+	body, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := string(body)
+	for _, want := range []string{
+		`function combinedVisibleSessions(pid)`,
+		`existing.last_reply_at = newerSessionTimestamp(existing.last_reply_at, row.last_reply_at)`,
+		`.sort(compareSessionsNewest)`,
+		`const isLive = s._session_list_live === true`,
+		`function sessionDeviceTimeMeta(body)`,
+		`SESSION_REFRESH_META = { ...SESSION_REFRESH_META, device_time: deviceTime }`,
+		`new Intl.DateTimeFormat("en-CA",`,
+		`timeZone, year: "numeric"`,
+		`deviceTime.utc_offset_minutes`,
+		`timestampOwnOffsetMinutes(value)`,
+		`date.getUTCFullYear()`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Fatalf("device UI missing global session ordering/device-time behavior %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		`g.className = "live-grp"`,
+		`sessionSortAt(s).slice(0, 16)`,
+		`sessionSortAt(b).localeCompare(sessionSortAt(a))`,
+	} {
+		if strings.Contains(ui, forbidden) {
+			t.Fatalf("device UI retains grouped/browser-time session behavior %q", forbidden)
+		}
+	}
+}
+
+func TestDeviceUIUsesTypedActionsAndConfirmedTerminalStates(t *testing.T) {
+	body, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := string(body)
+	for _, want := range []string{
+		`ACTIVE_ACTIONS`,
+		`actionSupported("turn.steer", "steer")`,
+		`actionSupported("turn.interrupt", "interrupt")`,
+		`r.confirmed === false ? "已请求停止，等待 Codex 确认终态…"`,
+		"r.confirmed === false ? `'${decision}' 已发送，等待 Codex 确认…`",
+	} {
+		if !strings.Contains(ui, want) {
+			t.Fatalf("device UI missing typed action/terminal behavior %q", want)
+		}
+	}
+}
+
 func TestDeviceUIRefreshesReconnectedDevicesAndUsesNewestFallback(t *testing.T) {
 	body, err := os.ReadFile("index.html")
 	if err != nil {

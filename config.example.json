@@ -21,6 +21,20 @@
       "app_name": "Codex",
       "command": "codex",
       "cwd": "~/Developer"
+    },
+    "terminal-agent": {
+      "type": "pty",
+      "app_name": "Terminal Agent",
+      "command": "agent-cli",
+      "args": ["--interactive"],
+      "cwd": "~/Developer",
+      "prompt_suffix": "\r",
+      "interrupt_sequence": "\u0003",
+      "idle_timeout_ms": 1500,
+      "ready_pattern": "(?m)^> $",
+      "allow_raw_keys": false,
+      "max_output_bytes": 262144,
+      "max_sessions": 32
     }
   }
 }
