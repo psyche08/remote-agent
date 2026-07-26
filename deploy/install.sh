@@ -22,6 +22,8 @@
 #     --uds PATH             socket path (default: /opt/private-tunnel/state/remote-agent/sockets/backend.sock)
 #     --agent-config PATH    retired; ingress is owned by private-edge profiles
 #     --etc DIR              supervisor config dir (default: /opt/private-tunnel/etc)
+#     --update-relay-url URL persist RC_UPDATE_RELAY_URL for manifest polling
+#     --update-cert-dir DIR  persist RC_UPDATE_CERT_DIR for updater mTLS certs
 #     --log-user USER        private-tunnel user id for log upload cert discovery
 #     --log-cert-dir DIR     client certificate dir for log upload
 set -euo pipefail
@@ -53,6 +55,12 @@ ensure_runtime_dir() {
   sudo -n install -d -o "$(id -un)" -g staff -m 0755 "$dir"
 }
 
+yaml_quote() {
+  printf "'"
+  printf '%s' "$1" | sed "s/'/''/g"
+  printf "'"
+}
+
 DEVICE_ID="${1:?usage: install.sh DEVICE_ID [--devices a,b] [--uds path] [--agent-config path]}"
 shift || true
 
@@ -72,6 +80,8 @@ LOG_UPLOAD=1
 LOG_USER="${RC_LOG_UPLOAD_USER:-}"
 LOG_CERT_DIR="${RC_LOG_UPLOAD_CERT_DIR:-}"
 LOG_RELAY_URL="${RC_LOG_UPLOAD_RELAY_URL:-}"
+UPDATE_RELAY_URL="${RC_UPDATE_RELAY_URL:-}"
+UPDATE_CERT_DIR="${RC_UPDATE_CERT_DIR:-}"
 LOG_NAMESPACE="${RC_LOG_UPLOAD_NAMESPACE:-remocoding}"
 LOG_INTERVAL="${RC_LOG_UPLOAD_INTERVAL:-60s}"
 LOG_MAX_CHUNK="${RC_LOG_UPLOAD_MAX_CHUNK:-1048576}"
@@ -87,6 +97,8 @@ while [ $# -gt 0 ]; do
     --agent-config) echo "--agent-config is retired; deploy/update private-edge instead" >&2; exit 2 ;;
     --etc) ETC_DIR="$2"; shift 2 ;;
     --port) PORT="$2"; shift 2 ;;
+    --update-relay-url) UPDATE_RELAY_URL="$2"; shift 2 ;;
+    --update-cert-dir) UPDATE_CERT_DIR="$2"; shift 2 ;;
     --no-log-upload) LOG_UPLOAD=0; shift ;;
     --log-user) LOG_USER="$2"; shift 2 ;;
     --log-cert-dir) LOG_CERT_DIR="$2"; shift 2 ;;
@@ -290,6 +302,19 @@ fi
   echo "      - --config"
   echo "      - $CFG"
   echo "    cwd: $LIBEXEC_DIR"
+  if [ -n "$UPDATE_RELAY_URL" ] || [ -n "$UPDATE_CERT_DIR" ]; then
+    echo "    env:"
+    if [ -n "$UPDATE_RELAY_URL" ]; then
+      printf "      RC_UPDATE_RELAY_URL: "
+      yaml_quote "$UPDATE_RELAY_URL"
+      printf "\n"
+    fi
+    if [ -n "$UPDATE_CERT_DIR" ]; then
+      printf "      RC_UPDATE_CERT_DIR: "
+      yaml_quote "$UPDATE_CERT_DIR"
+      printf "\n"
+    fi
+  fi
   if [ "$LOG_UPLOAD" = "1" ]; then
     echo "  remote-agent-log-upload:"
     echo "    cmd:"

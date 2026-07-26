@@ -315,9 +315,12 @@ The security boundary is the local UDS/filesystem permission plus
 private-tunnel **mTLS**. Never expose port 8765 directly.
 
 Auto-update and log upload are opt-in in the public repository. Set
-`RC_UPDATE_RELAY_URL` to enable manifest polling. Pass `--log-relay-url` (or
-set `RC_LOG_UPLOAD_RELAY_URL`) when installing with log upload, or use
-`deploy/install.sh <device> --no-log-upload`.
+`RC_UPDATE_RELAY_URL` while running `deploy/install.sh`, or pass
+`--update-relay-url`, to persist manifest polling in the `remote-agent`
+supervisor drop-in. Set `RC_UPDATE_CERT_DIR` or pass `--update-cert-dir` when
+the updater's mTLS certificates are outside its default discovery paths.
+Pass `--log-relay-url` (or set `RC_LOG_UPLOAD_RELAY_URL`) when installing with
+log upload, or use `deploy/install.sh <device> --no-log-upload`.
 
 ## Test
 
