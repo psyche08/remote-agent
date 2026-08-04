@@ -772,7 +772,7 @@ func TestCodexInstalledDetection(t *testing.T) {
 		t.Fatal("codex must report not installed for a missing binary")
 	}
 	bin := filepath.Join(t.TempDir(), "codex")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true}'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	present := NewCodex("codex", config.ProviderConfig{
@@ -847,8 +847,8 @@ func TestCodexScopedStateDoesNotLeakFromAnotherThread(t *testing.T) {
 	}
 }
 
-// Requirement: a device without any Claude Desktop CLI / PATH claude hides
-// the claude providers.
+// Requirement: a device without an authenticated Claude CLI hides the Claude
+// provider, even when the binary itself exists.
 func TestClaudeInstalledDetection(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -857,7 +857,7 @@ func TestClaudeInstalledDetection(t *testing.T) {
 		t.Fatal("claude must report not installed for a missing binary")
 	}
 	bin := filepath.Join(t.TempDir(), "claude")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true}'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	present := NewClaudeCLI("claude", config.ProviderConfig{Command: bin})
@@ -868,12 +868,20 @@ func TestClaudeInstalledDetection(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(userBin), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(userBin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	if err := os.WriteFile(userBin, []byte("#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true}'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", t.TempDir())
 	userInstalled := NewClaudeCLI("claude", config.ProviderConfig{Command: "claude"})
 	if got := userInstalled.resolveCommand(); got != userBin {
 		t.Fatalf("bare claude command resolved to %q, want standard user install %q", got, userBin)
+	}
+	loggedOutBin := filepath.Join(t.TempDir(), "claude")
+	if err := os.WriteFile(loggedOutBin, []byte("#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":false}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	loggedOut := NewClaudeCLI("claude", config.ProviderConfig{Command: loggedOutBin})
+	if loggedOut.Installed() || loggedOut.Status().Installed {
+		t.Fatal("unauthenticated Claude CLI provider must stay hidden")
 	}
 }

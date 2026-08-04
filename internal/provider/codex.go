@@ -141,6 +141,18 @@ func NewCodex(id string, cfg config.ProviderConfig) *Codex {
 		desktopRefreshAt:        map[string]time.Time{},
 		lastState:               "idle",
 	}
+	// Default transport selection is capability-based. Keep the managed shared
+	// daemon when it is installed; otherwise use a locally available Desktop or
+	// CLI executable with the stdio app-server. An explicitly configured
+	// transport remains strict and never silently changes owner semantics.
+	if strings.TrimSpace(stringExtra(cfg.Extra, "app_server_transport", "")) == "" {
+		if _, err := c.resolveSharedDaemonCommand(); err != nil && c.resolveCommand() != "" {
+			c.appServerTransport = "stdio"
+			if c.nativeDeliveryRoute == "shared_daemon" {
+				c.nativeDeliveryRoute = "desktop_ipc"
+			}
+		}
+	}
 	return c
 }
 
@@ -190,9 +202,9 @@ func codexAppServerTransport(transport string) string {
 	return "shared_daemon"
 }
 
-// Installed reports whether the configured transport has its required Codex
-// executable. Shared mode requires the official managed standalone layout;
-// legacy stdio mode accepts the Desktop bundle or PATH.
+// Installed reports whether the selected transport has its required Codex
+// executable. Authentication is owned by Codex/ChatGPT's shared CODEX_HOME;
+// remote-agent does not require a second provider-specific login.
 func (c *Codex) Installed() bool {
 	if c.appServerTransport == "shared_daemon" {
 		_, err := c.resolveSharedDaemonCommand()
@@ -2082,7 +2094,34 @@ func (c *Codex) resolveCommand() string {
 	if p, err := exec.LookPath(strings.Fields(c.command)[0]); err == nil {
 		return p
 	}
+	name := strings.Fields(c.command)[0]
+	if !strings.ContainsRune(name, filepath.Separator) {
+		candidates := []string{}
+		if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
+			candidates = append(candidates, filepath.Join(expandUser(codexHome), "packages", "standalone", "current", "codex"))
+		}
+		if home, err := os.UserHomeDir(); err == nil && strings.TrimSpace(home) != "" {
+			candidates = append(candidates,
+				filepath.Join(home, ".codex", "packages", "standalone", "current", "codex"),
+				filepath.Join(home, ".local", "bin", name),
+			)
+		}
+		candidates = append(candidates,
+			filepath.Join("/opt/homebrew/bin", name),
+			filepath.Join("/usr/local/bin", name),
+		)
+		for _, candidate := range dedupeStrings(candidates) {
+			if executableFile(candidate) {
+				return candidate
+			}
+		}
+	}
 	return ""
+}
+
+func executableFile(path string) bool {
+	st, err := os.Stat(path)
+	return err == nil && st.Mode().IsRegular() && st.Mode().Perm()&0o111 != 0
 }
 
 func (c *Codex) resolveSharedDaemonCommand() (string, error) {

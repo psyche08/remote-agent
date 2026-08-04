@@ -42,11 +42,12 @@ var cst = time.FixedZone("UTC+8", 8*60*60)
 // Manifest is assets/release/manifest.json on the relay — the single source
 // of truth for what every device should be running.
 type Manifest struct {
-	Commit       string              `json:"commit"`
-	BuiltAt      string              `json:"built_at"`
-	Binaries     map[string]Artifact `json:"binaries"`
-	UpdateScript Artifact            `json:"update_script"`
-	Assets       []Artifact          `json:"assets,omitempty"`
+	ModuleVersion int                 `json:"module_version,omitempty"`
+	Commit        string              `json:"commit"`
+	BuiltAt       string              `json:"built_at"`
+	Binaries      map[string]Artifact `json:"binaries"`
+	UpdateScript  Artifact            `json:"update_script"`
+	Assets        []Artifact          `json:"assets,omitempty"`
 }
 
 // Artifact is one downloadable file, path relative to assets/release/.

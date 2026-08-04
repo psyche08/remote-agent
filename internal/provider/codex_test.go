@@ -1966,6 +1966,40 @@ func TestResolveDesktopCodexSupportsChatGPTBundle(t *testing.T) {
 	}
 }
 
+func TestCodexDefaultTransportFallsBackToDiscoveredCLI(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PATH", t.TempDir())
+	bin := filepath.Join(home, ".local", "bin", "codex")
+	if err := os.MkdirAll(filepath.Dir(bin), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := NewCodex("codex", config.ProviderConfig{
+		Command: "codex",
+		Extra:   map[string]any{"prefer_desktop_codex": false},
+	})
+	if got := c.resolveCommand(); got != bin {
+		t.Fatalf("resolved Codex=%q want=%q", got, bin)
+	}
+	if !c.Installed() || c.AppServerDeliveryRoute() != "stdio" {
+		t.Fatalf("default transport did not fall back: installed=%v route=%q", c.Installed(), c.AppServerDeliveryRoute())
+	}
+
+	strict := NewCodex("codex", config.ProviderConfig{
+		Command: "codex",
+		Extra: map[string]any{
+			"prefer_desktop_codex": false,
+			"app_server_transport": "shared_daemon",
+		},
+	})
+	if strict.Installed() || strict.AppServerDeliveryRoute() != "shared_daemon" {
+		t.Fatalf("explicit shared daemon silently fell back: installed=%v route=%q", strict.Installed(), strict.AppServerDeliveryRoute())
+	}
+}
+
 func TestCodexResumeRejectsThreadAndCwdRouteMismatch(t *testing.T) {
 	fc := newFakeCodexClient()
 	c := testCodexWithClient(t, fc)

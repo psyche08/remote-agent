@@ -111,7 +111,29 @@ func NewServer(cfg *config.Config, registry provider.Registry, store *state.Stor
 			})
 		}
 	}
+	// A running/waiting state belongs to one remote-agent process generation.
+	// Never carry it across a restart; live provider discovery will repopulate
+	// authoritative runtime state after startup.
+	s.resetPersistedTransientSessions()
 	return s
+}
+
+func (s *Server) resetPersistedTransientSessions() {
+	records, err := s.store.Sessions()
+	if err != nil {
+		return
+	}
+	changed := false
+	for _, rec := range records {
+		switch recordString(rec, "state") {
+		case "running", "delivering", "waiting_approval", "waiting_input", "interrupting":
+			rec["state"] = "idle"
+			changed = true
+		}
+	}
+	if changed {
+		_ = s.store.SaveSessions(records)
+	}
 }
 
 func (s *Server) StartBackground() {

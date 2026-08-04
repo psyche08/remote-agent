@@ -73,14 +73,31 @@ if [ "${RC_ALLOW_DIRTY:-0}" != "1" ] && ! git -C "$REPO_DIR" diff --quiet HEAD -
 fi
 COMMIT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo dev)"
 BUILT_AT="$(TZ=Asia/Shanghai date +%Y-%m-%dT%H:%M:%S+08:00)"
+VERSION_BASE="$(tr -d '[:space:]' <"$SRC_DIR/VERSION")"
+VERSION_CURRENT="$VERSION_BASE"
+if [ -z "${RA_MODULE_VERSION:-}" ]; then
+	VERSION_INCREMENT="${RA_VERSION_INCREMENT:-1}"
+	[[ "$VERSION_INCREMENT" =~ ^[1-9][0-9]*$ ]] || die "invalid RA_VERSION_INCREMENT: $VERSION_INCREMENT"
+  REMOTE_MANIFEST="$(ssh -o RemoteCommand=none "$SSH_TARGET" "cat '${RELEASE_DIR}/manifest.json' 2>/dev/null || true")"
+  REMOTE_VERSION="$(python3 -c 'import json,sys
+try: print(int(json.loads(sys.stdin.read()).get("module_version", 0)))
+except Exception: print(0)' <<<"$REMOTE_MANIFEST")"
+  if [[ "$REMOTE_VERSION" =~ ^[0-9]+$ && "$REMOTE_VERSION" -gt "$VERSION_CURRENT" ]]; then
+    VERSION_CURRENT="$REMOTE_VERSION"
+  fi
+  MODULE_VERSION=$((VERSION_CURRENT + VERSION_INCREMENT))
+else
+  MODULE_VERSION="$RA_MODULE_VERSION"
+fi
+[[ "$MODULE_VERSION" =~ ^[1-9][0-9]*$ ]] || die "invalid remote-agent module version: $MODULE_VERSION"
 
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
-echo "==> building ${BIN_NAME} commit=${COMMIT} built_at=${BUILT_AT}"
+echo "==> building ${BIN_NAME} version=remote-agent.${MODULE_VERSION} commit=${COMMIT} built_at=${BUILT_AT}"
 BUILDINFO_PKG="github.com/psyche08/remote-agent/internal/buildinfo"
 ( cd "$SRC_DIR" && GOCACHE="$GOCACHE" GOOS=darwin GOARCH=arm64 "$GO" build -trimpath \
-  -ldflags "-X ${BUILDINFO_PKG}.Version=${COMMIT} -X ${BUILDINFO_PKG}.Commit=${COMMIT} -X ${BUILDINFO_PKG}.BuiltAt=${BUILT_AT}" \
+  -ldflags "-X ${BUILDINFO_PKG}.Version=remote-agent.${MODULE_VERSION} -X ${BUILDINFO_PKG}.Commit=${COMMIT} -X ${BUILDINFO_PKG}.BuiltAt=${BUILT_AT}" \
   -o "$OUT/$BIN_NAME" ./cmd/remote-agent )
 
 echo "==> signing Darwin binaries with Developer ID team ${NOTARY_TEAM_ID}"
@@ -106,6 +123,7 @@ SCRIPT_SHA="$(sha "$OUT/update.sh")"
 
 cat > "$OUT/manifest.json" <<EOF
 {
+  "module_version": ${MODULE_VERSION},
   "commit": "${COMMIT}",
   "built_at": "${BUILT_AT}",
   "signing": {"team_id": "${NOTARY_TEAM_ID}", "notarized": true},
@@ -156,4 +174,4 @@ fi
 # 3) manifest 最后落位 —— 设备要么看到旧发布,要么看到完整新发布
 put "$OUT/manifest.json" "${RELEASE_DIR}/manifest.json"
 
-echo "==> done. commit=${COMMIT};设备将在 5 分钟内自动更新(或网页端触发 /update)。"
+echo "==> done. version=remote-agent.${MODULE_VERSION} commit=${COMMIT};设备将在 5 分钟内自动更新(或网页端触发 /update)。"

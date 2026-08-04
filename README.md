@@ -188,16 +188,20 @@ The registered `codex` provider is the Go `provider.Codex`.
   `approvalsReviewer=auto_review` turns are guardian-reviewed server-side and
   never surface fake web approvals. Approvals are tracked per thread +
   request id: one thread going idle no longer clears another thread's queue.
-* **Managed daemon prerequisite**: mutable Codex traffic defaults to the
-  official standalone install at
-  `~/.codex/packages/standalone/current/codex`. Install it with OpenAI's
+* **Codex transport discovery**: when no transport is explicitly configured,
+  remote-agent prefers the official managed standalone install at
+  `~/.codex/packages/standalone/current/codex`; otherwise it falls back to a
+  usable ChatGPT.app/Codex.app/PATH/common-prefix binary and its stdio
+  app-server. Codex and ChatGPT own the shared `CODEX_HOME` authentication
+  state, so remote-agent does not require a second provider login. Install the
+  managed standalone with OpenAI's
   `https://chatgpt.com/codex/install.sh`, then run
   `codex app-server daemon start`. Set
+  Set `extra.app_server_transport=shared_daemon` to require that layout, and
   `extra.shared_daemon_autostart=true` only on devices where remote-agent is
   explicitly allowed to start an already-installed daemon after reboot. This
   flag never installs Codex, bootstraps its updater, or enables OpenAI cloud
-  remote control. `extra.app_server_transport=stdio` is a legacy headless-only
-  compatibility mode and must not control native Desktop previews.
+  remote control. An explicit transport never silently falls back.
 * **Shared app-server lifecycle**: the provider assigns every UDS WebSocket
   connection a generation. EOF, malformed JSON, or socket loss immediately
   fails pending RPCs and retires only that generation's routes. An old exit

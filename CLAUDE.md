@@ -55,8 +55,12 @@ a valid acceptance check for a bare CLI Mach-O: it reports “not an app” even
 when notarytool accepted the signed payload.)
 
 It cross-builds `remote-agent-darwin-arm64` with the full device console
-embedded and uploads it plus `assets/release/manifest.json` (commit + build
-datetime in UTC+8; manifest uploaded last) to the relay release directory.
+embedded and uploads it plus `assets/release/manifest.json` (independent
+integer module version + source commit + build datetime in UTC+8; manifest
+uploaded last) to the relay release directory. `VERSION` defines the module's
+baseline; publishing defaults to the relay's current `module_version + 1`, and
+an install deployment similarly advances its target-local deployment version
+only after health succeeds. A failed deployment does not consume a version.
 Each configured device agent compares the manifest against its `/healthz`
 version every 5 minutes; on mismatch it downloads `assets/release/update.sh` + the binary
 (sha256-verified, agent mTLS cert), swaps the binary atomically, and restarts

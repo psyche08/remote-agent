@@ -240,10 +240,10 @@ Codex app-server/Desktop IPC：
 
 ### Discovery 与 read side
 
-生产实例是 `NewCodex("codex", ...)`，默认 backend 为
-`codex_shared_app_server`。mutable traffic 只连接官方 standalone managed daemon；
-ChatGPT.app/Codex.app/PATH binary 只属于 legacy stdio/显式 Desktop compatibility
-候选；shared 模式的安装检测只认 managed standalone，read side 另从本地 index 与
+生产实例是 `NewCodex("codex", ...)`。未显式配置 transport 时优先
+`codex_shared_app_server`，但设备没有 managed standalone 时会从
+ChatGPT.app/Codex.app/PATH/常见安装目录发现可执行文件并降级到 stdio app-server；
+显式 shared 模式的安装检测仍只认 managed standalone，read side 另从本地 index 与
 rollout 发现 metadata，不能把其他 binary 当成 native thread 的竞争 owner。
 
 - `/native_sessions` 以 app-server `thread/list` 为主，再按 thread UUID 合并本地

@@ -8,8 +8,9 @@ var (
 
 func Info() map[string]any {
 	return map[string]any{
-		"version":  Version,
-		"commit":   Commit,
-		"built_at": BuiltAt,
+		"version":        Version,
+		"module_version": Version,
+		"commit":         Commit,
+		"built_at":       BuiltAt,
 	}
 }

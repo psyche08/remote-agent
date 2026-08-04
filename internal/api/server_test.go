@@ -1834,6 +1834,30 @@ func TestLiveSessionsUseRuntimeSourceNotPersistedRunningState(t *testing.T) {
 	}
 }
 
+func TestNewServerResetsPersistedTransientSessionState(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.SaveSessions([]state.Record{
+		{"session_id": "running", "provider_id": "codex", "state": "running"},
+		{"session_id": "approval", "provider_id": "claude", "state": "waiting_approval"},
+		{"session_id": "failed", "provider_id": "codex", "state": "error", "last_error": "keep me"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}, "codex": {}}}
+	config.ApplyDefaults(cfg)
+	NewServer(cfg, provider.Registry{"claude": &fakePushProvider{id: "claude"}, "codex": &fakePushProvider{id: "codex"}}, st)
+	records, err := st.Sessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recordString(records[0], "state") != "idle" || recordString(records[1], "state") != "idle" {
+		t.Fatalf("transient states survived restart: %#v", records)
+	}
+	if recordString(records[2], "state") != "error" || recordString(records[2], "last_error") != "keep me" {
+		t.Fatalf("terminal diagnostic state was polluted: %#v", records[2])
+	}
+}
+
 func TestLiveSessionsPreserveRuntimeTranscriptWithoutRecord(t *testing.T) {
 	dir := t.TempDir()
 	st := state.New(filepath.Join(dir, "data"))

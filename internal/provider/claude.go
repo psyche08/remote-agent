@@ -1,6 +1,7 @@
 package provider
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -68,6 +69,9 @@ type Claude struct {
 	recoveredQuestionSeen map[string]bool
 	cliStream             *claudeStreamBackend
 	desktopProcesses      claudeDesktopProcessManager
+	authMu                sync.Mutex
+	authCheckedAt         time.Time
+	authenticated         bool
 }
 
 var (
@@ -109,10 +113,15 @@ func NewClaudeCLI(id string, cfg config.ProviderConfig) *Claude {
 
 func (c *Claude) ID() string { return c.id }
 
-// Installed reports whether a runnable Claude CLI exists on this device.
+// Installed reports whether a runnable, authenticated Claude CLI exists on
+// this device. Claude Desktop and Claude CLI keep independent login state, so
+// the Desktop app being signed in is not sufficient for this CLI provider.
 // The registered provider prefers PATH; an explicitly configured absolute
 // path or extra.prefer_desktop_claude=true may opt into another binary.
-func (c *Claude) Installed() bool { return c.resolveCommand() != "" }
+func (c *Claude) Installed() bool {
+	cli := c.resolveCommand()
+	return cli != "" && c.cliAuthenticated(cli)
+}
 
 func (c *Claude) SetStreamPublisher(publish func(target string, frame map[string]any)) {
 	c.streamMu.Lock()
@@ -128,6 +137,7 @@ func (c *Claude) StopCLIStream() {
 
 func (c *Claude) Status() Status {
 	cli := c.resolveCommand()
+	ready := cli != "" && c.cliAuthenticated(cli)
 	err := (*string)(nil)
 	if c.lastError != "" {
 		err = &c.lastError
@@ -135,9 +145,9 @@ func (c *Claude) Status() Status {
 	return Status{
 		ProviderID:  c.id,
 		AppName:     firstNonEmpty(c.cfg.AppName, "Claude"),
-		IsRunning:   cli != "",
+		IsRunning:   ready,
 		IsFrontmost: false,
-		Installed:   cli != "",
+		Installed:   ready,
 		State:       c.lastState,
 		LastError:   err,
 		Capabilities: map[string]bool{
@@ -150,6 +160,34 @@ func (c *Claude) Status() Status {
 		Command: c.command,
 		Cwd:     c.cwd,
 	}
+}
+
+func (c *Claude) cliAuthenticated(cli string) bool {
+	c.authMu.Lock()
+	defer c.authMu.Unlock()
+	if !c.authCheckedAt.IsZero() && time.Since(c.authCheckedAt) < 15*time.Second {
+		return c.authenticated
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, cli, "auth", "status")
+	cmd.Stdin = nil
+	out, err := cmd.Output()
+	ready := false
+	if len(out) <= 64*1024 {
+		var status struct {
+			LoggedIn bool `json:"loggedIn"`
+		}
+		if json.Unmarshal(out, &status) == nil {
+			ready = status.LoggedIn
+		}
+	}
+	if err != nil && !ready {
+		ready = false
+	}
+	c.authCheckedAt = time.Now()
+	c.authenticated = ready
+	return ready
 }
 
 func (c *Claude) ModelSelect() ModelSelect {

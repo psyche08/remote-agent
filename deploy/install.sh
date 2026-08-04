@@ -120,6 +120,18 @@ if [ ! -x "$GO" ]; then
   echo "go not found; install Go or set PATH before running install.sh" >&2
   exit 127
 fi
+
+VERSION_BASE="$(tr -d '[:space:]' <"$REPO_REMOTE_AGENT/VERSION")"
+VERSION_STATE="${RA_VERSION_STATE:-$STATE_DIR/deployment-version}"
+VERSION_CURRENT="$VERSION_BASE"
+if [ -r "$VERSION_STATE" ]; then VERSION_CURRENT="$(tr -d '[:space:]' <"$VERSION_STATE")"; fi
+case "$VERSION_BASE:$VERSION_CURRENT:${RA_VERSION_INCREMENT:-1}" in
+  *[!0-9:]*|:*|*:) echo "invalid remote-agent deployment version" >&2; exit 1 ;;
+esac
+VERSION_INCREMENT="${RA_VERSION_INCREMENT:-1}"
+[ "$VERSION_INCREMENT" -gt 0 ] || { echo "RA_VERSION_INCREMENT must be positive" >&2; exit 1; }
+MODULE_VERSION=$((VERSION_CURRENT + VERSION_INCREMENT))
+echo "==> remote-agent deployment version: $VERSION_CURRENT -> $MODULE_VERSION"
 if [ ! -x "$PY" ]; then
   echo "python3 not found; install Python 3 or set PATH before running install.sh" >&2
   exit 127
@@ -135,7 +147,7 @@ else
   BUILD_AT="$(TZ=Asia/Shanghai date +%Y-%m-%dT%H:%M:%S+08:00)"
   BUILDINFO_PKG="github.com/psyche08/remote-agent/internal/buildinfo"
   ( cd "$REPO_REMOTE_AGENT" && GOCACHE="${GOCACHE:-/private/tmp/remote-agent-gocache}" "$GO" build -trimpath \
-    -ldflags "-X ${BUILDINFO_PKG}.Version=${BUILD_COMMIT} -X ${BUILDINFO_PKG}.Commit=${BUILD_COMMIT} -X ${BUILDINFO_PKG}.BuiltAt=${BUILD_AT}" \
+    -ldflags "-X ${BUILDINFO_PKG}.Version=remote-agent.${MODULE_VERSION} -X ${BUILDINFO_PKG}.Commit=${BUILD_COMMIT} -X ${BUILDINFO_PKG}.BuiltAt=${BUILD_AT}" \
     -o bin/remote-agent ./cmd/remote-agent )
   echo "==> built $REPO_REMOTE_AGENT/bin/remote-agent"
 fi
@@ -397,5 +409,9 @@ else
   echo "==> NOTE: supervisor not found at $SUPERVISOR; start remote-agent manually"
 fi
 
-echo "==> done. UI: https://<user>-relay.<domain>/s/remotecoding/d/$DEVICE_ID/"
+mkdir -p "$(dirname "$VERSION_STATE")"
+printf '%s\n' "$MODULE_VERSION" >"$VERSION_STATE.tmp"
+mv "$VERSION_STATE.tmp" "$VERSION_STATE"
+
+echo "==> done. version=remote-agent.$MODULE_VERSION UI: https://<user>-relay.<domain>/s/remotecoding/d/$DEVICE_ID/"
 exit 0
