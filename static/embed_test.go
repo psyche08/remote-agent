@@ -97,6 +97,27 @@ func TestDeviceUISynchronizesSessionDeviceAndProvider(t *testing.T) {
 	}
 }
 
+func TestDeviceUIShowsConfiguredProvidersAndMarksUnavailableOnes(t *testing.T) {
+	body, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := string(body)
+	for _, want := range []string{
+		`fetch(browseUrl("/providers?include_uninstalled=1")`,
+		`function providerReady(meta)`,
+		`meta.status.installed !== false`,
+		`!ready ? " unavailable" : ""`,
+		`<span class="provider-state">未就绪</span>`,
+		`providerReady(p) && (!p.capabilities || p.capabilities.create_session !== false)`,
+		`当前设备没有已就绪的 provider；仍可查看已有会话。`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Fatalf("device UI missing complete provider visibility behavior %q", want)
+		}
+	}
+}
+
 func TestDeviceUISessionRefreshConvergesWithoutStaleOverwrite(t *testing.T) {
 	body, err := os.ReadFile("index.html")
 	if err != nil {

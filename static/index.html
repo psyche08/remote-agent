@@ -66,6 +66,10 @@
     .chip:active { transform:scale(.97); }
     .chip.active { background:var(--accent); border-color:var(--accent); color:#fff; }
     .chip.active .dot { background:#fff; }
+    .chip.unavailable { color:var(--muted); border-style:dashed; opacity:.82; }
+    .chip.unavailable.active { background:var(--inset); border-color:var(--line2); color:var(--fg); }
+    .chip.unavailable.active .dot { background:#f5a623; }
+    .provider-state { font-size:10px; opacity:.82; }
     /* session tab bar */
     .tabbar { display:flex; gap:6px; overflow-x:auto; overflow-y:hidden; flex:none; padding:7px 10px; border-bottom:1px solid var(--line); background:var(--bg); -webkit-overflow-scrolling:touch; }
     .tabbar::-webkit-scrollbar { height:0; }
@@ -1259,6 +1263,9 @@
       const hidden = hiddenProviderIDs();
       return (rows || []).filter(p => !hidden.has(String(p.provider_id || "")));
     }
+    function providerReady(meta) {
+      return !meta || !meta.status || meta.status.installed !== false;
+    }
     function renderProviderVisibility() {
       const box = $("provider-visibility"); if (!box) return;
       if (!PROVIDERS_META.length) { box.textContent = "providers 尚未加载"; return; }
@@ -1266,7 +1273,8 @@
       box.innerHTML = PROVIDERS_META.map(p => {
         const id = String(p.provider_id || ""), shown = !hidden.has(id);
         const disabled = shown && visibleCount <= 1 ? " disabled" : "";
-        return `<label style="display:flex;align-items:center;gap:8px"><input type="checkbox" ${shown ? "checked" : ""}${disabled} onchange="setProviderVisible(${escA(JSON.stringify(id))},this.checked)"><span>${esc(providerLabel(id, p))}</span><code class="muted">${esc(id)}</code></label>`;
+        const readiness = providerReady(p) ? "" : `<span class="muted">未就绪</span>`;
+        return `<label style="display:flex;align-items:center;gap:8px"><input type="checkbox" ${shown ? "checked" : ""}${disabled} onchange="setProviderVisible(${escA(JSON.stringify(id))},this.checked)"><span>${esc(providerLabel(id, p))}</span><code class="muted">${esc(id)}</code>${readiness}</label>`;
       }).join("");
     }
     function setProviderVisible(id, visible) {
@@ -1278,7 +1286,10 @@
     }
     async function refreshProviders(options = {}) {
       try {
-        const data = await (await fetch(browseUrl("/providers"), { headers: headers() })).json();
+        // The default API intentionally hides providers that cannot currently
+        // start. The device UI still needs the complete configured list so a
+        // missing CLI/login is visible instead of looking like lost config.
+        const data = await (await fetch(browseUrl("/providers?include_uninstalled=1"), { headers: headers() })).json();
         const sel = $("provider-select"), chips = $("provider-chips");
         sel.innerHTML = ""; chips.innerHTML = ""; let caps = {}, actions = [];
         const order = { codex: 0, claude: 1 };
@@ -1300,9 +1311,11 @@
           }
           sel.appendChild(o);
           const c = document.createElement("div");
-          c.className = "chip" + (p.provider_id === selectedProvider ? " active" : "");
-          c.innerHTML = `<span class="dot ${p.status && p.status.is_running ? "on" : ""}"></span>${esc(providerLabel(p.provider_id, p))}`;
+          const ready = providerReady(p);
+          c.className = "chip" + (p.provider_id === selectedProvider ? " active" : "") + (!ready ? " unavailable" : "");
+          c.innerHTML = `<span class="dot ${p.status && p.status.is_running ? "on" : ""}"></span>${esc(providerLabel(p.provider_id, p))}${ready ? "" : `<span class="provider-state">未就绪</span>`}`;
           c.title = p.provider_id;
+          c.setAttribute("aria-label", providerLabel(p.provider_id, p) + (ready ? "" : "（未就绪）"));
           c.onclick = () => { sel.value = p.provider_id; selectProvider(); };
           chips.appendChild(c);
         });
@@ -1608,7 +1621,7 @@
     function syncNewProviderOptions() {
       const sel = $("new-provider"); if (!sel) return;
       const current = sel.value || $("provider-select").value || "";
-      const providers = PROVIDERS_META.length ? visibleProviders(PROVIDERS_META).filter(p => !p.capabilities || p.capabilities.create_session !== false) : [...$("provider-select").options].map(o => ({ provider_id: o.value }));
+      const providers = PROVIDERS_META.length ? visibleProviders(PROVIDERS_META).filter(p => providerReady(p) && (!p.capabilities || p.capabilities.create_session !== false)) : [...$("provider-select").options].map(o => ({ provider_id: o.value }));
       sel.innerHTML = providers.map(p => `<option value="${escA(p.provider_id)}">${esc(providerLabel(p.provider_id))}</option>`).join("");
       if ([...sel.options].some(o => o.value === current)) sel.value = current;
     }
@@ -1666,8 +1679,12 @@
     async function newSession() {
       syncNewProviderOptions();
       const choices = [...$("new-provider").options].map(o => o.value);
+      if (!choices.length) {
+        $("send-out").textContent = "当前设备没有已就绪的 provider；仍可查看已有会话。";
+        return;
+      }
       const current = $("provider-select").value || CUR_PROVIDER;
-      const prov = choices.includes(current) ? current : (choices[0] || "codex");
+      const prov = choices.includes(current) ? current : choices[0];
       $("new-provider").value = prov;
       $("new-title").value = "";
       await loadNewSessionOptions(prov);
