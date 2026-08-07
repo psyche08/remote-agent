@@ -172,6 +172,27 @@ relay 的 30s 超时。控制器**不使用请求的 context**：客户端断开
 
 ## 安装
 
+### 0. 先跑 preflight
+
+Swift worker 与 ObjC plug-in 只能在 macOS 上编译和运行，CI 与 Linux 容器都无法
+验证它们。**在装任何东西之前**，先在目标机器上跑一次：
+
+```bash
+cd /path/to/remote-agent && bash mac/preflight.sh
+```
+
+默认**只读**：不锁屏、不升遮罩、不安装 plug-in、不改 authorization database。
+它检查工具链、Go 构建/测试、Swift worker 能否 type-check 并回答三个只读操作、
+未知 op/action 是否被拒、worker 里确实没有 unlock 操作、Accessibility 是否授权、
+plug-in 能否编译，以及 **Go 与 plug-in 之间那几个跨语言常量是否漂移**
+（`GrantVersion`、`MaxGrantTTL`、`MaxClockSkew`、grant 目录）——漂移会让 agent
+签发的 grant 永远被 plug-in 拒绝。
+
+两个会打断桌面的检查需要显式开启：`--check-shield`（短暂遮挡屏幕）、
+`--check-lock`（锁屏）。
+
+### 1. 构建并安装 plug-in
+
 plug-in 必须在目标 Mac 上编译和签名（它会被加载进 SecurityAgent 进程），CI 不构建它。
 
 ```bash

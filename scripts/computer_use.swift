@@ -197,9 +197,13 @@ func engageShield() -> (Bool, Int) {
     guard displays > 0 else { return (false, 0) }
     // The helper is this same script re-invoked in shield-host mode, so there
     // is exactly one file to install and sign.
+    //
+    // #filePath, not CommandLine.arguments[0]: when run as `swift script.swift`
+    // argv[0] is the interpreter, not this file, so re-invoking through it would
+    // spawn a shield host that never covers anything.
     let task = Process()
     task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-    task.arguments = ["swift", CommandLine.arguments[0], "{\"op\":\"shield_host\"}"]
+    task.arguments = ["swift", #filePath, "{\"op\":\"shield_host\"}"]
     do {
         try task.run()
     } catch {

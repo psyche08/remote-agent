@@ -45,6 +45,7 @@ remote-agent/
 │   ├── shell.html               # stable relay device picker
 │   └── index.html               # full console embedded into the agent binary
 ├── mac/
+│   ├── preflight.sh             # on-Mac checks for computer use / Locked Use
 │   └── authorization-plugin/    # Locked Use Apple Authorization Plug-in (built on the Mac)
 ├── scripts/
 │   ├── ocr_vision.swift         # local Apple Vision OCR worker
@@ -251,6 +252,11 @@ device's own `config.json` — no API call can enable them.
   hard window TTL. Relock is confirmed by readback before the shield comes down,
   and startup scrubs any grant a crash left behind. Screen capture and OCR are
   refused while a window is open without a confirmed shield.
+
+The Swift worker and the authorization plug-in only build and run on macOS, so
+CI cannot check them. Run `bash mac/preflight.sh` on the target Mac first — it
+is read-only by default and also catches drift in the constants the Go code and
+the plug-in must agree on.
 
 This is deliberately **not** a general-purpose remote unlock: it authorizes one
 turn's unlock, not other applications or local processes. Setup, the full grant
