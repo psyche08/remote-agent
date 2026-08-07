@@ -30,3 +30,6 @@ mac/authorization-plugin/build/
 .pytest_cache/
 __pycache__/
 *.pyc
+
+# SwiftPM build products for the macOS helper
+mac/RemoteAgentDesktop/.build/
