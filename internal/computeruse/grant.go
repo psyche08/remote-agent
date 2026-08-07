@@ -1,13 +1,18 @@
 package computeruse
 
 import (
-	"crypto/ed25519"
+	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"path/filepath"
 	"time"
@@ -50,7 +55,25 @@ const (
 	// NonceBytes is the grant nonce length. The nonce is the single-use key in
 	// the verifier's consumed ledger.
 	NonceBytes = 16
+	// PublicKeyBytes is the length of the published verifying key: the X9.63
+	// uncompressed point (0x04 || X || Y) of a P-256 public key, which is the
+	// form SecKeyCreateWithData expects in the plug-in. The plug-in hard-codes
+	// the same length, and mac/preflight.sh compares the two.
+	PublicKeyBytes = 65
 )
+
+// Grants are signed with ECDSA P-256 over SHA-256, and the choice is forced by
+// the verifier rather than preferred here.
+//
+// Ed25519 would be the better primitive and Go signs it with less ceremony, but
+// the plug-in must verify through Security.framework, and SecKey's Ed25519
+// constants (kSecAttrKeyTypeEd25519, kSecKeyAlgorithmEdDSASignatureMessage…)
+// are SPI: exported by Security.tbd, declared in no public header. A mechanism
+// bundle that binds a private symbol stops loading the day Apple drops it — and
+// this bundle sits in the screensaver-unlock right, where a mechanism that
+// cannot load is the lockout direction the design forbids. ECDSA P-256 with
+// kSecKeyAlgorithmECDSASignatureMessageX962SHA256 is public API on every
+// supported macOS, and Go's SignASN1 emits exactly the X9.62 DER it wants.
 
 // GrantPayload is the signed portion of a grant. Field names and ordering are
 // part of the wire contract with the Authorization Plug-in: the signature
@@ -74,15 +97,20 @@ type Grant struct {
 	Signature string `json:"signature"`
 }
 
-// Signer mints grants. It holds the Ed25519 private key and is the only thing
-// in the process that can produce a verifiable unlock assertion.
+// Signer mints grants. It holds the P-256 private key and is the only thing in
+// the process that can produce a verifiable unlock assertion.
 type Signer struct {
-	key      ed25519.PrivateKey
+	key      *ecdsa.PrivateKey
 	deviceID string
 }
 
 var (
-	ErrNoSigningKey    = errors.New("locked use has no signing key")
+	ErrNoSigningKey = errors.New("locked use has no signing key")
+	// errSigningKeyMalformed names the remedy, because the only way to reach it
+	// is a key file this build cannot use — including one written by a build
+	// that signed grants with Ed25519.
+	errSigningKeyMalformed = errors.New(
+		"locked-use signing key is malformed or is not a P-256 key; remove the file to mint a fresh one")
 	ErrGrantExpired    = errors.New("grant expired")
 	ErrGrantNotYet     = errors.New("grant is not yet valid")
 	ErrGrantTTLTooLong = errors.New("grant declares a lifetime beyond the permitted ceiling")
@@ -92,8 +120,8 @@ var (
 	ErrGrantVersion    = errors.New("unsupported grant version")
 )
 
-// LoadOrCreateSigner reads the Ed25519 private key at path, creating one on
-// first use. The key file is 0600 in a 0700 directory.
+// LoadOrCreateSigner reads the P-256 private key at path, creating one on
+// first use. The key is stored as base64 PKCS#8 DER, 0600 in a 0700 directory.
 //
 // Threat-model note: file permissions keep the key from other users, not from a
 // process already running as this user. Binding the key to hardware (Secure
@@ -109,19 +137,33 @@ func LoadOrCreateSigner(path string, deviceID string) (*Signer, error) {
 		return nil, err
 	}
 	if raw, err := os.ReadFile(path); err == nil {
-		seed, decodeErr := base64.StdEncoding.DecodeString(trimSpaceBytes(raw))
-		if decodeErr != nil || len(seed) != ed25519.SeedSize {
-			return nil, errors.New("locked-use signing key is malformed")
+		der, decodeErr := base64.StdEncoding.DecodeString(trimSpaceBytes(raw))
+		if decodeErr != nil {
+			return nil, errSigningKeyMalformed
 		}
-		return &Signer{key: ed25519.NewKeyFromSeed(seed), deviceID: deviceID}, nil
+		parsed, parseErr := x509.ParsePKCS8PrivateKey(der)
+		if parseErr != nil {
+			return nil, errSigningKeyMalformed
+		}
+		key, ok := parsed.(*ecdsa.PrivateKey)
+		// The curve is checked, not assumed: a key on another curve would sign
+		// grants the plug-in — which only ever builds a P-256 key — rejects.
+		if !ok || key.Curve != elliptic.P256() {
+			return nil, errSigningKeyMalformed
+		}
+		return &Signer{key: key, deviceID: deviceID}, nil
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	seed := make([]byte, ed25519.SeedSize)
-	if _, err := rand.Read(seed); err != nil {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
 		return nil, err
 	}
-	encoded := base64.StdEncoding.EncodeToString(seed)
+	der, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, err
+	}
+	encoded := base64.StdEncoding.EncodeToString(der)
 	// Write with O_EXCL so a concurrent starter cannot silently replace a key
 	// that another process is already publishing a public half for.
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -138,16 +180,21 @@ func LoadOrCreateSigner(path string, deviceID string) (*Signer, error) {
 	if err := f.Close(); err != nil {
 		return nil, err
 	}
-	return &Signer{key: ed25519.NewKeyFromSeed(seed), deviceID: deviceID}, nil
+	return &Signer{key: key, deviceID: deviceID}, nil
 }
 
-// PublicKey returns the verifying half, which is what the Authorization
-// Plug-in is provisioned with. The private half never leaves this process.
-func (s *Signer) PublicKey() ed25519.PublicKey {
-	if s == nil {
+// PublicKey returns the verifying half as the X9.63 uncompressed point the
+// plug-in hands to SecKeyCreateWithData. The private half never leaves this
+// process.
+func (s *Signer) PublicKey() []byte {
+	if s == nil || s.key == nil {
 		return nil
 	}
-	return s.key.Public().(ed25519.PublicKey)
+	pub, err := s.key.PublicKey.ECDH()
+	if err != nil {
+		return nil
+	}
+	return pub.Bytes()
 }
 
 // PublicKeyBase64 renders the public key for provisioning the plugin.
@@ -162,7 +209,7 @@ func (s *Signer) PublicKeyBase64() string {
 // an unlock attempt; ttl is clamped to MaxGrantTTL because the verifier will
 // reject anything longer regardless.
 func (s *Signer) Mint(turnID string, ttl time.Duration, now time.Time) (Grant, GrantPayload, error) {
-	if s == nil || len(s.key) == 0 {
+	if s == nil || s.key == nil {
 		return Grant{}, GrantPayload{}, ErrNoSigningKey
 	}
 	// An unset or out-of-range TTL falls back to the shortest useful life, not
@@ -191,10 +238,29 @@ func (s *Signer) Mint(turnID string, ttl time.Duration, now time.Time) (Grant, G
 	if err != nil {
 		return Grant{}, GrantPayload{}, err
 	}
+	sig, err := SignPayload(s.key, raw)
+	if err != nil {
+		return Grant{}, GrantPayload{}, err
+	}
 	return Grant{
 		Payload:   base64.StdEncoding.EncodeToString(raw),
-		Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(s.key, raw)),
+		Signature: base64.StdEncoding.EncodeToString(sig),
 	}, payload, nil
+}
+
+// SignPayload produces the detached signature over the exact payload bytes:
+// DER-encoded ECDSA over SHA-256, which is what
+// kSecKeyAlgorithmECDSASignatureMessageX962SHA256 verifies on the plug-in side.
+//
+// It is exported so tests can mint a validly signed but semantically invalid
+// grant without reaching into the Signer, and so the signing format lives in
+// exactly one place.
+func SignPayload(key *ecdsa.PrivateKey, payload []byte) ([]byte, error) {
+	if key == nil {
+		return nil, ErrNoSigningKey
+	}
+	digest := sha256.Sum256(payload)
+	return ecdsa.SignASN1(rand.Reader, key, digest[:])
 }
 
 // WriteGrant publishes a grant for the Authorization Plug-in to read. The file
@@ -248,6 +314,32 @@ func ScrubGrants(dir string) error {
 	return RemoveGrant(dir)
 }
 
+// VerifyPayloadSignature mirrors RAVerifySignature in the plug-in: an X9.63
+// uncompressed P-256 point verifying a DER ECDSA signature over SHA-256 of the
+// payload bytes.
+//
+// The point goes through ecdh.P256().NewPublicKey, which rejects a point that
+// is malformed or not on the curve — the same validation SecKeyCreateWithData
+// applies — so this mirror refuses the keys the enforcing copy would refuse
+// rather than accepting them and diverging.
+func VerifyPayloadSignature(pub, payload, sig []byte) bool {
+	if len(pub) != PublicKeyBytes || pub[0] != 0x04 || len(sig) == 0 || len(payload) == 0 {
+		return false
+	}
+	point, err := ecdh.P256().NewPublicKey(pub)
+	if err != nil {
+		return false
+	}
+	raw := point.Bytes()
+	key := &ecdsa.PublicKey{
+		Curve: elliptic.P256(),
+		X:     new(big.Int).SetBytes(raw[1:33]),
+		Y:     new(big.Int).SetBytes(raw[33:65]),
+	}
+	digest := sha256.Sum256(payload)
+	return ecdsa.VerifyASN1(key, digest[:], sig)
+}
+
 // VerifyGrant is the reference implementation of the check the Authorization
 // Plug-in performs. The plugin is the enforcing copy; this one keeps the
 // contract honest and testable in CI, where the ObjC bundle cannot run.
@@ -256,7 +348,7 @@ func ScrubGrants(dir string) error {
 // a declared lifetime longer than MaxGrantTTL is rejected outright rather than
 // clamped-and-accepted, so a mis-minted grant fails loudly instead of quietly
 // becoming long-lived.
-func VerifyGrant(grant Grant, pub ed25519.PublicKey, deviceID string, now time.Time) (GrantPayload, error) {
+func VerifyGrant(grant Grant, pub []byte, deviceID string, now time.Time) (GrantPayload, error) {
 	raw, err := base64.StdEncoding.DecodeString(grant.Payload)
 	if err != nil {
 		return GrantPayload{}, errors.New("grant payload is malformed")
@@ -265,7 +357,7 @@ func VerifyGrant(grant Grant, pub ed25519.PublicKey, deviceID string, now time.T
 	if err != nil {
 		return GrantPayload{}, errors.New("grant signature is malformed")
 	}
-	if len(pub) != ed25519.PublicKeySize || !ed25519.Verify(pub, raw, sig) {
+	if !VerifyPayloadSignature(pub, raw, sig) {
 		return GrantPayload{}, ErrGrantSignature
 	}
 	// Parse only the bytes the signature covered.

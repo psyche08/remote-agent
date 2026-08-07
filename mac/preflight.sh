@@ -20,6 +20,7 @@ set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SWIFT_WORKER="$REPO/scripts/computer_use.swift"
+PLUGIN_SRC="$REPO/mac/authorization-plugin/RemoteAgentLockedUse.m"
 CHECK_SHIELD=0
 CHECK_LOCK=0
 FAILED=0
@@ -172,6 +173,7 @@ check_const "grant version"  'kGrantVersion[^;]*= *[0-9]+'      'GrantVersion *=
 check_const "max grant TTL"  'kMaxGrantTTL[^;]*= *[0-9.]+'      'MaxGrantTTL *= *[0-9]+ *\* *time\.Second'
 check_const "max clock skew" 'kMaxClockSkew[^;]*= *[0-9.]+'     'MaxClockSkew *= *[0-9]+ *\* *time\.Second'
 check_const "grant purpose"  'screensaver-unlock'               'screensaver-unlock'
+check_const "public key size" 'kPublicKeyBytes[^;]*= *[0-9]+'   'PublicKeyBytes *= *[0-9]+'
 
 PLUGIN_DIR_CONST="$(grep -oE '/Library/Application Support/remote-agent/locked-use' "$REPO/mac/authorization-plugin/RemoteAgentLockedUse.m" | head -1)"
 GO_DIR_CONST="$(grep -oE '/Library/Application Support/remote-agent/locked-use' "$REPO/internal/computeruse/locked.go" | head -1)"
@@ -180,6 +182,68 @@ if [ -n "$PLUGIN_DIR_CONST" ] && [ "$PLUGIN_DIR_CONST" = "$GO_DIR_CONST" ]; then
 else
   fail "grant directory differs — the agent would publish grants where the plug-in never looks"
 fi
+
+step "plug-in uses only public Security API"
+# A mechanism bundle is loaded inside authd, in the screensaver-unlock right. If
+# it binds a symbol Apple later drops, it stops loading *there* — a Mac that
+# will not unlock. So every Security constant it names must be declared in a
+# public SDK header, not merely exported by Security.tbd. Ed25519's SecKey
+# constants are exactly that trap: exported, undeclared, and they compile only
+# if you declare them yourself.
+SDK_PATH="$(xcrun --sdk macosx --show-sdk-path 2>/dev/null)"
+SEC_HEADERS="$SDK_PATH/System/Library/Frameworks/Security.framework/Versions/A/Headers"
+[ -d "$SEC_HEADERS" ] || SEC_HEADERS="$SDK_PATH/System/Library/Frameworks/Security.framework/Headers"
+if [ -d "$SEC_HEADERS" ]; then
+  UNDECLARED=""
+  for sym in $(grep -oE 'kSec[A-Za-z0-9]+' "$PLUGIN_SRC" | sort -u); do
+    grep -rqE "\b$sym\b" "$SEC_HEADERS" 2>/dev/null || UNDECLARED="$UNDECLARED $sym"
+  done
+  if [ -z "$UNDECLARED" ]; then
+    pass "every kSec* constant the plug-in names is declared in a public header"
+  else
+    fail "plug-in references SPI (exported but undeclared):$UNDECLARED"
+  fi
+else
+  skip "cannot locate Security.framework headers in the SDK"
+fi
+
+step "a Go-minted grant verifies in the plug-in's own verifier"
+# The contract has two implementations in two languages and only the ObjC one
+# enforces anything. Nothing in CI can tell "they agree" apart from "each is
+# self-consistent and rejects the other" — which fails silently: the agent
+# mints, the plug-in refuses, and the Mac simply never unlocks. This is the one
+# place the two are run against each other, so it happens on the target Mac.
+VECTOR="$(mktemp -t ra-interop-vector)"
+CHECKER="$(mktemp -d -t ra-interop)/interop_check"
+if (cd "$REPO" && RA_INTEROP_VECTOR_OUT="$VECTOR" \
+      go test ./internal/computeruse/ -run TestInteropVector -count=1 >/dev/null 2>&1) &&
+   [ -s "$VECTOR" ]; then
+  if clang -fobjc-arc -Wno-unused-function -framework Foundation -framework Security \
+       -o "$CHECKER" "$REPO/mac/authorization-plugin/interop_check.m" 2>/tmp/ra-interop-build.log; then
+    PUB="$(sed -n 1p "$VECTOR")"
+    PAYLOAD="$(sed -n 2p "$VECTOR")"
+    SIG="$(sed -n 3p "$VECTOR")"
+    WRONG_PUB="$(sed -n 4p "$VECTOR")"
+    if "$CHECKER" "$PUB" "$PAYLOAD" "$SIG"; then
+      pass "plug-in verifier accepts a grant minted by the Go signer"
+    else
+      fail "plug-in verifier REJECTED a valid Go-minted grant — the two sides disagree"
+    fi
+    # Without a case it must refuse, a verifier that always allowed would pass.
+    if "$CHECKER" "$WRONG_PUB" "$PAYLOAD" "$SIG"; then
+      fail "plug-in verifier accepted a grant under the wrong public key"
+    else
+      pass "plug-in verifier refuses a grant signed by another key"
+    fi
+  else
+    fail "interop harness did not build — see /tmp/ra-interop-build.log"
+    tail -20 /tmp/ra-interop-build.log 2>/dev/null | sed 's/^/       /'
+  fi
+else
+  fail "could not mint an interop vector from the Go signer"
+fi
+rm -f "$VECTOR"
+rm -rf "$(dirname "$CHECKER")"
 
 if [ "$CHECK_SHIELD" = "1" ]; then
   step "display shield (disruptive)"

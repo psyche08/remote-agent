@@ -1,7 +1,6 @@
 package computeruse
 
 import (
-	"crypto/ed25519"
 	"encoding/base64"
 	"errors"
 	"os"
@@ -621,8 +620,8 @@ func TestStatusPublishesUsableVerifyingKey(t *testing.T) {
 		t.Fatal("status did not publish a public key to provision the plug-in")
 	}
 	pub, err := base64.StdEncoding.DecodeString(encoded)
-	if err != nil || len(pub) != ed25519.PublicKeySize {
-		t.Fatalf("published key is not a usable Ed25519 public key: %v", err)
+	if err != nil || len(pub) != PublicKeyBytes {
+		t.Fatalf("published key is not a usable P-256 verifying key: %v", err)
 	}
 
 	c.mu.Lock()

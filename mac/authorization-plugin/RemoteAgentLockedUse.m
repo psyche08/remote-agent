@@ -66,13 +66,23 @@
 #define RA_LEDGER_DIR   RA_LOCKED_USE_DIR "/consumed"
 #define RA_DEVICE_PATH  RA_LOCKED_USE_DIR "/device_id"
 
-/* Must match internal/computeruse/grant.go. */
+/* Must match internal/computeruse/grant.go. mac/preflight.sh compares these
+ * across the language boundary, because a silent drift here does not fail
+ * loudly: the agent mints grants this plugin rejects forever, and the only
+ * symptom is a Mac that simply never unlocks. */
 static const int      kGrantVersion   = 1;
 static const NSTimeInterval kMaxGrantTTL  = 15.0;
 static const NSTimeInterval kMaxClockSkew = 5.0;
 static const NSUInteger kNonceHexLen  = 32;   /* 16 bytes, hex-encoded */
 static const off_t    kMaxGrantBytes  = 4096;
 static NSString *const kGrantPurpose  = @"screensaver-unlock";
+/* X9.63 uncompressed P-256 point: 0x04 || X || Y. */
+static const NSUInteger kPublicKeyBytes = 65;
+/* DER ECDSA P-256 signatures are variable-length; these are sanity bounds, not
+ * the check. SecKeyVerifySignature is the check. */
+static const NSUInteger kMinSignatureBytes = 8;
+static const NSUInteger kMaxSignatureBytes = 150;
+static const off_t    kMaxDeviceIDBytes = 256;
 
 #pragma mark - Plugin scaffolding
 
@@ -115,7 +125,7 @@ static NSData *RALoadGrantBytes(void) {
     return buffer;
 }
 
-/* Loads the provisioned Ed25519 public key (base64, root-owned, 0600). */
+/* Loads the provisioned P-256 public key (base64, root-owned, 0600). */
 static NSData *RALoadPublicKey(void) {
     int fd = open(RA_PUBKEY_PATH, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
     if (fd < 0) {
@@ -142,20 +152,38 @@ static NSData *RALoadPublicKey(void) {
 }
 
 /*
- * Verifies an Ed25519 signature over payload using the provisioned key.
+ * Verifies the grant signature over payload using the provisioned key:
+ * ECDSA P-256 over SHA-256, mirrored by VerifyPayloadSignature in Go.
  *
- * CryptoKit is not reachable from a C-ABI plugin, so this goes through
- * SecKeyVerifySignature with an Ed25519 key. On a system where the algorithm is
- * unavailable, verification fails and the plugin stays transparent — the safe
- * direction.
+ * The algorithm is chosen by what this bundle is allowed to depend on, not by
+ * preference. Ed25519 is the better primitive, but SecKey's Ed25519 constants
+ * are SPI — exported by Security.tbd and declared in no public header. A
+ * mechanism that binds a private symbol stops loading the day Apple drops it,
+ * and this mechanism sits in the screensaver-unlock right, so a bundle that
+ * cannot load is exactly the lockout direction commitment 1 forbids.
+ * kSecKeyAlgorithmECDSASignatureMessageX962SHA256 is public API and hashes the
+ * message itself, so the signed bytes here are the payload bytes, unhashed by
+ * the caller.
+ *
+ * Every failure — a key that will not build, an unavailable algorithm, a bad
+ * signature — returns NO, and NO means the plugin stays transparent and the
+ * password challenge proceeds unchanged.
  */
 static BOOL RAVerifySignature(NSData *payload, NSData *signature, NSData *publicKey) {
-    if (payload.length == 0 || signature.length != 64 || publicKey.length != 32) {
+    if (payload.length == 0 || publicKey.length != kPublicKeyBytes ||
+        signature.length < kMinSignatureBytes || signature.length > kMaxSignatureBytes) {
+        return NO;
+    }
+    /* SecKeyCreateWithData reads an EC public key as an X9.63 point. Requiring
+     * the uncompressed marker keeps this to the one encoding the agent
+     * publishes rather than whatever else might parse. */
+    if (((const uint8_t *)publicKey.bytes)[0] != 0x04) {
         return NO;
     }
     NSDictionary *attrs = @{
-        (__bridge id)kSecAttrKeyType:  (__bridge id)kSecAttrKeyTypeEd25519,
-        (__bridge id)kSecAttrKeyClass: (__bridge id)kSecAttrKeyClassPublic,
+        (__bridge id)kSecAttrKeyType:       (__bridge id)kSecAttrKeyTypeECSECPrimeRandom,
+        (__bridge id)kSecAttrKeyClass:      (__bridge id)kSecAttrKeyClassPublic,
+        (__bridge id)kSecAttrKeySizeInBits: @256,
     };
     CFErrorRef error = NULL;
     SecKeyRef key = SecKeyCreateWithData((__bridge CFDataRef)publicKey,
@@ -164,7 +192,7 @@ static BOOL RAVerifySignature(NSData *payload, NSData *signature, NSData *public
         if (error) CFRelease(error);
         return NO;
     }
-    Boolean ok = SecKeyVerifySignature(key, kSecKeyAlgorithmEdDSASignatureMessageEd25519,
+    Boolean ok = SecKeyVerifySignature(key, kSecKeyAlgorithmECDSASignatureMessageX962SHA256,
                                        (__bridge CFDataRef)payload,
                                        (__bridge CFDataRef)signature, &error);
     CFRelease(key);
@@ -241,6 +269,42 @@ static void RAPruneLedger(void) {
             [fm removeItemAtPath:path error:NULL];
         }
     }
+}
+
+/*
+ * Reads the device id this Mac was bound to at install time, or nil when the
+ * installer was run without one.
+ *
+ * nil means "not bound", and the caller then skips the comparison rather than
+ * refusing every grant — the behaviour install.sh documents when RA_DEVICE_ID
+ * is omitted. Refusing instead would be the safer-looking choice but a false
+ * one: an unreadable file would silently disable a feature the operator
+ * believes is armed, with no signal anywhere.
+ *
+ * The read is O_NOFOLLOW and fstat-checked for root ownership for the same
+ * reason as the grant and the key: a file a non-root user could plant must not
+ * decide which grants this Mac accepts.
+ */
+static NSString *RAExpectedDeviceID(void) {
+    int fd = open(RA_DEVICE_PATH, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) {
+        return nil;
+    }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_uid != 0 ||
+        st.st_size <= 0 || st.st_size > kMaxDeviceIDBytes) {
+        close(fd);
+        return nil;
+    }
+    NSMutableData *raw = [NSMutableData dataWithLength:(NSUInteger)st.st_size];
+    ssize_t got = read(fd, raw.mutableBytes, (size_t)st.st_size);
+    close(fd);
+    if (got != st.st_size) {
+        return nil;
+    }
+    NSString *text = [[[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding]
+                      stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return text.length > 0 ? text : nil;
 }
 
 /*

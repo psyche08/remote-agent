@@ -44,8 +44,21 @@ flowchart TB
     Ctl --> Audit["audit ring (no secrets)"]
 ```
 
-`remote-agent` 持有 Ed25519 **私钥**；plug-in 只被 provision 对应的**公钥**。
+`remote-agent` 持有 ECDSA P-256 **私钥**；plug-in 只被 provision 对应的**公钥**。
 私钥永远不离开 agent 进程，公钥永远不足以签发 grant。
+
+选 P-256 而不是 Ed25519，是被验证方一侧逼出来的，不是偏好：plug-in 只能走
+Security.framework 验签，而 SecKey 的 Ed25519 常量（`kSecAttrKeyTypeEd25519`、
+`kSecKeyAlgorithmEdDSASignatureMessage…`）是 **SPI** —— 只由 `Security.tbd`
+导出，任何公开头文件里都没有声明。mechanism bundle 一旦绑定私有符号，Apple
+哪天撤掉它，bundle 就会在 **authd 内部、screensaver-unlock right 上**加载失败，
+那正是设计承诺 1 要避免的锁死方向。`kSecKeyAlgorithmECDSASignatureMessageX962SHA256`
+是公开 API，Go 的 `ecdsa.SignASN1` 产出的正是它要的 X9.62 DER。
+
+`mac/preflight.sh` 会在目标 Mac 上做两件 CI 做不到的事：拒绝 plug-in 引用任何
+未在公开头文件中声明的 `kSec*` 常量，以及用 Go 真实签出的 grant 跑一遍 plug-in
+自己的验签函数（并确认换一把公钥会被拒）。两侧各自自洽却互不接受是静默失败——
+agent 一直签，plug-in 一直拒，唯一症状是"这台 Mac 就是解不开锁"。
 
 ## Grant 契约
 

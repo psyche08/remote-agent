@@ -23,6 +23,9 @@ data/
 screenshots/*.png
 !screenshots/.gitkeep
 
+# the authorization plug-in is built and signed on the target Mac, never in CI
+mac/authorization-plugin/build/
+
 # test/tool caches
 .pytest_cache/
 __pycache__/

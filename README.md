@@ -237,11 +237,17 @@ device's own `config.json` — no API call can enable them.
 * **Locked Use** lets an authorized turn keep driving the desktop after the
   screen locks, through an **Apple Authorization Plug-in** that participates in
   the macOS unlock flow. The plug-in **never touches the password** and is
-  **transparent by default**: with no valid grant it returns `undefined` and the
-  normal password mechanism runs exactly as if it were not installed. It can
-  allow an unlock; it can never deny one.
-* **Grants are seconds-long and single-use.** The agent holds an Ed25519 private
-  key and the plug-in only the public half. A grant is minted immediately before
+  **transparent by default**: with no valid grant it returns
+  `kAuthorizationResultAllow`, meaning only "this mechanism does not object",
+  and the password mechanism that follows challenges the user exactly as if the
+  plug-in were not installed. It never returns Deny, and never Undefined —
+  authd may treat Undefined as a mechanism failure and abort the whole
+  authorization, which on the unlock right would be a Mac nobody can open.
+* **Grants are seconds-long and single-use.** The agent holds an ECDSA P-256
+  private key and the plug-in only the public half — P-256 rather than Ed25519
+  because the plug-in verifies through Security.framework, whose Ed25519 SecKey
+  constants are SPI, and a mechanism that binds a private symbol can stop
+  loading inside the unlock right. A grant is minted immediately before
   an unlock, consumed atomically (`O_CREAT|O_EXCL` nonce ledger) by that unlock,
   and withdrawn right after — a grant resting on disk would be ambient authority
   any local process could ride. The verifier enforces its own freshness ceiling

@@ -1,7 +1,7 @@
 package computeruse
 
 import (
-	"crypto/ed25519"
+	"crypto/ecdsa"
 	"encoding/base64"
 	"encoding/json"
 	"os"
@@ -117,7 +117,7 @@ func TestVerifyRejectsOverlongDeclaredTTL(t *testing.T) {
 	raw, _ := json.Marshal(payload)
 	grant := Grant{
 		Payload:   base64.StdEncoding.EncodeToString(raw),
-		Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(signerKey(t, signer), raw)),
+		Signature: base64.StdEncoding.EncodeToString(signPayload(t, signer, raw)),
 	}
 	_, err := VerifyGrant(grant, signer.PublicKey(), "mac-1", now)
 	if err != ErrGrantTTLTooLong {
@@ -156,7 +156,7 @@ func TestVerifyRejectsWrongDeviceAndPurpose(t *testing.T) {
 	raw, _ := json.Marshal(payload)
 	wrongPurpose := Grant{
 		Payload:   base64.StdEncoding.EncodeToString(raw),
-		Signature: base64.StdEncoding.EncodeToString(ed25519.Sign(signerKey(t, signer), raw)),
+		Signature: base64.StdEncoding.EncodeToString(signPayload(t, signer, raw)),
 	}
 	if _, err := VerifyGrant(wrongPurpose, signer.PublicKey(), "mac-1", now); err != ErrGrantPurpose {
 		t.Fatalf("err = %v, want ErrGrantPurpose", err)
@@ -311,7 +311,18 @@ func TestSigningKeyIsPersistedWithRestrictivePermissions(t *testing.T) {
 
 // signerKey reaches the private key for tests that must produce a validly
 // signed but semantically invalid grant.
-func signerKey(t *testing.T, s *Signer) ed25519.PrivateKey {
+func signerKey(t *testing.T, s *Signer) *ecdsa.PrivateKey {
 	t.Helper()
 	return s.key
+}
+
+// signPayload signs raw with the signer's own key, so a test grant is validly
+// signed and fails only on the property under test.
+func signPayload(t *testing.T, s *Signer, raw []byte) []byte {
+	t.Helper()
+	sig, err := SignPayload(signerKey(t, s), raw)
+	if err != nil {
+		t.Fatalf("SignPayload: %v", err)
+	}
+	return sig
 }

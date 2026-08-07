@@ -48,9 +48,10 @@ type LockedUseConfig struct {
 	// GrantDir is where the controller writes signed unlock grants for the
 	// Authorization Plug-in to read. Defaults to <state_dir>/data/locked-use.
 	GrantDir string `json:"grant_dir"`
-	// SigningKeyPath is the Ed25519 private key the controller signs grants
-	// with. Defaults to <state_dir>/data/locked-use/signing.key (0600). The
-	// plugin is provisioned with only the matching public key.
+	// SigningKeyPath is the ECDSA P-256 private key the controller signs grants
+	// with, stored as base64 PKCS#8. Defaults to
+	// <state_dir>/data/locked-use/signing.key (0600). The plugin is provisioned
+	// with only the matching public key.
 	SigningKeyPath string `json:"signing_key_path"`
 	// GrantTTLSeconds bounds how long a single signed grant is valid. A grant
 	// is minted just before an unlock attempt and consumed by it, so this is
