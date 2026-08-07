@@ -16,6 +16,12 @@ func (s *Server) screenshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// A capture taken while the desktop is unlocked under Locked Use but the
+	// privacy shield is not confirmed would persist whatever is on screen to a
+	// file this agent then serves. Refuse rather than capture.
+	if !s.captureGate(w) {
+		return
+	}
 	dir := filepath.Join(filepath.Dir(s.store.DataDir()), "screenshots")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -81,6 +87,11 @@ func (s *Server) recover(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ocr(w http.ResponseWriter, r *http.Request) {
+	// OCR turns a captured frame into text that flows onward. Gate it on the
+	// same condition as the capture itself.
+	if !s.captureGate(w) {
+		return
+	}
 	if s.lastScreenshot == "" {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "not_implemented", "engine": "apple_vision", "detail": "no screenshot available to OCR"})
 		return

@@ -159,6 +159,21 @@ install -m 0755 "$REPO_REMOTE_AGENT/bin/remote-agent" "$RUNTIME_BIN.new"
 mv -f "$RUNTIME_BIN.new" "$RUNTIME_BIN"
 echo "==> installed runtime binary $RUNTIME_BIN"
 
+# The native Swift workers are looked up relative to the service's cwd, which is
+# $LIBEXEC_DIR. Install them alongside the binary so the OCR and computer-use
+# helpers resolve at runtime instead of silently reporting "not available".
+# These are workers only: enabling computer use still requires config.json, and
+# Locked Use additionally requires the separately installed authorization
+# plug-in (see docs/computer-use-locked-user.md).
+if [ -d "$REPO_REMOTE_AGENT/scripts" ]; then
+  ensure_runtime_dir "$LIBEXEC_DIR/scripts"
+  for f in "$REPO_REMOTE_AGENT/scripts/"*.swift; do
+    [ -f "$f" ] || continue
+    install -m 0755 "$f" "$LIBEXEC_DIR/scripts/$(basename "$f")"
+  done
+  echo "==> installed native workers into $LIBEXEC_DIR/scripts"
+fi
+
 # Reject an ambiguous state layout before stopping the currently healthy
 # service. This keeps a preflight failure from causing an outage.
 if [ -e "$STATE_DIR" ] && [ -d "$LEGACY_STATE_DIR" ] && [ ! -L "$LEGACY_STATE_DIR" ]; then

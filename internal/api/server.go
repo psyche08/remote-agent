@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/psyche08/remote-agent/internal/buildinfo"
+	"github.com/psyche08/remote-agent/internal/computeruse"
 	"github.com/psyche08/remote-agent/internal/config"
 	"github.com/psyche08/remote-agent/internal/pricing"
 	"github.com/psyche08/remote-agent/internal/provider"
@@ -52,6 +53,7 @@ type Server struct {
 	pricing         *pricing.Manager
 	lastScreenshot  string
 	lastShotAt      string
+	computerUseCtl  *computeruse.Controller
 }
 
 type nativeSessionCacheEntry struct {
@@ -101,6 +103,15 @@ func NewServer(cfg *config.Config, registry provider.Registry, store *state.Stor
 		clients: map[string]*clientVersionSeen{}, pricing: pricing.New(store.DataDir()),
 	}
 	s.pushSender = func(payload map[string]any) int { return s.sendPushToAll(payload, true) }
+	// The controller exists whenever computer use is configured on, so the
+	// status route can explain the feature. Locked Use only arms in
+	// StartBackground, after its startup scrub establishes a locked baseline.
+	if cfg.ComputerUse.Enabled {
+		s.computerUseCtl = computeruse.NewController(
+			cfg.ComputerUse, cfg.DeviceID, store.DataDir(),
+			computeruse.NewSystem(scriptPath("computer_use.swift")),
+		)
+	}
 	for _, id := range registry.IDs() {
 		providerID := id
 		if p, ok := registry[id].(interface {
@@ -153,11 +164,19 @@ func (s *Server) StartBackgroundWithOptions(autoUpdate bool, watchdog bool) {
 		if watchdog {
 			go s.watchdogLoop()
 		}
+		if s.computerUseCtl != nil {
+			s.computerUseCtl.Start()
+		}
 		s.pricing.Start(s.pushStop)
 	})
 }
 
 func (s *Server) StopBackground() {
+	if s.computerUseCtl != nil {
+		// Closing the window relocks the screen before the process goes away.
+		// A shutdown must not be a way to leave a Mac unlocked.
+		s.computerUseCtl.Stop()
+	}
 	select {
 	case <-s.pushStop:
 	default:
@@ -182,6 +201,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/copy_reply", s.copyReply)
 	mux.HandleFunc("/recover", s.recover)
 	mux.HandleFunc("/ocr", s.ocr)
+	mux.HandleFunc("/computer_use", s.computerUse)
+	mux.HandleFunc("/computer_use/locked_use", s.computerUseLockedUse)
+	mux.HandleFunc("/computer_use/window", s.computerUseWindow)
+	mux.HandleFunc("/computer_use/action", s.computerUseAction)
 	mux.HandleFunc("/sessions", s.sessions)
 	mux.HandleFunc("/native_sessions", s.nativeSessions)
 	mux.HandleFunc("/session_options", s.sessionOptions)

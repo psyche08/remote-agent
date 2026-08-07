@@ -8,6 +8,16 @@
   "push_proxy": "",
   "push_vapid": null,
   "default_provider": "claude",
+  "computer_use": {
+    "enabled": false,
+    "locked_use": {
+      "enabled": false,
+      "grant_ttl_seconds": 10,
+      "window_ttl_seconds": 300,
+      "input_relock_grace_ms": 250,
+      "require_display_shield": true
+    }
+  },
   "providers": {
     "claude": {
       "app_name": "Claude",

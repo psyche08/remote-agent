@@ -25,12 +25,20 @@ The public relay route `/s/remotecoding/` remains a compatibility URL only.
 5. Relay HTTP timeout is 30s. Long waits must be bounded or moved out of the
    request path.
 6. Do not log account, cookie, token, recovery-code, or file contents.
+7. Computer use and Locked Use are opt-in per device and default off. Locked Use
+   participates in the macOS unlock flow through an Apple Authorization Plug-in:
+   it never touches the password, is transparent without a valid grant, and mints
+   only seconds-long single-use signed grants. Config is the ceiling — no API
+   call may enable it. Every safeguard fails toward relocking; there is no
+   log-and-continue branch. See the doc above before touching
+   `internal/computeruse/` or `mac/authorization-plugin/`.
 
 ## Route Context
 
 | Task | Read |
 |---|---|
 | Current provider registry, identities, delivery routes and invariants | [docs/provider-architecture.md](docs/provider-architecture.md) |
+| Computer use, Locked Use, the unlock grant contract and its threat model | [docs/computer-use-locked-user.md](docs/computer-use-locked-user.md) |
 | General project README | [README.md](README.md) |
 | Go API/config/state/provider code | `internal/` |
 | Web console | [static/index.html](static/index.html) |

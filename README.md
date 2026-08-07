@@ -44,8 +44,11 @@ remote-agent/
 ├── static/
 │   ├── shell.html               # stable relay device picker
 │   └── index.html               # full console embedded into the agent binary
+├── mac/
+│   └── authorization-plugin/    # Locked Use Apple Authorization Plug-in (built on the Mac)
 ├── scripts/
-│   └── ocr_vision.swift         # local Apple Vision OCR worker
+│   ├── ocr_vision.swift         # local Apple Vision OCR worker
+│   └── computer_use.swift       # CoreGraphics computer-use worker
 ├── deploy/
 │   └── private-tunnel.example.yaml   # how to expose the agent via ../private-tunnel
 └── screenshots/
@@ -221,6 +224,41 @@ The registered `codex` provider is the Go `provider.Codex`.
   transcript images are served through the session-scoped `/session_asset`
   route instead.
 
+### Computer use & Locked Use
+
+Both are **opt-in per device and default off**, and both must be turned on in the
+device's own `config.json` — no API call can enable them.
+
+* **Computer use** exposes a closed action vocabulary (`screen.capture`,
+  `pointer.move/click/scroll`, `keyboard.type/key`). Unknown ids are refused at
+  the API boundary; nothing reaches a shell, and every coordinate, text length,
+  and chord size is bounded.
+* **Locked Use** lets an authorized turn keep driving the desktop after the
+  screen locks, through an **Apple Authorization Plug-in** that participates in
+  the macOS unlock flow. The plug-in **never touches the password** and is
+  **transparent by default**: with no valid grant it returns `undefined` and the
+  normal password mechanism runs exactly as if it were not installed. It can
+  allow an unlock; it can never deny one.
+* **Grants are seconds-long and single-use.** The agent holds an Ed25519 private
+  key and the plug-in only the public half. A grant is minted immediately before
+  an unlock, consumed atomically (`O_CREAT|O_EXCL` nonce ledger) by that unlock,
+  and withdrawn right after — a grant resting on disk would be ambient authority
+  any local process could ride. The verifier enforces its own freshness ceiling
+  and rejects a grant that declares a longer life.
+* **Safeguards fail toward relocking.** A window requires an already-idle
+  machine and a confirmed display shield *before* unlocking; a fixed 40ms monitor
+  relocks on any local keystroke or pointer movement, a dropped shield, or the
+  hard window TTL. Relock is confirmed by readback before the shield comes down,
+  and startup scrubs any grant a crash left behind. Screen capture and OCR are
+  refused while a window is open without a confirmed shield.
+
+This is deliberately **not** a general-purpose remote unlock: it authorizes one
+turn's unlock, not other applications or local processes. Setup, the full grant
+contract, and the honest threat-model limits — including that the signing key is
+a file rather than Secure-Enclave-bound, and that there is no root deadman
+process — are in
+[`docs/computer-use-locked-user.md`](docs/computer-use-locked-user.md).
+
 ### API-price estimates
 
 The device refreshes standard token prices once per day from the official
@@ -258,6 +296,10 @@ path.
 | GET  | `/pending_approvals` | provider/session-scoped approval and question inbox across every live session |
 | POST | `/approval` | `{provider_id, session_id, request_id, decision}` for a Claude or Codex request |
 | POST | `/question_answer` | `{provider_id, session_id, request_id, answers}` for provider user-input questions |
+| GET  | `/computer_use` | computer-use capability, Locked Use state, and a secret-free audit ring |
+| POST | `/computer_use/locked_use` | `{active}` runtime switch, bounded by on-device config |
+| POST | `/computer_use/window` | `{turn_id, action}` open/close a Locked Use unlock window |
+| POST | `/computer_use/action` | one validated desktop action from a closed vocabulary |
 
 Typed actions give clients a closed operation id plus `endpoint`, `scope`,
 `risk`, and `supported`; legacy boolean capabilities remain for older clients.
@@ -290,10 +332,16 @@ test -x ~/.codex/packages/standalone/current/codex
 | Permission | Needed by | Where |
 |------------|-----------|-------|
 | **Screen Recording** | `screencapture` (screenshots, the OCR input) | System Settings → Privacy & Security → Screen Recording |
+| **Accessibility** | synthetic keyboard/pointer events for computer use | System Settings → Privacy & Security → Accessibility |
 
 The Claude stream-json path and Codex app-server path need **none** of these for core
 operation. Screen Recording is only needed if you use the `/screenshot` or
-`/ocr` endpoints.
+`/ocr` endpoints, and Accessibility only if you enable computer use.
+
+Locked Use additionally requires installing the Apple Authorization Plug-in —
+see [`docs/computer-use-locked-user.md`](docs/computer-use-locked-user.md). It is
+a separate, reversible, admin-only step that changes how the Mac unlocks, and it
+stays inert until you also opt in via `config.json`.
 
 ### 3. Run
 
