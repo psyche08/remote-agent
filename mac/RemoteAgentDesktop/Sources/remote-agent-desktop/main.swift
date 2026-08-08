@@ -78,10 +78,23 @@ if selfCheck || checkShield || checkLock {
         FileHandle.standardOutput.write(router.handle(line: Data("{\"op\":\"\(op)\"}".utf8)))
     }
     if checkShield {
+        // The shield is AppKit windows, so this needs what AppKit needs: an
+        // initialized NSApplication and a running run loop. Engaging and then
+        // sleeping on the main thread would block the very loop that composites
+        // the windows — the check would pass against windows nobody ever saw,
+        // which is worse than not checking, because it would certify a shield
+        // that does not cover anything.
+        let application = NSApplication.shared
+        application.setActivationPolicy(.accessory)
+        application.finishLaunching()
         let engaged = desktop.engageShield()
-        Thread.sleep(forTimeInterval: 2)
+        RunLoop.main.run(until: Date().addingTimeInterval(2))
         let live = desktop.shieldState()
         desktop.releaseShield()
+        // Let the release reach the window server before the process exits, so
+        // a failure to drop the shield surfaces here rather than as a black
+        // screen the operator has to reason about.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
         let result: [String: Any] = [
             "ok": engaged.engaged && live.engaged,
             "check": "shield",
