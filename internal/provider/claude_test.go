@@ -2,9 +2,11 @@ package provider
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,7 +27,7 @@ func TestClaudeCLIStreamJSONLifecycleAndApproval(t *testing.T) {
 	dir := t.TempDir()
 	argsPath := filepath.Join(dir, "args.txt")
 	t.Setenv("CLAUDE_STREAM_ARGS_FILE", argsPath)
-	c := NewClaudeCLI("claude", config.ProviderConfig{Command: writeClaudeStreamFixture(t, dir), Cwd: dir})
+	c := NewClaudeCLI("claude", config.ProviderConfig{Command: writeClaudeStreamFixture(t), Cwd: dir})
 	t.Cleanup(c.StopCLIStream)
 	frameSeen := make(chan struct{}, 1)
 	c.SetStreamPublisher(func(target string, frame map[string]any) {
@@ -86,7 +88,7 @@ func TestClaudeCLIStreamJSONResumeAndInterrupt(t *testing.T) {
 	argsPath := filepath.Join(dir, "args.txt")
 	t.Setenv("CLAUDE_STREAM_ARGS_FILE", argsPath)
 	c := NewClaudeCLI("claude", config.ProviderConfig{
-		Command: writeClaudeStreamFixture(t, dir), Cwd: dir,
+		Command: writeClaudeStreamFixture(t), Cwd: dir,
 		Extra: map[string]any{"turnstate_dir": filepath.Join(dir, "turnstate")},
 	})
 	t.Cleanup(c.StopCLIStream)
@@ -108,7 +110,7 @@ func TestClaudeCLIStreamJSONResumeAndInterrupt(t *testing.T) {
 
 func TestClaudeCLIStreamJSONDenialAndQuestionResponses(t *testing.T) {
 	dir := t.TempDir()
-	c := NewClaudeCLI("claude", config.ProviderConfig{Command: writeClaudeStreamFixture(t, dir), Cwd: dir})
+	c := NewClaudeCLI("claude", config.ProviderConfig{Command: writeClaudeStreamFixture(t), Cwd: dir})
 	t.Cleanup(c.StopCLIStream)
 	transcriptID := "019ef769-7611-70e0-839a-283dc0e5f256"
 	if _, err := c.OpenOrCreateSession(transcriptID, StartOptions{}); err != nil {
@@ -194,7 +196,7 @@ func TestClaudeCLIStreamJSONRestartsCompletedProcessWithResume(t *testing.T) {
 	t.Setenv("CLAUDE_STREAM_ARGS_FILE", argsPath)
 	t.Setenv("CLAUDE_STREAM_ARGS_APPEND", "1")
 	t.Setenv("CLAUDE_STREAM_EXIT_AFTER_RESULT", "1")
-	c := NewClaudeCLI("claude", config.ProviderConfig{Command: writeClaudeStreamFixture(t, dir), Cwd: dir})
+	c := NewClaudeCLI("claude", config.ProviderConfig{Command: writeClaudeStreamFixture(t), Cwd: dir})
 	t.Cleanup(c.StopCLIStream)
 	transcriptID := "019ef769-7611-70e0-839a-283dc0e5f256"
 	c.BindTranscript("logical-restart", transcriptID)
@@ -229,8 +231,41 @@ func TestClaudeCLIStreamJSONRestartsCompletedProcessWithResume(t *testing.T) {
 	}
 }
 
-func writeClaudeStreamFixture(t *testing.T, dir string) string {
+// The stream fixture takes all of its behaviour from its arguments and
+// environment, never from where it lives, so one warmed copy serves the whole
+// package. Writing a fresh copy per test made the managed-CLI initialize
+// handshake absorb a first-exec evaluation (see writeWarmTestExecutable),
+// which under load could outrun the handshake timeout.
+var (
+	claudeStreamFixtureOnce sync.Once
+	claudeStreamFixtureDir  string
+	claudeStreamFixturePath string
+	claudeStreamFixtureErr  error
+)
+
+func cleanupClaudeStreamFixture() {
+	if claudeStreamFixtureDir != "" {
+		_ = os.RemoveAll(claudeStreamFixtureDir)
+	}
+}
+
+func writeClaudeStreamFixture(t *testing.T) string {
 	t.Helper()
+	claudeStreamFixtureOnce.Do(func() {
+		claudeStreamFixturePath, claudeStreamFixtureErr = buildWarmClaudeStreamFixture()
+	})
+	if claudeStreamFixtureErr != nil {
+		t.Fatal(claudeStreamFixtureErr)
+	}
+	return claudeStreamFixturePath
+}
+
+func buildWarmClaudeStreamFixture() (string, error) {
+	dir, err := os.MkdirTemp("", "rc-claude-fixture-")
+	if err != nil {
+		return "", fmt.Errorf("create Claude stream fixture directory: %w", err)
+	}
+	claudeStreamFixtureDir = dir
 	path := filepath.Join(dir, "fake-claude-stream")
 	script := `#!/bin/sh
 if [ -n "$CLAUDE_STREAM_ARGS_FILE" ]; then
@@ -271,9 +306,14 @@ while IFS= read -r line; do
 done
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
+		return "", fmt.Errorf("write Claude stream fixture: %w", err)
 	}
-	return path
+	// Blank the args file for the warm-up exec only, so warming never records
+	// itself in the args a test is about to assert on.
+	if err := warmTestExecutable(path, "CLAUDE_STREAM_ARGS_FILE="); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func waitForClaudeState(t *testing.T, c *Claude, sessionID string, want string) {

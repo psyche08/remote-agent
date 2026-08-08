@@ -856,10 +856,10 @@ func TestClaudeInstalledDetection(t *testing.T) {
 	if missing.Installed() {
 		t.Fatal("claude must report not installed for a missing binary")
 	}
-	bin := filepath.Join(t.TempDir(), "claude")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true}'\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	// cliAuthenticated probes the CLI under a 2s bound, so each fake must be
+	// warm before it is used (see writeWarmTestExecutable).
+	bin := writeWarmTestExecutable(t, filepath.Join(t.TempDir(), "claude"),
+		"#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true}'\n", 0o755)
 	present := NewClaudeCLI("claude", config.ProviderConfig{Command: bin})
 	if !present.Installed() || !present.Status().Installed {
 		t.Fatal("claude must report installed when the binary exists")
@@ -868,18 +868,14 @@ func TestClaudeInstalledDetection(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(userBin), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(userBin, []byte("#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true}'\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	writeWarmTestExecutable(t, userBin, "#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true}'\n", 0o755)
 	t.Setenv("PATH", t.TempDir())
 	userInstalled := NewClaudeCLI("claude", config.ProviderConfig{Command: "claude"})
 	if got := userInstalled.resolveCommand(); got != userBin {
 		t.Fatalf("bare claude command resolved to %q, want standard user install %q", got, userBin)
 	}
-	loggedOutBin := filepath.Join(t.TempDir(), "claude")
-	if err := os.WriteFile(loggedOutBin, []byte("#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":false}'\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
+	loggedOutBin := writeWarmTestExecutable(t, filepath.Join(t.TempDir(), "claude"),
+		"#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":false}'\n", 0o755)
 	loggedOut := NewClaudeCLI("claude", config.ProviderConfig{Command: loggedOutBin})
 	if loggedOut.Installed() || loggedOut.Status().Installed {
 		t.Fatal("unauthenticated Claude CLI provider must stay hidden")

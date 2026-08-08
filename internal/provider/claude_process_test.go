@@ -97,7 +97,7 @@ func TestClaudeCLIResumeStopsDesktopOwnerBeforeIgnoringRunningTurnstate(t *testi
 	}
 	t.Setenv("CLAUDE_STREAM_ARGS_FILE", argsPath)
 	c := NewClaudeCLI("claude", config.ProviderConfig{
-		Command: writeClaudeStreamFixture(t, dir), Cwd: dir,
+		Command: writeClaudeStreamFixture(t), Cwd: dir,
 		Extra: map[string]any{"claude_code_sessions_dir": desktopDir, "turnstate_dir": turnDir},
 	})
 	t.Cleanup(c.StopCLIStream)
@@ -128,7 +128,7 @@ func TestClaudeCLIResumeRefusesWhenDesktopOwnerCannotStop(t *testing.T) {
 	writeClaudeDesktopSessionMeta(t, desktopDir, "native", transcriptID)
 	t.Setenv("CLAUDE_STREAM_ARGS_FILE", argsPath)
 	c := NewClaudeCLI("claude", config.ProviderConfig{
-		Command: writeClaudeStreamFixture(t, dir), Cwd: dir,
+		Command: writeClaudeStreamFixture(t), Cwd: dir,
 		Extra: map[string]any{"claude_code_sessions_dir": desktopDir},
 	})
 	t.Cleanup(c.StopCLIStream)
@@ -154,7 +154,7 @@ func TestClaudeCLILazySendStopsDesktopOwnerBeforeResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	c := NewClaudeCLI("claude", config.ProviderConfig{
-		Command: writeClaudeStreamFixture(t, dir), Cwd: dir,
+		Command: writeClaudeStreamFixture(t), Cwd: dir,
 		Extra: map[string]any{"claude_code_sessions_dir": desktopDir, "turnstate_dir": turnDir},
 	})
 	t.Cleanup(c.StopCLIStream)

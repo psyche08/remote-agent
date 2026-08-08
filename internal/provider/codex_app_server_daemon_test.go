@@ -3,10 +3,12 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,10 +36,7 @@ func TestQueryCodexSharedDaemon(t *testing.T) {
 		"futureCompatibleField": true,
 	}))
 
-	status, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
+	status := mustQueryCodexSharedDaemon(t, binary)
 	if status.SocketPath != socket {
 		t.Fatalf("socket path=%q want=%q", status.SocketPath, socket)
 	}
@@ -56,9 +55,7 @@ func TestQueryCodexSharedDaemonRejectsNonRunningStatus(t *testing.T) {
 	}))
 
 	_, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "not running") {
-		t.Fatalf("error=%v, want not-running failure", err)
-	}
+	requireCodexSharedDaemonFailure(t, err, "not running")
 }
 
 func TestStartCodexSharedDaemonIsExplicitAndBounded(t *testing.T) {
@@ -81,9 +78,7 @@ func TestQueryCodexSharedDaemonRejectsInvalidVersion(t *testing.T) {
 	}))
 
 	_, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "invalid version") {
-		t.Fatalf("error=%v, want invalid-version failure", err)
-	}
+	requireCodexSharedDaemonFailure(t, err, "invalid version")
 }
 
 func TestQueryCodexSharedDaemonRejectsInsecureSocket(t *testing.T) {
@@ -96,9 +91,7 @@ func TestQueryCodexSharedDaemonRejectsInsecureSocket(t *testing.T) {
 	t.Setenv(codexSharedDaemonTestStatusEnv, runningCodexSharedDaemonTestStatus(t, socket))
 
 	_, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "permissions must be 0600") {
-		t.Fatalf("error=%v, want private-socket failure", err)
-	}
+	requireCodexSharedDaemonFailure(t, err, "permissions must be 0600")
 }
 
 func TestQueryCodexSharedDaemonRejectsSymlinkSocket(t *testing.T) {
@@ -112,9 +105,7 @@ func TestQueryCodexSharedDaemonRejectsSymlinkSocket(t *testing.T) {
 	t.Setenv(codexSharedDaemonTestStatusEnv, runningCodexSharedDaemonTestStatus(t, link))
 
 	_, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "not a direct Unix socket") {
-		t.Fatalf("error=%v, want direct-socket failure", err)
-	}
+	requireCodexSharedDaemonFailure(t, err, "not a direct Unix socket")
 }
 
 func TestQueryCodexSharedDaemonRejectsRelativeSocket(t *testing.T) {
@@ -122,9 +113,7 @@ func TestQueryCodexSharedDaemonRejectsRelativeSocket(t *testing.T) {
 	t.Setenv(codexSharedDaemonTestStatusEnv, runningCodexSharedDaemonTestStatus(t, "control.sock"))
 
 	_, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "path is not absolute") {
-		t.Fatalf("error=%v, want absolute-path failure", err)
-	}
+	requireCodexSharedDaemonFailure(t, err, "path is not absolute")
 }
 
 func TestQueryCodexSharedDaemonRejectsWritableParent(t *testing.T) {
@@ -139,9 +128,7 @@ func TestQueryCodexSharedDaemonRejectsWritableParent(t *testing.T) {
 	t.Setenv(codexSharedDaemonTestStatusEnv, runningCodexSharedDaemonTestStatus(t, socket))
 
 	_, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "parent is writable by another user") {
-		t.Fatalf("error=%v, want writable-parent failure", err)
-	}
+	requireCodexSharedDaemonFailure(t, err, "parent is writable by another user")
 }
 
 func TestCodexSharedDaemonDialRejectsSocketReplacement(t *testing.T) {
@@ -149,10 +136,7 @@ func TestCodexSharedDaemonDialRejectsSocketReplacement(t *testing.T) {
 	binary := writeCodexSharedDaemonTestBinary(t)
 	t.Setenv(codexSharedDaemonTestStatusEnv, runningCodexSharedDaemonTestStatus(t, socket))
 
-	status, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
+	status := mustQueryCodexSharedDaemon(t, binary)
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -182,9 +166,8 @@ func TestQueryCodexSharedDaemonRejectsVersionSkew(t *testing.T) {
 		"appServerVersion": "0.145.0",
 	}))
 
-	if _, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second); err == nil || !strings.Contains(err.Error(), "version mismatch") {
-		t.Fatalf("error=%v, want version-mismatch failure", err)
-	}
+	_, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
+	requireCodexSharedDaemonFailure(t, err, "version mismatch")
 }
 
 func TestQueryCodexSharedDaemonIsBounded(t *testing.T) {
@@ -207,9 +190,7 @@ func TestQueryCodexSharedDaemonRejectsOversizedStatus(t *testing.T) {
 	t.Setenv(codexSharedDaemonTestStatusEnv, strings.Repeat("x", codexSharedDaemonMaxStatus+1))
 
 	_, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
-	if err == nil || !strings.Contains(err.Error(), "oversized") {
-		t.Fatalf("error=%v, want oversized-status failure", err)
-	}
+	requireCodexSharedDaemonFailure(t, err, "oversized")
 }
 
 func TestValidCodexSharedDaemonVersion(t *testing.T) {
@@ -348,9 +329,48 @@ func listenCodexSharedDaemonTestSocket(t *testing.T) (string, net.Listener) {
 	return socket, listener
 }
 
+// Writing a fresh fake Codex per test made every bounded status query absorb a
+// first-exec evaluation (see writeWarmTestExecutable), which regularly ran
+// longer than the timeout under test. Build the fake once per package run and
+// warm it, so each test measures only the code under test.
+var (
+	codexSharedDaemonTestBinaryOnce sync.Once
+	codexSharedDaemonTestBinaryDir  string
+	codexSharedDaemonTestBinaryPath string
+	codexSharedDaemonTestBinaryErr  error
+)
+
+// cleanupCodexSharedDaemonTestBinary is called from TestMain, because the fake
+// outlives the individual test that first asked for it.
+func cleanupCodexSharedDaemonTestBinary() {
+	if codexSharedDaemonTestBinaryDir != "" {
+		_ = os.RemoveAll(codexSharedDaemonTestBinaryDir)
+	}
+}
+
 func writeCodexSharedDaemonTestBinary(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "codex-test")
+	codexSharedDaemonTestBinaryOnce.Do(func() {
+		codexSharedDaemonTestBinaryPath, codexSharedDaemonTestBinaryErr = buildWarmCodexSharedDaemonTestBinary()
+	})
+	if codexSharedDaemonTestBinaryErr != nil {
+		t.Fatal(codexSharedDaemonTestBinaryErr)
+	}
+	return codexSharedDaemonTestBinaryPath
+}
+
+func buildWarmCodexSharedDaemonTestBinary() (string, error) {
+	dir, err := os.MkdirTemp("", "rc-codex-fake-")
+	if err != nil {
+		return "", fmt.Errorf("create fake Codex directory: %w", err)
+	}
+	codexSharedDaemonTestBinaryDir = dir
+	// QueryCodexSharedDaemon rejects an executable whose parent is writable by
+	// another user, so pin the mode instead of inheriting the process umask.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		return "", fmt.Errorf("restrict fake Codex directory: %w", err)
+	}
+	path := filepath.Join(dir, "codex-test")
 	script := `#!/bin/sh
 if [ "$1" != "app-server" ] || [ "$2" != "daemon" ]; then
   exit 97
@@ -371,9 +391,45 @@ fi
 printf '%s' "$RC_TEST_CODEX_DAEMON_STATUS"
 `
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
-		t.Fatal(err)
+		return "", fmt.Errorf("write fake Codex: %w", err)
 	}
-	return path
+	if err := warmTestExecutable(path); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// mustQueryCodexSharedDaemon runs the status query that a test needs to
+// succeed before it can assert anything, and reports a timeout as a harness
+// failure rather than a plain query error.
+func mustQueryCodexSharedDaemon(t *testing.T, binary string) CodexSharedDaemonStatus {
+	t.Helper()
+	status, err := QueryCodexSharedDaemon(context.Background(), binary, time.Second)
+	if err == nil {
+		return status
+	}
+	if strings.Contains(err.Error(), "status query timed out") {
+		t.Fatalf("harness failure: the fake Codex status query timed out before the assertion could run: %v", err)
+	}
+	t.Fatal(err)
+	return CodexSharedDaemonStatus{}
+}
+
+// requireCodexSharedDaemonFailure asserts a specific rejection reason and
+// reports a status-query timeout as a distinct harness failure, so an
+// environment problem can never masquerade as a security assertion that ran
+// and merely produced a different message.
+func requireCodexSharedDaemonFailure(t *testing.T, err error, want string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("error=nil, want %q failure", want)
+	}
+	if strings.Contains(err.Error(), "status query timed out") {
+		t.Fatalf("harness failure: the fake Codex status query timed out before the %q assertion could run: %v", want, err)
+	}
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("error=%v, want %q failure", err, want)
+	}
 }
 
 func runningCodexSharedDaemonTestStatus(t *testing.T, socket string) string {
