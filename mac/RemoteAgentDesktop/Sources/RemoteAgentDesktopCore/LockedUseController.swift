@@ -43,6 +43,8 @@ public final class LockedUseController: @unchecked Sendable {
     /// the post-unlock side this is time the desktop is live, so it is a bound
     /// on exposure, not a convenience.
     private static let shieldConfirmTimeout: TimeInterval = 2.0
+    /// How often to re-provoke the login window while a grant is alive.
+    private static let provocationInterval: TimeInterval = 1.0
     private static let auditRingSize = 64
 
     /// One authorized per-turn unlock window.
@@ -333,7 +335,28 @@ public final class LockedUseController: @unchecked Sendable {
 
         // The unlock itself is performed by macOS. This process does not supply
         // a credential; it has only asserted, verifiably, that an authorized
-        // turn is asking. The Authorization Plug-in decides.
+        // turn is asking. The Authorization Plug-in decides — and on a real
+        // locked Mac it does exactly what it should. Measured directly:
+        //
+        //   authd: running mechanism CodexComputerUseAuthorizationPlugin:allow
+        //   authd: running mechanism RemoteAgentLockedUse:invoke,privileged
+        //   authd: Succeeded authorizing right 'system.login.screensaver'
+        //
+        // So the grant contract, the plug-in, and the rule wiring are sound;
+        // the k-of-n=1 order works, with the other agent's branch declining
+        // and ours authorizing. What is missing is narrower and is not in this
+        // codebase's reach: the login window has two unlock paths — a PAM path
+        // (password/biometrics) and the authorizationdb path our mechanism sits
+        // on — and it chooses between them itself. provokeUnlockAttempt below
+        // (IOPMAssertionDeclareUserActivity) reliably makes it *begin* an
+        // unlock, logged as `startUnlock: kLWUnlockFromUserActive`, but it
+        // begins on the PAM path, which reports no non-interactive mechanism
+        // available and stops. Nothing a user-session process can post drives
+        // it onto the authorizationdb path; that is the login window's own
+        // decision. See docs/computer-use-locked-user.md "未验证事项".
+        if lockedAtOpen {
+            system.provokeUnlockAttempt()
+        }
         let unlockError = awaitUnlock(payload: minted.1)
         // Withdraw the grant regardless of outcome so nothing can ride it later.
         GrantStore.remove(from: grantDirectory)
@@ -365,6 +388,8 @@ public final class LockedUseController: @unchecked Sendable {
     /// though the desktop is reachable.
     private func awaitUnlock(payload: GrantPayload) -> Error? {
         let deadline = Date(timeIntervalSince1970: TimeInterval(payload.expiresAt))
+        let now = { Date() }
+        var lastProvocation = Date()
         while true {
             do {
                 if try !system.isLocked() { return nil }
@@ -377,6 +402,14 @@ public final class LockedUseController: @unchecked Sendable {
             }
             if stopLatch.wait(timeout: Self.inputPollInterval) {
                 return LockedUseError.systemFailure("shutting down")
+            }
+            // Keep knocking while the grant is alive. The first event may land
+            // while the system still considers the user active, in which case
+            // there is no transition for the login window to notice, and one
+            // attempt would be the whole chance we get.
+            if now().timeIntervalSince(lastProvocation) >= Self.provocationInterval {
+                lastProvocation = now()
+                system.provokeUnlockAttempt()
             }
         }
     }

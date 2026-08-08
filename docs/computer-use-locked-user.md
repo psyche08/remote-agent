@@ -305,12 +305,50 @@ grant 能否真正缩短解锁流程，取决于该 right 的 mechanism 列表�
 | Go 写的私钥能被 helper 读取并导出相同公钥 | 已验证（金标向量） |
 | 遮罩在**单屏 / 外接镜像**下确实黑屏且无边缘漏光 | 已验证（人工目视 + 窗口服务器几何） |
 | 遮罩在**外接扩展**排布下的覆盖 | **未复验**——最初的漏遮缺陷正是在此排布下发现的 |
-| `SACLockScreenImmediate` 真能锁屏 | **未验证**（`--check-lock`，会真的锁屏） |
-| plug-in 装上后能否真正缩短解锁 | **未验证**，见上文 |
+| `SACLockScreenImmediate` 真能锁屏 | **已验证**（真机锁屏，helper 的 `lock` 生效） |
+| 授权链本身（plug-in 被求值 → 验签 → 消费 nonce → 放行） | **已验证**（真机 authd 日志，见下） |
+| 从锁屏状态自动解锁并接管桌面 | **未打通**——缺口在 loginwindow 内部，见下 |
 
 遮罩这一项无法用截屏自证：实测表明 `screencapture` 在这条路径上抓不到本进程的
 窗口（连普通层级的全屏窗口也抓不到），所以像素采样不能作为证据，只能靠窗口服务器
 报告的几何 + 人工目视。
+
+### 锁屏自动解锁：链路已通，缺 loginwindow 的最后一跳
+
+在真机（macOS 26.5，屏幕真实锁定）上，用 `AuthorizationCopyRights` 直接求值
+`system.login.screensaver`、同时 helper 发布一个有效 grant，authd 日志确凿地
+显示整条授权链按设计工作：
+
+```
+authd: engine … running mechanism CodexComputerUseAuthorizationPlugin:allow (1 of 1)
+authd: engine … running mechanism RemoteAgentLockedUse:invoke,privileged (1 of 1)
+authd: Succeeded authorizing right 'system.login.screensaver'
+```
+
+即 `k-of-n=1` 的“或”语义正确：同机已装的 OpenAI CUA 分支先跑、因无 pending 而
+拒绝，落到我们的分支，grant 验签通过 → 授权成功，`consumed/` 里 nonce 被烧掉。
+**grant 契约、plug-in、rule 排布三者都已在真机证实无误。**
+
+缺的一跳**不在本仓库的可达范围内**：loginwindow 撤销锁屏有两条独立路径——
+
+* **PAM 路径**（`/etc/pam.d/screensaver`，密码/生物识别），以及
+* **authorizationdb 路径**（求值 `system.login.screensaver`，我们的 mechanism 挂在这里）。
+
+`IOPMAssertionDeclareUserActivity`（`kIOPMUserActiveLocal`/`Remote` 均试过）能
+可靠地让 loginwindow **发起**解锁（日志 `startUnlock: kLWUnlockFromUserActive`），
+但它总是走 PAM 路径、报 `AvailableMechanisms=( ) · User interaction required`
+后停下，**从不进入 authorizationdb 路径**。以下用户态手段全部试过、均无法让它改走
+authorizationdb 路径：local/remote 用户活动声明、显示器休眠→唤醒、锁屏 UI 已显示
+（用户已选定）状态、`CGEventPostToPid` 直投 loginwindow、合成 HID 事件（锁屏时
+根本到不了 HID 层，实测空闲计时器不重置）。
+
+参照实现（OpenAI CUA）的 plug-in 注释自述为“**询问 SkyComputerUseClient 是否有
+pending 的 Computer Use 登录授权**”，与我们“读磁盘 grant”在语义上等价；其组件也
+未链接 login.framework、未安装任何特权守护进程。因此这最后一跳要么依赖某个尚未
+定位的 loginwindow 内部触发条件，要么需要一个特权（root）组件在 HID 层注入真实
+输入。**在补上这一跳之前，Locked Use 不能在“无人在场、纯远程唤起已锁 Mac”的场景
+下工作**；但一旦有真实用户活动使 loginwindow 走上 authorizationdb 路径，授权链已
+证实会正确放行。
 
 ## 威胁模型与已知边界
 

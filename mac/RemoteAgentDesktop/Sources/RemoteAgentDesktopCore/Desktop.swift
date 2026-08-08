@@ -165,6 +165,37 @@ public final class DesktopService: @unchecked Sendable {
         lock.unlock()
     }
 
+    /// Posts a single synthetic event to make the login window notice user
+    /// activity.
+    ///
+    /// Publishing a grant does not make macOS evaluate anything. The unlock
+    /// begins when loginwindow sees the user-activity state go active — its own
+    /// log calls it "user event received, start an unlock with 'active user' as
+    /// the reason" — and only then is the authorization right evaluated, which
+    /// is where a grant can authorize anything at all.
+    ///
+    /// What matters is the *transition*, not the event: a machine already
+    /// considered active produces no transition and no unlock. The controller
+    /// requires the device to be idle before opening a window, so by the time
+    /// this runs the state is inactive and this one event flips it.
+    ///
+    /// It is marked as ours like any other synthetic post, so the presence
+    /// safeguard does not read the agent knocking on the door as a person
+    /// arriving at it.
+    public func provokeUnlockAttempt() {
+        markSyntheticPost()
+        guard let source = try? eventSource() else { return }
+        // A move rather than a click or a keystroke: at the login window a
+        // click lands somewhere and a keystroke lands in the password field.
+        // A move is the least the system can be asked to notice.
+        let position = CGPoint(x: 1, y: 1)
+        if let event = CGEvent(
+            mouseEventSource: source, mouseType: .mouseMoved,
+            mouseCursorPosition: position, mouseButton: .left) {
+            event.post(tap: .cghidEventTap)
+        }
+    }
+
     // MARK: - Display shield
 
     public func engageShield() -> (engaged: Bool, displays: Int) {

@@ -32,6 +32,10 @@ public protocol LockedUseSystem: AnyObject, Sendable {
     func releaseShield() throws
     /// The shield's current state, re-probed rather than cached.
     func shieldEngaged() -> Bool
+    /// Makes the login window notice user activity, so it begins an unlock and
+    /// the authorization right is evaluated. Publishing a grant alone makes
+    /// macOS evaluate nothing.
+    func provokeUnlockAttempt()
     /// Executes a validated action. The result is action-specific (e.g. a
     /// screenshot path); it never carries secrets.
     func run(_ action: Action) throws -> DesktopService.ActionResult
@@ -66,6 +70,10 @@ public final class DesktopSystem: LockedUseSystem {
 
     public func confirmShieldCoverage(timeout: TimeInterval) -> Bool {
         desktop.confirmShieldCoverage(timeout: timeout)
+    }
+
+    public func provokeUnlockAttempt() {
+        desktop.provokeUnlockAttempt()
     }
 
     public func releaseShield() throws { desktop.releaseShield() }

@@ -81,6 +81,16 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
         return shieldUp && !coverageUnconfirmable
     }
 
+    /// Counts how often the controller knocked on the login window's door.
+    /// Publishing a grant provokes nothing on its own, so a controller that
+    /// never knocks can only ever time out.
+    private(set) var provocations = 0
+    func provokeUnlockAttempt() {
+        mutex.lock()
+        provocations += 1
+        mutex.unlock()
+    }
+
     func run(_ action: Action) throws -> DesktopService.ActionResult {
         mutex.lock()
         defer { mutex.unlock() }
@@ -135,6 +145,7 @@ final class UnavailableSystem: LockedUseSystem, @unchecked Sendable {
     func releaseShield() throws { throw LockedUseError.unsupported }
     func shieldEngaged() -> Bool { false }
     func confirmShieldCoverage(timeout: TimeInterval) -> Bool { false }
+    func provokeUnlockAttempt() {}
     func run(_ action: Action) throws -> DesktopService.ActionResult {
         throw LockedUseError.unsupported
     }
@@ -563,14 +574,47 @@ extension LockedUseControllerTests {
     /// confirmation keeps its original place: before anything else happens.
     func testAnUnlockedScreenStillConfirmsTheShieldFirst() {
         let system = FakeSystem()
-        system.set(locked: false)
         system.coverageUnconfirmable = true
         let controller = makeController(system: system)
+        // The startup scrub locks; the unlocked state has to be established
+        // after it or this would silently exercise the locked path.
+        system.set(locked: false)
 
         XCTAssertThrowsError(try controller.openWindow(turnID: "turn-1")) { error in
             guard case LockedUseError.shieldRequired = error else {
                 return XCTFail("expected shieldRequired, got \(error)")
             }
         }
+    }
+}
+
+/// A published grant provokes nothing. macOS evaluates the unlock right when
+/// the login window sees user activity go active — its own log calls it "user
+/// event received, start an unlock with 'active user' as the reason" — so a
+/// controller that only publishes and waits can do nothing but time out, which
+/// is what every attempt on the first real device did.
+extension LockedUseControllerTests {
+    func testOpeningFromALockedScreenProvokesTheLoginWindow() throws {
+        let system = FakeSystem()
+        let controller = makeController(system: system)
+        try controller.openWindow(turnID: "turn-1")
+        XCTAssertGreaterThan(
+            system.provocations, 0,
+            "the controller published a grant and waited without asking macOS to evaluate it")
+    }
+
+    /// Nothing needs provoking when the screen is already unlocked, and doing
+    /// it anyway would post an event into whatever has focus.
+    func testAnUnlockedScreenIsNotProvoked() throws {
+        let system = FakeSystem()
+        let controller = makeController(system: system)
+        // After the controller, not before: the startup scrub locks the screen
+        // on purpose, so setting this first would test the locked path while
+        // claiming to test the unlocked one.
+        system.set(locked: false)
+        try controller.openWindow(turnID: "turn-1")
+        XCTAssertEqual(
+            system.provocations, 0,
+            "an already-unlocked screen was sent a synthetic event for no reason")
     }
 }
