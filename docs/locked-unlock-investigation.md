@@ -115,10 +115,25 @@ loginwindow: _authSuccessUsingPassword | Unlock succeeded, with password
 3. FileVault 为 Off，故 `with password` 一句不必然意味着键入了密码（keybag 无需
    真实凭据）；此点不单独作为结论依据。
 
-**分岔点已定位到 `began service screensaver` 之后那约 2.8 秒**：成功序列在此之后
-走 `_authCopyRights` 并求值授权链；本人所有触发（含与成功序列前段逐行一致的
-`userActivityChanged → enqueueUnlock reason:9 → Did Wake → authStateForUsername
-→ began service screensaver`）都停在 `began service screensaver`，不进入求值。
+**分岔点已定位到 `began service screensaver` 之后**，且经 live capture 确证为
+**结构性、而非时序性**差异。本人触发在此之后的实录：
+
+```
+loginwindow: LWPAMManager _beginServiceNamed: | began service screensaver
+             MechanismTree=(1)
+             User interaction required.
+             AvailableMechanisms=( )
+```
+
+即软件声明的用户活动（`kLWUnlockFromUserActive`）在 `began service` 之后**总是
+走 PAM 路径**（`/etc/pam.d/screensaver`，不含我们的 mechanism），报告"可用非交互
+机制为空、需要交互"后停下，**从不咨询任何 authorization plug-in**。成功序列（T0）
+在此之后走的是 `_authCopyRights`（authorizationdb 路径），说明 T0 的进入方式**不是**
+`IOPMAssertionDeclareUserActivity` 能复现的 `userActivityChanged` 路径。
+
+**结论修正**：缺口不是"那 2.8 秒里少调了某个 API"，而是 **loginwindow 对软件声明的
+用户活动，架构上只走 PAM 路径**；进入 authorizationdb 路径（会调我们 plug-in）的
+触发条件，无任何已试的用户态 API 能复现。
 
 这 2.8 秒里发生了什么，是打通最后一跳的唯一未知数。它已随统一日志保留窗口过期，
 **必须在 `/usr/bin/log stream` 实时捕获运行期间让成功序列重现一次**才能取得——

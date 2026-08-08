@@ -344,16 +344,29 @@ public final class LockedUseController: @unchecked Sendable {
         //
         // So the grant contract, the plug-in, and the rule wiring are sound;
         // the k-of-n=1 order works, with the other agent's branch declining
-        // and ours authorizing. What is missing is narrower and is not in this
-        // codebase's reach: the login window has two unlock paths — a PAM path
-        // (password/biometrics) and the authorizationdb path our mechanism sits
-        // on — and it chooses between them itself. provokeUnlockAttempt below
+        // and ours authorizing. What is missing is narrower and is structural,
+        // not a timing gap, and it is not in this codebase's reach.
+        //
+        // The login window has two unlock paths. provokeUnlockAttempt below
         // (IOPMAssertionDeclareUserActivity) reliably makes it *begin* an
-        // unlock, logged as `startUnlock: kLWUnlockFromUserActive`, but it
-        // begins on the PAM path, which reports no non-interactive mechanism
-        // available and stops. Nothing a user-session process can post drives
-        // it onto the authorizationdb path; that is the login window's own
-        // decision. See docs/computer-use-locked-user.md "未验证事项".
+        // unlock — logged as `startUnlock: kLWUnlockFromUserActive` — but that
+        // software-declared activity always begins on the PAM path
+        // (`LWPAMManager _beginServiceNamed: screensaver`), which our mechanism
+        // is not part of. Captured live, that path reports:
+        //
+        //   MechanismTree=(1) · AvailableMechanisms=( ) · User interaction required.
+        //
+        // and stops, never consulting an authorization plug-in. The
+        // authorizationdb path — the one that runs our mechanism — is reached
+        // only by an evaluation the login window initiates for some other
+        // reason (observed once, as T0), and no user-space API reproduces that
+        // entry: local/remote activity, display sleep→wake, shown lock UI,
+        // CGEventPostToPid, synthetic HID (which cannot reach the HID layer
+        // while locked at all), a held display assertion, and evaluating the
+        // right with a username in the environment were all tried and all
+        // stopped at the same PAM branch. Kept because it is the correct thing
+        // to attempt and harmless; the close of the gap is documented in
+        // docs/locked-unlock-investigation.md, not pending here.
         if lockedAtOpen {
             system.provokeUnlockAttempt()
         }
