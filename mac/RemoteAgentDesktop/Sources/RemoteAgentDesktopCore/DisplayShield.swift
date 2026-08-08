@@ -2,19 +2,6 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-/// A full-screen opaque window above the shielding level on every active
-/// display, so a bystander cannot read the session while the agent works on a
-/// temporarily unlocked desktop.
-///
-/// The windows are owned by this process. The one-shot script could not hold
-/// windows across invocations, so it spawned a host process and tracked it by
-/// pid file in $HOME — which meant any process running as this user could write
-/// a live pid there and make "the shield is up" true to the controller while
-/// the desktop sat uncovered. Ownership removes that forgeable surface: the
-/// only thing that can claim coverage is the object holding the windows.
-///
-/// Every method is main-thread confined because AppKit windows are. Callers
-/// arrive from the socket queue, so each entry point hops.
 /// A window that occupies exactly the rect it is given.
 ///
 /// AppKit constrains ordinary windows to a screen's usable area — under the
@@ -34,12 +21,25 @@ private final class ShieldWindow: NSWindow {
     override var canBecomeMain: Bool { false }
 }
 
+/// One full-screen opaque window per attached screen, above the shielding
+/// level, so a bystander cannot read the session while the agent works on a
+/// temporarily unlocked desktop.
+///
+/// The windows are owned by this process. The one-shot script could not hold
+/// windows across invocations, so it spawned a host process and tracked it by
+/// pid file in $HOME — which meant any process running as this user could write
+/// a live pid there and make "the shield is up" true to the controller while
+/// the desktop sat uncovered. Ownership removes that forgeable surface: the
+/// only thing that can claim coverage is the object holding the windows.
+///
+/// Every method is main-thread confined because AppKit windows are. Callers
+/// arrive from the socket queue, so each entry point hops.
 final class DisplayShield {
     private var windows: [NSWindow] = []
-    /// How many displays were covered at engage time. A later probe finding
-    /// more attached displays means a monitor was plugged in that the shield
+    /// How many screens were covered at engage time. A later probe finding
+    /// more attached screens means a display was plugged in that the shield
     /// does not cover.
-    private var coveredDisplays = 0
+    private var coveredScreens = 0
     /// Set when the screen layout changed under us. The shield is not trusted
     /// again after that: the caller's next state probe reports uncovered, which
     /// relocks — the safe direction.
@@ -80,12 +80,19 @@ final class DisplayShield {
     private func create() -> (engaged: Bool, displays: Int) {
         onMain {
             if !self.windows.isEmpty && !self.invalidated {
-                return (true, Self.activeDisplayCount())
+                return (true, NSScreen.screens.count)
             }
             self.teardown()
-            let displays = Self.activeDisplayCount()
-            guard displays > 0 else { return (false, 0) }
-            for screen in NSScreen.screens {
+            // One shield per NSScreen, and NSScreen is what decides how many
+            // there are. CGGetActiveDisplayList disagrees in two ways that both
+            // matter: it reports 1 when displays are mirrored, and 0 when they
+            // are asleep. Gating on it meant a Mac with sleeping displays
+            // refused to raise a shield at all — and "nobody is here, the
+            // screens have gone to sleep" is exactly the situation Locked Use
+            // exists for, so that closed the main use case.
+            let screens = NSScreen.screens
+            guard !screens.isEmpty else { return (false, 0) }
+            for screen in screens {
                 // Both halves of this are load-bearing, and each was wrong on
                 // its own when measured against the window server:
                 //
@@ -111,16 +118,16 @@ final class DisplayShield {
                 window.orderFrontRegardless()
                 self.windows.append(window)
             }
-            // Cover every display or none: partial coverage is not a shield,
-            // and reporting it as one would leave a readable screen behind a
+            // Cover every screen or none: partial coverage is not a shield,
+            // and reporting it as one would leave a readable display behind a
             // safeguard that believes it is satisfied.
-            guard self.windows.count >= displays else {
+            guard self.windows.count == screens.count else {
                 self.teardown()
                 return (false, 0)
             }
             // Coverage is confirmed against the window server by the caller,
             // once the windows have had a chance to reach the screen.
-            self.coveredDisplays = displays
+            self.coveredScreens = screens.count
             self.invalidated = false
             self.observer = NotificationCenter.default.addObserver(
                 forName: NSApplication.didChangeScreenParametersNotification,
@@ -128,7 +135,7 @@ final class DisplayShield {
             ) { [weak self] _ in
                 self?.invalidated = true
             }
-            return (true, displays)
+            return (true, screens.count)
         }
     }
 
@@ -138,12 +145,15 @@ final class DisplayShield {
 
     func state() -> (engaged: Bool, displays: Int) {
         onMain {
-            let displays = Self.activeDisplayCount()
+            // A screen appearing since engage time is a display the shield does
+            // not cover — plugging a monitor in must end the window, not be
+            // absorbed silently.
+            let screens = NSScreen.screens.count
             let live = !self.windows.isEmpty
                 && !self.invalidated
                 && self.windows.allSatisfy { $0.isVisible }
-                && displays == self.coveredDisplays
-            return (live, displays)
+                && screens == self.coveredScreens
+            return (live, screens)
         }
     }
 
@@ -154,7 +164,7 @@ final class DisplayShield {
         }
         for window in windows { window.orderOut(nil) }
         windows.removeAll()
-        coveredDisplays = 0
+        coveredScreens = 0
         invalidated = false
     }
 
@@ -243,12 +253,6 @@ final class DisplayShield {
     private static func sameRect(_ a: CGRect, _ b: CGRect) -> Bool {
         abs(a.minX - b.minX) < 2 && abs(a.minY - b.minY) < 2
             && abs(a.width - b.width) < 2 && abs(a.height - b.height) < 2
-    }
-
-    private static func activeDisplayCount() -> Int {
-        var count: UInt32 = 0
-        guard CGGetActiveDisplayList(0, nil, &count) == .success else { return 0 }
-        return Int(count)
     }
 
     /// Runs `body` on the main thread and returns its value. The socket queue
