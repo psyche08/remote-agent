@@ -77,6 +77,23 @@ public final class LockedUseController: @unchecked Sendable {
             case turnID = "turn_id"
             case noncePrefix = "nonce_prefix"
         }
+
+        /// The entry as plain JSON types.
+        ///
+        /// The status response is assembled as `[String: Any]` and serialized
+        /// with JSONSerialization, which cannot encode a Swift struct: handing
+        /// it one throws an Objective-C exception that Swift cannot catch, so
+        /// the helper does not fail the request — it dies. That is what
+        /// happened the first time Locked Use was enabled on a real device,
+        /// because until an audit entry exists the array is empty and encodes
+        /// fine.
+        var jsonObject: [String: Any] {
+            var out: [String: Any] = ["at": at, "event": event]
+            if let turnID { out["turn_id"] = turnID }
+            if let noncePrefix { out["nonce_prefix"] = noncePrefix }
+            if let reason { out["reason"] = reason }
+            return out
+        }
     }
 
     public init(
@@ -613,7 +630,7 @@ public final class LockedUseController: @unchecked Sendable {
             "available": system.isAvailable,
             "actions": ActionID.allCases.map(\.rawValue),
             "locked_use": lockedUse,
-            "audit": entries,
+            "audit": entries.map(\.jsonObject),
         ]
     }
 
