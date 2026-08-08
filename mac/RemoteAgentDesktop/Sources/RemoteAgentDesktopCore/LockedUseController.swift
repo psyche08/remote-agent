@@ -39,6 +39,10 @@ public final class LockedUseController: @unchecked Sendable {
     /// so this is bounded for safety rather than to fit a response budget.
     private static let relockDeadline: TimeInterval = 20
     private static let relockRetryInterval: TimeInterval = 0.5
+    /// How long to wait for the window server to confirm the shield. Short: on
+    /// the post-unlock side this is time the desktop is live, so it is a bound
+    /// on exposure, not a convenience.
+    private static let shieldConfirmTimeout: TimeInterval = 2.0
     private static let auditRingSize = 64
 
     /// One authorized per-turn unlock window.
@@ -273,6 +277,21 @@ public final class LockedUseController: @unchecked Sendable {
         // The shield goes up before anything is unlocked, never after: the gap
         // between an unlock and a shield is a window where the desktop is
         // visible to whoever is standing there.
+        //
+        // *Confirming* it, though, can only happen on the side of the unlock
+        // where the session is actually being displayed. While the screen is
+        // locked the user's session is not on screen at all, so the window
+        // server reports no coverage no matter how correct the shield is —
+        // requiring confirmation first made the feature unusable from exactly
+        // the state it exists for: locked, nobody present, refusing with
+        // "display shield could not be engaged".
+        //
+        // Nothing is exposed by waiting. While locked, the lock screen is
+        // itself covering the session; the shield only has to be in place by
+        // the moment the unlock lands, and it is raised before that here. When
+        // the screen is already unlocked the desktop is visible right now, so
+        // confirmation stays where it was: before anything else happens.
+        let lockedAtOpen = (try? system.isLocked()) ?? true
         if config.lockedUse.shieldRequired {
             do {
                 try system.engageShield()
@@ -280,7 +299,7 @@ public final class LockedUseController: @unchecked Sendable {
                 abortOpen(opened, reason: "shield: \(error)")
                 throw LockedUseError.shieldRequired("\(error)")
             }
-            guard system.shieldEngaged() else {
+            if !lockedAtOpen, !system.confirmShieldCoverage(timeout: Self.shieldConfirmTimeout) {
                 abortOpen(opened, reason: "shield not confirmed")
                 throw LockedUseError.shieldRequired("")
             }
@@ -321,6 +340,18 @@ public final class LockedUseController: @unchecked Sendable {
         if let unlockError {
             abortOpen(opened, reason: "unlock: \(unlockError)")
             throw unlockError
+        }
+
+        // The session is on screen now, so this is the first moment the shield
+        // can be confirmed after starting from a locked screen — and the last
+        // moment it is safe not to have been. A shield that is not covering
+        // here means the desktop is live and readable, so the window is torn
+        // down and the screen relocked at once rather than handed to the turn.
+        if config.lockedUse.shieldRequired && lockedAtOpen {
+            guard system.confirmShieldCoverage(timeout: Self.shieldConfirmTimeout) else {
+                abortOpen(opened, reason: "shield not confirmed after unlock")
+                throw LockedUseError.shieldRequired("the shield was not covering after the unlock")
+            }
         }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.watchWindow(opened)

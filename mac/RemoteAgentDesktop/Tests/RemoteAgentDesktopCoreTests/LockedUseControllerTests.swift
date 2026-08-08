@@ -17,6 +17,7 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
     var lockFails = false
     var lockStateFails = false
     var idleFails = false
+    var coverageUnconfirmable = false
     var grantDirectory = ""
     private var actions: [Action] = []
 
@@ -69,6 +70,15 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
         mutex.lock()
         defer { mutex.unlock() }
         return shieldUp
+    }
+
+    /// Confirmation mirrors the real one: it answers for whatever the shield is
+    /// actually doing, and a test can make it fail independently of engaging to
+    /// stand in for a shield that never reached the screen.
+    func confirmShieldCoverage(timeout: TimeInterval) -> Bool {
+        mutex.lock()
+        defer { mutex.unlock() }
+        return shieldUp && !coverageUnconfirmable
     }
 
     func run(_ action: Action) throws -> DesktopService.ActionResult {
@@ -124,6 +134,7 @@ final class UnavailableSystem: LockedUseSystem, @unchecked Sendable {
     func engageShield() throws { throw LockedUseError.unsupported }
     func releaseShield() throws { throw LockedUseError.unsupported }
     func shieldEngaged() -> Bool { false }
+    func confirmShieldCoverage(timeout: TimeInterval) -> Bool { false }
     func run(_ action: Action) throws -> DesktopService.ActionResult {
         throw LockedUseError.unsupported
     }
@@ -510,5 +521,56 @@ final class LockedUseControllerTests: XCTestCase {
             system.isScreenLocked,
             "stop returned before the screen was confirmed locked")
         XCTAssertNil(controller.openWindowTurn())
+    }
+}
+
+/// Which side of the unlock the shield is confirmed on is decided by whether
+/// the screen was locked, and getting it wrong made the feature unusable from
+/// the only state it exists for.
+extension LockedUseControllerTests {
+    /// Starting from a locked screen, the shield cannot be confirmed first: the
+    /// user's session is not being displayed, so the window server reports no
+    /// coverage however correct the shield is. Requiring it up front refused
+    /// every window with "display shield could not be engaged".
+    func testAWindowOpensFromALockedScreen() throws {
+        let system = FakeSystem()
+        // The fake starts locked, which is the real starting state.
+        let controller = makeController(system: system)
+        try controller.openWindow(turnID: "turn-1")
+        XCTAssertEqual(controller.openWindowTurn(), "turn-1")
+        XCTAssertTrue(system.isShieldUp)
+    }
+
+    /// The confirmation still has to happen — just after the unlock, which is
+    /// the first moment it can succeed and the last moment it is safe to be
+    /// missing. A shield that is not covering there means a live desktop, so
+    /// the window must not be handed to the turn.
+    func testAnUnconfirmableShieldStillRefusesTheWindow() {
+        let system = FakeSystem()
+        system.coverageUnconfirmable = true
+        let controller = makeController(system: system)
+
+        XCTAssertThrowsError(try controller.openWindow(turnID: "turn-1")) { error in
+            guard case LockedUseError.shieldRequired = error else {
+                return XCTFail("expected shieldRequired, got \(error)")
+            }
+        }
+        eventually("the reservation to clear") { !controller.isWindowClosing() }
+        XCTAssertTrue(system.isScreenLocked, "an unconfirmable shield must leave the screen locked")
+    }
+
+    /// When the screen is already unlocked the desktop is visible right now, so
+    /// confirmation keeps its original place: before anything else happens.
+    func testAnUnlockedScreenStillConfirmsTheShieldFirst() {
+        let system = FakeSystem()
+        system.set(locked: false)
+        system.coverageUnconfirmable = true
+        let controller = makeController(system: system)
+
+        XCTAssertThrowsError(try controller.openWindow(turnID: "turn-1")) { error in
+            guard case LockedUseError.shieldRequired = error else {
+                return XCTFail("expected shieldRequired, got \(error)")
+            }
+        }
     }
 }

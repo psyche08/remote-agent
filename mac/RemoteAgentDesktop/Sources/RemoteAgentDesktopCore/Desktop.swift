@@ -171,6 +171,16 @@ public final class DesktopService: @unchecked Sendable {
         shield.engage()
     }
 
+    /// Waits for the window server to confirm the shield is actually on screen.
+    ///
+    /// Separate from engaging because the two cannot always happen together:
+    /// while the screen is locked the user's session is not displayed, so
+    /// nothing in it can be confirmed on screen — see the controller for which
+    /// side of the unlock this is required on.
+    public func confirmShieldCoverage(timeout: TimeInterval) -> Bool {
+        shield.confirmCoverage(timeout: timeout)
+    }
+
     public func releaseShield() {
         shield.release()
     }

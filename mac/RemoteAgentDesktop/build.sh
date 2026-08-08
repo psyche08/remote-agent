@@ -56,8 +56,20 @@ codesign --verify --strict --verbose=2 "$BINARY"
 
 if [ -n "$OUT" ]; then
   mkdir -p "$(dirname "$OUT")"
-  # cp preserves the signature: it lives inside the Mach-O, not beside it.
-  cp "$BINARY" "$OUT"
+  # Write beside the target and rename over it, never into it.
+  #
+  # Copying onto the path of a *running* helper writes through to the same
+  # inode, which corrupts the image the kernel already mapped: macOS kills the
+  # process with OS_REASON_CODESIGNING, and launchd respawns it into the same
+  # broken file. Rename swaps in a new inode instead, so the running process
+  # keeps the old one until it exits.
+  #
+  # The signature travels either way — it lives inside the Mach-O, not beside
+  # it — so this is about the file, not the signing.
+  TMP_OUT="$(dirname "$OUT")/.$(basename "$OUT").new.$$"
+  cp "$BINARY" "$TMP_OUT"
+  chmod 0755 "$TMP_OUT"
+  mv -f "$TMP_OUT" "$OUT"
   echo "==> wrote $OUT"
 else
   echo "==> built $BINARY"

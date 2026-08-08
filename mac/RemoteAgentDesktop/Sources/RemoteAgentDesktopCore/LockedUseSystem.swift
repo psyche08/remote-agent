@@ -19,9 +19,15 @@ public protocol LockedUseSystem: AnyObject, Sendable {
     /// Throwing must be treated as "a person may be present": the controller
     /// fails closed and relocks.
     func sinceLastInput() throws -> TimeInterval
-    /// Raises the shield. The controller refuses to open a window when this
-    /// fails and the shield is required.
+    /// Raises the shield windows. Coverage is confirmed separately.
     func engageShield() throws
+    /// Waits for confirmation that the shield is actually on screen.
+    ///
+    /// This cannot succeed while the screen is locked — the user's session is
+    /// not displayed, so nothing in it is on screen — which is why the
+    /// controller requires it before the unlock only when the screen was
+    /// already unlocked, and immediately after otherwise.
+    func confirmShieldCoverage(timeout: TimeInterval) -> Bool
     /// Drops the shield. Called on every window-close path.
     func releaseShield() throws
     /// The shield's current state, re-probed rather than cached.
@@ -56,6 +62,10 @@ public final class DesktopSystem: LockedUseSystem {
         guard desktop.engageShield().engaged else {
             throw LockedUseError.systemFailure("could not engage the display shield")
         }
+    }
+
+    public func confirmShieldCoverage(timeout: TimeInterval) -> Bool {
+        desktop.confirmShieldCoverage(timeout: timeout)
     }
 
     public func releaseShield() throws { desktop.releaseShield() }

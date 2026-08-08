@@ -54,16 +54,30 @@ final class DisplayShield {
     /// Locked Use never opens a window.
     private static let coverageDeadline: TimeInterval = 1.5
 
+    /// Raises the shield windows. Coverage is confirmed separately, because
+    /// when the two can happen is decided by whether the screen is locked.
     func engage() -> (engaged: Bool, displays: Int) {
-        let result = create()
-        guard result.engaged else { return result }
-        // Confirm with the window server before reporting coverage. The
-        // controller refuses to unlock without this answer, so it has to mean
-        // "the screen is actually covered", not "we asked for it to be".
-        let deadline = Date().addingTimeInterval(Self.coverageDeadline)
+        create()
+    }
+
+    /// Waits for the window server to report the shield actually on screen.
+    ///
+    /// `orderFrontRegardless()` hands a window to the server; it does not make
+    /// it visible by the time the call returns, so this polls rather than
+    /// asking once.
+    ///
+    /// It cannot succeed while the screen is locked: the user's session is not
+    /// being displayed, so nothing in it is on screen, and the window server
+    /// says so. That is not a failure to cover — the lock screen is covering
+    /// the session — which is why the controller only requires this before an
+    /// unlock when the screen was already unlocked, and immediately after
+    /// otherwise.
+    @discardableResult
+    func confirmCoverage(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             if onMain({ Self.windowServerShowsCoverage(pid: getpid(), screens: NSScreen.screens) }) {
-                return result
+                return true
             }
             // On the main thread the run loop is what commits the windows, so
             // sleeping here would block the very thing being waited for.
@@ -73,9 +87,10 @@ final class DisplayShield {
                 Thread.sleep(forTimeInterval: 0.05)
             }
         }
-        release()
-        return (false, 0)
+        return onMain { Self.windowServerShowsCoverage(pid: getpid(), screens: NSScreen.screens) }
     }
+
+    static let defaultCoverageTimeout: TimeInterval = coverageDeadline
 
     private func create() -> (engaged: Bool, displays: Int) {
         onMain {
