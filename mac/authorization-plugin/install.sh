@@ -27,6 +27,10 @@ PLUGIN_DIR="/Library/Security/SecurityAgentPlugins"
 STATE_DIR="/Library/Application Support/remote-agent/locked-use"
 RIGHT="system.login.screensaver"
 MECHANISM="RemoteAgentLockedUse:invoke,privileged"
+# The mechanism gets its own rule rather than being appended to the right, so
+# it can be one branch of the right's k-of-n evaluation. See the registration
+# step for why that distinction decides whether it works at all.
+RULE_NAME="com.psyche08.remote-agent.locked-use"
 PUBKEY_SOURCE="${1:-}"
 DEVICE_ID="${RA_DEVICE_ID:-}"
 # The account the agent's desktop helper runs as. It has to be able to fill in
@@ -155,32 +159,98 @@ if [ ! -f "$STATE_DIR/$RIGHT.original.plist" ]; then
   echo "==> backed up the original right to $STATE_DIR/$RIGHT.original.plist"
 fi
 
-if grep -q "RemoteAgentLockedUse" "$TMP"; then
-  echo "==> mechanism already registered"
-else
-  # Insert ahead of the existing mechanisms so the plug-in observes the unlock
-  # attempt before the password mechanism runs. It never returns Deny or
-  # Undefined, so the rest of the chain always proceeds.
-  /usr/bin/python3 - "$TMP" "$TMP.new" "$MECHANISM" <<'PYEOF'
+# Register as a branch of the right, the way macOS actually evaluates it.
+#
+# system.login.screensaver is a `rule` class right whose rule list is evaluated
+# k-of-n with k = 1: the first branch that authorizes wins, and
+# `use-login-window-ui` — the password prompt — is the last branch. So the
+# mechanism goes into its own evaluate-mechanisms rule, and that rule's name
+# goes into the list ahead of the password branch.
+#
+# Writing a `mechanisms` key onto a rule-class right, which is what this script
+# used to do, is silently discarded: the plug-in installs, the script reports
+# success, and nothing is ever loaded. If the right is not one of the two shapes
+# understood here, this refuses rather than writing something meaningless.
+cat > "$TMP.rule" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>class</key><string>evaluate-mechanisms</string>
+  <key>comment</key><string>Screen-unlock branch that authorizes only against a fresh, single-use, signed Locked Use grant.</string>
+  <key>mechanisms</key><array><string>$MECHANISM</string></array>
+  <key>tries</key><integer>1</integer>
+  <key>shared</key><true/>
+  <key>version</key><integer>1</integer>
+</dict>
+</plist>
+PLIST
+security authorizationdb write "$RULE_NAME" < "$TMP.rule"
+echo "==> defined rule $RULE_NAME"
+
+set +e
+/usr/bin/python3 - "$TMP" "$TMP.new" "$RULE_NAME" "$MECHANISM" <<'PYEOF'
 import plistlib, sys
-src, dst, mechanism = sys.argv[1], sys.argv[2], sys.argv[3]
+src, dst, rule_name, mechanism = sys.argv[1:5]
 with open(src, "rb") as f:
     right = plistlib.load(f)
-mechanisms = right.get("mechanisms", [])
-if mechanism not in mechanisms:
+
+kind = right.get("class")
+if kind == "rule":
+    rules = right.get("rule", [])
+    if rule_name in rules:
+        sys.exit(0)
+    # Ahead of the password prompt, but behind any other agent's branch, so
+    # installing this does not preempt something already in the chain.
+    try:
+        at = rules.index("use-login-window-ui")
+    except ValueError:
+        at = len(rules)
+    rules.insert(at, rule_name)
+    right["rule"] = rules
+elif kind == "evaluate-mechanisms":
+    mechanisms = right.get("mechanisms", [])
+    if mechanism in mechanisms:
+        sys.exit(0)
     mechanisms.insert(0, mechanism)
-right["mechanisms"] = mechanisms
+    right["mechanisms"] = mechanisms
+else:
+    sys.stderr.write(
+        "unrecognised authorization right shape: class=%r\n"
+        "Refusing to modify it. Registering blindly is how a plug-in ends up\n"
+        "installed and inert, or worse, wired into the wrong position.\n" % (kind,))
+    sys.exit(2)
+
 with open(dst, "wb") as f:
     plistlib.dump(right, f)
 PYEOF
+REGISTER_STATUS=$?
+set -e
+if [ "$REGISTER_STATUS" != "0" ]; then
+  echo "could not register the mechanism; the right was left untouched" >&2
+  exit 1
+fi
+if [ -f "$TMP.new" ]; then
   security authorizationdb write "$RIGHT" < "$TMP.new"
-  echo "==> registered $MECHANISM"
+  echo "==> registered $RULE_NAME in $RIGHT"
+else
+  echo "==> already registered"
+fi
+
+# Confirm rather than assume: the previous version reported success after a
+# write the system discarded.
+if security authorizationdb read "$RIGHT" 2>/dev/null | grep -q "$RULE_NAME"; then
+  echo "==> verified: $RULE_NAME is present in $RIGHT"
+else
+  echo "the right does not contain $RULE_NAME after writing it" >&2
+  exit 1
 fi
 
 echo
 echo "==> done."
-echo "    The plug-in is installed. It never denies an unlock, so unlocking by"
-echo "    hand is unchanged."
+echo "    The plug-in authorizes ONLY a verified, single-use grant. Every other"
+echo "    unlock — including yours, by hand — falls through to the password"
+echo "    prompt, which is the branch after this one."
 echo
 echo "    VALIDATE BEFORE RELYING ON IT: confirm you can still unlock normally,"
 echo "    then confirm a Locked Use turn actually unlocks. If it does not, the"

@@ -11,6 +11,7 @@ PLUGIN_DIR="/Library/Security/SecurityAgentPlugins"
 BUNDLE_NAME="RemoteAgentLockedUse.bundle"
 STATE_DIR="/Library/Application Support/remote-agent/locked-use"
 RIGHT="system.login.screensaver"
+RULE_NAME="com.psyche08.remote-agent.locked-use"
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "Locked Use is macOS-only" >&2
@@ -39,12 +40,20 @@ if [ -f "$BACKUP" ]; then
   echo "==> backup restore failed; falling back to editing the current right" >&2
 fi
 if security authorizationdb read "$RIGHT" > "$TMP" 2>/dev/null; then
-  /usr/bin/python3 - "$TMP" "$TMP.new" <<'PYEOF'
+  # Both shapes have to be handled. The right is normally a rule list holding
+  # this plug-in's rule *name*; stripping only a `mechanisms` key would report
+  # success and leave the branch in place.
+  /usr/bin/python3 - "$TMP" "$TMP.new" "$RULE_NAME" <<'PYEOF'
 import plistlib, sys
-src, dst = sys.argv[1], sys.argv[2]
+src, dst, rule_name = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(src, "rb") as f:
     right = plistlib.load(f)
-right["mechanisms"] = [m for m in right.get("mechanisms", []) if "RemoteAgentLockedUse" not in m]
+if "rule" in right:
+    right["rule"] = [r for r in right["rule"] if r != rule_name]
+if "mechanisms" in right:
+    right["mechanisms"] = [
+        m for m in right["mechanisms"] if "RemoteAgentLockedUse" not in m
+    ]
 with open(dst, "wb") as f:
     plistlib.dump(right, f)
 PYEOF
@@ -53,6 +62,12 @@ PYEOF
 else
   echo "==> could not read $RIGHT; leaving it alone"
 fi
+
+# The rule definition outlives the right that referenced it, and an orphan rule
+# naming a bundle that is gone is exactly the kind of leftover that makes a
+# later reinstall behave differently from a first one.
+security authorizationdb remove "$RULE_NAME" >/dev/null 2>&1 && \
+  echo "==> removed rule $RULE_NAME" || true
 
 echo "==> removing the bundle"
 rm -rf "${PLUGIN_DIR:?}/$BUNDLE_NAME"

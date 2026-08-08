@@ -8,21 +8,28 @@
  *
  * Design commitments, in order of importance:
  *
- *  1. IT CAN NEVER LOCK YOU OUT. This mechanism never returns Deny and never
- *     returns Undefined. Undefined is documented as "the mechanism did not come
- *     to a decision", and authd may treat that as a mechanism failure and abort
- *     the whole authorization — which on the screensaver right would mean a Mac
- *     nobody can unlock. So the no-grant path returns Allow, meaning only "this
- *     mechanism does not object", and the password mechanism that follows still
- *     challenges the user exactly as before.
+ *  1. ALLOW MEANS UNLOCK. On macOS the screensaver right is a `rule` class
+ *     right whose rule list is evaluated k-of-n with k = 1: the first branch
+ *     that succeeds authorizes the unlock. This mechanism is one such branch,
+ *     and `use-login-window-ui` — the password prompt — is the branch after it.
  *
- *     CONSEQUENCE, STATED PLAINLY: because this mechanism only ever declines to
- *     object, installing it alone does NOT bypass the password. Whether a valid
- *     grant actually shortens the unlock depends on how the right's mechanism
- *     list is arranged on your macOS version, which is why install.sh requires
- *     an explicit validation step on a non-production Mac first. If that
- *     arrangement is wrong, the feature simply does not unlock — the safe
- *     failure direction — rather than locking anyone out.
+ *     So Allow here does not mean "I do not object". It means "unlock now,
+ *     without a password". This mechanism therefore returns Allow only for a
+ *     grant that verified and was consumed, and Deny for everything else,
+ *     including every failure path.
+ *
+ *     An earlier version of this file returned Allow unconditionally, on the
+ *     reasoning that a mechanism which never objects cannot lock anyone out.
+ *     That reasoning holds for an `evaluate-mechanisms` list, where every
+ *     mechanism must pass; it is exactly inverted here. Wired into the rule
+ *     list as written, it would have unlocked the Mac for anyone who walked up
+ *     to it. It was never actually wired in — the installer inserted into a
+ *     `mechanisms` key the right does not have, so the plug-in sat inert — but
+ *     the intent was wrong and it is recorded here so it is not reintroduced.
+ *
+ *     Denying cannot lock anyone out: the login-window branch follows, and a
+ *     branch that does not authorize simply lets evaluation continue to it.
+ *     The dangerous direction here is permissive, not restrictive.
  *
  *  2. IT NEVER TOUCHES THE PASSWORD. The plugin does not read, request, set,
  *     or log kAuthorizationEnvironmentPassword or any credential. It answers
@@ -425,17 +432,24 @@ static OSStatus MechanismCreate(AuthorizationPluginRef inPlugin,
 static OSStatus MechanismInvoke(AuthorizationMechanismRef inMechanism) {
     MechanismRecord *mechanism = (MechanismRecord *)inMechanism;
 
-    /* The result of the check does not change what we return; it decides
-     * whether an authorized unlock is recorded and its nonce burned. Any
-     * unexpected failure is swallowed for the same reason. */
+    /*
+     * Allow only on a grant that verified and was consumed. Everything else
+     * denies, which hands the decision to the next branch of the right — the
+     * ordinary password prompt.
+     *
+     * An exception is a refusal, not a shrug: if the check could not complete,
+     * this mechanism has no basis to authorize anything.
+     */
+    BOOL allowed = NO;
     @try {
-        (void)RAGrantAllowsUnlock();
+        allowed = RAGrantAllowsUnlock();
     } @catch (__unused NSException *exception) {
-        /* deliberately ignored — see the note above */
+        allowed = NO;
     }
 
-    return mechanism->plugin->callbacks->SetResult(mechanism->engine,
-                                                   kAuthorizationResultAllow);
+    return mechanism->plugin->callbacks->SetResult(
+        mechanism->engine,
+        allowed ? kAuthorizationResultAllow : kAuthorizationResultDeny);
 }
 
 static OSStatus MechanismDeactivate(AuthorizationMechanismRef inMechanism) {
