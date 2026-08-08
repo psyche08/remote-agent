@@ -159,56 +159,66 @@ type ActionRequest struct {
 	DeltaY int      `json:"delta_y,omitempty"`
 }
 
-// call sends one request and reads one reply, reconnecting once if the cached
-// connection has gone away.
+// call sends one request and reads one reply, reconnecting once when the
+// request never reached the helper.
+//
+// What may be retried is decided by delivery, not by whether an error came
+// back. A refusal is a valid answer and resending it would ask twice; a read
+// that failed after the request was written may have been acted on already, and
+// resending an action that half-executed would run it again. Only a request the
+// helper never received is safe to send a second time.
 func (c *Controller) call(timeout time.Duration, req map[string]any) (map[string]any, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	res, err := c.callLocked(timeout, req)
-	if err == nil {
-		return res, nil
-	}
-	if errors.Is(err, ErrHelperUnavailable) {
-		return nil, err
-	}
-	// A helper restart (an update, a crash, a relogin) leaves a dead cached
-	// connection. One retry distinguishes that from a helper that is genuinely
-	// gone, so a routine restart does not surface as a failed action.
-	c.closeLocked()
-	return c.callLocked(timeout, req)
-}
-
-func (c *Controller) callLocked(timeout time.Duration, req map[string]any) (map[string]any, error) {
-	if c.conn == nil {
-		conn, err := net.DialTimeout("unix", c.socketPath, dialTimeout)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %v", ErrHelperUnavailable, err)
-		}
-		c.conn = conn
-		c.rd = bufio.NewReader(conn)
-	}
 	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, err
 	}
-	deadline := time.Now().Add(timeout)
-	if err := c.conn.SetDeadline(deadline); err != nil {
-		c.closeLocked()
-		return nil, err
+	body = append(body, '\n')
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	res, delivered, err := c.attemptLocked(timeout, body)
+	if err == nil || delivered || errors.Is(err, ErrHelperUnavailable) {
+		return res, err
 	}
-	if _, err := c.conn.Write(append(body, '\n')); err != nil {
+	// The bytes never went out, which is what a cached connection looks like
+	// after the helper restarted for an update, a crash, or a re-login. One
+	// reconnect keeps a routine restart from surfacing as a failed action.
+	c.closeLocked()
+	res, _, err = c.attemptLocked(timeout, body)
+	return res, err
+}
+
+// attemptLocked sends one request. delivered reports whether it reached the
+// helper, so the caller can tell a lost request from one that may have run.
+func (c *Controller) attemptLocked(
+	timeout time.Duration, body []byte,
+) (result map[string]any, delivered bool, err error) {
+	if c.conn == nil {
+		conn, dialErr := net.DialTimeout("unix", c.socketPath, dialTimeout)
+		if dialErr != nil {
+			return nil, false, fmt.Errorf("%w: %v", ErrHelperUnavailable, dialErr)
+		}
+		c.conn = conn
+		c.rd = bufio.NewReader(conn)
+	}
+	if err := c.conn.SetDeadline(time.Now().Add(timeout)); err != nil {
 		c.closeLocked()
-		return nil, err
+		return nil, false, err
+	}
+	if _, err := c.conn.Write(body); err != nil {
+		c.closeLocked()
+		return nil, false, err
 	}
 	line, err := c.rd.ReadBytes('\n')
 	if err != nil {
 		c.closeLocked()
-		return nil, err
+		// Written, so the helper may have acted on it. Not retryable.
+		return nil, true, err
 	}
 	var res map[string]any
 	if err := json.Unmarshal(line, &res); err != nil {
 		c.closeLocked()
-		return nil, errors.New("the computer-use helper returned malformed output")
+		return nil, true, errors.New("the computer-use helper returned malformed output")
 	}
 	if ok, _ := res["ok"].(bool); !ok {
 		detail, _ := res["error"].(string)
@@ -216,9 +226,9 @@ func (c *Controller) callLocked(timeout time.Duration, req map[string]any) (map[
 		if code == "" {
 			code = "failed"
 		}
-		return nil, &Error{Code: code, Detail: detail}
+		return nil, true, &Error{Code: code, Detail: detail}
 	}
-	return res, nil
+	return res, true, nil
 }
 
 func (c *Controller) closeLocked() {
