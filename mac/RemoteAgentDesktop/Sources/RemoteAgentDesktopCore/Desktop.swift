@@ -21,6 +21,12 @@ public final class DesktopService: @unchecked Sendable {
     /// a file: the one-shot script had to persist it, and a file in $HOME is
     /// writable by every process running as this user.
     private var lastSyntheticPost: TimeInterval?
+    /// The human-idle clock: at `humanIdleAnchorAt`, input not caused by this
+    /// process was `humanIdleAnchorValue` seconds old. It is carried forward
+    /// across the agent's own events so its activity does not read as a person
+    /// arriving at the keyboard.
+    private var humanIdleAnchorAt: TimeInterval?
+    private var humanIdleAnchorValue: TimeInterval = 0
     private let shield: DisplayShield
 
     public init() {
@@ -68,7 +74,7 @@ public final class DesktopService: @unchecked Sendable {
 
     /// Slack absorbing the gap between posting an event and the HID counter
     /// moving.
-    private static let syntheticAttributionSlack = 0.35
+    static let syntheticAttributionSlack = 0.35
 
     /// Seconds since the last local HID input that is *not* attributable to
     /// this process.
@@ -80,6 +86,57 @@ public final class DesktopService: @unchecked Sendable {
     /// process posts, so reading it directly would relock the moment the agent
     /// typed — and would make a real person indistinguishable from the agent.
     public func secondsSinceLastInput() -> Double {
+        let systemIdle = Self.systemIdleSeconds()
+        let now = Date().timeIntervalSince1970
+
+        lock.lock()
+        let ourLast = lastSyntheticPost
+        let anchorAt = humanIdleAnchorAt
+        let anchorValue = humanIdleAnchorValue
+        lock.unlock()
+
+        guard let ourLast, let anchorAt else { return systemIdle }
+        let decision = Self.humanIdle(
+            systemIdle: systemIdle, now: now, lastSyntheticPost: ourLast,
+            anchorAt: anchorAt, anchorValue: anchorValue)
+        if decision.humanPresent {
+            lock.lock()
+            humanIdleAnchorAt = now
+            humanIdleAnchorValue = systemIdle
+            lock.unlock()
+        }
+        return decision.idle
+    }
+
+    /// Decides how long the machine has been free of input *this process did not
+    /// cause*, and whether a person has acted since the agent's last event.
+    ///
+    /// Pure, so both directions can be tested: no synthetic event can stand in
+    /// for a human one, because every event this process posts is attributed to
+    /// it by construction.
+    ///
+    /// The system counter cannot say who caused the newest event, but the timing
+    /// can. An input newer than our own last post — by more than the slack
+    /// between posting and the counter moving — is not ours.
+    ///
+    /// When the newest input *is* ours it is no evidence of a person, so the
+    /// human clock is carried forward across the agent's activity. Reporting the
+    /// system counter here — or the time since our own post, which amounts to
+    /// the same number — was the original defect: the agent's first mouse move
+    /// looked like someone arriving at the keyboard, so the window closed and
+    /// the screen relocked on the first action it ever took. The feature could
+    /// not work at all.
+    static func humanIdle(
+        systemIdle: Double, now: TimeInterval, lastSyntheticPost: TimeInterval,
+        anchorAt: TimeInterval, anchorValue: TimeInterval
+    ) -> (idle: Double, humanPresent: Bool) {
+        if systemIdle + syntheticAttributionSlack < now - lastSyntheticPost {
+            return (systemIdle, true)
+        }
+        return (anchorValue + (now - anchorAt), false)
+    }
+
+    private static func systemIdleSeconds() -> Double {
         let types: [CGEventType] = [
             .keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown,
             .mouseMoved, .scrollWheel,
@@ -89,26 +146,22 @@ public final class DesktopService: @unchecked Sendable {
             let seconds = CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: type)
             if seconds < shortest { shortest = seconds }
         }
-        let systemIdle = shortest == Double.greatestFiniteMagnitude ? 0 : shortest
-
-        lock.lock()
-        let ourLast = lastSyntheticPost
-        lock.unlock()
-
-        // If our own last post is at least as recent as the system's last
-        // input, the counter is explained by us and carries no evidence of a
-        // person. Report idle measured from before our activity began.
-        guard let ourLast else { return systemIdle }
-        let sinceOurs = Date().timeIntervalSince1970 - ourLast
-        if sinceOurs <= systemIdle + Self.syntheticAttributionSlack {
-            return max(systemIdle, sinceOurs)
-        }
-        return systemIdle
+        return shortest == Double.greatestFiniteMagnitude ? 0 : shortest
     }
 
+    /// Records that this process is about to post a synthetic event.
+    ///
+    /// The anchor takes the *human* idle estimate rather than the raw system
+    /// counter, because by the second event in a burst the raw counter is
+    /// already explained by our own first one — anchoring to it would collapse
+    /// the human clock to zero and reintroduce the defect one action later.
     private func markSyntheticPost() {
+        let humanIdle = secondsSinceLastInput()
+        let now = Date().timeIntervalSince1970
         lock.lock()
-        lastSyntheticPost = Date().timeIntervalSince1970
+        humanIdleAnchorAt = now
+        humanIdleAnchorValue = humanIdle
+        lastSyntheticPost = now
         lock.unlock()
     }
 
