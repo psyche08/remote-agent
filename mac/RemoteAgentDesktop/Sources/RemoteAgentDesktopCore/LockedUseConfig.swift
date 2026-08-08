@@ -21,6 +21,18 @@ public struct ComputerUseConfig: Codable, Sendable {
         self.lockedUse = lockedUse
     }
 
+    /// Every key is optional on the wire, because a real config.json fills in
+    /// only what the operator set. The synthesized decoder would reject a
+    /// partial block outright, and a config that fails to decode presents as
+    /// "computer use is not configured" — the feature silently absent rather
+    /// than misconfigured.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        lockedUse = try container.decodeIfPresent(LockedUseConfig.self, forKey: .lockedUse)
+            ?? LockedUseConfig()
+    }
+
     /// Every field fails closed: an unset or invalid value collapses to the
     /// most restrictive safe default rather than a wider unlock window.
     public func normalized() -> ComputerUseConfig {
@@ -96,6 +108,22 @@ public struct LockedUseConfig: Codable, Sendable {
         self.windowTTLSeconds = windowTTLSeconds
         self.inputRelockGraceMs = inputRelockGraceMs
         self.requireDisplayShield = requireDisplayShield
+    }
+
+    /// Absent keys take the unset value, which `normalized()` then collapses to
+    /// the most restrictive safe default. Note `requireDisplayShield` stays nil
+    /// when absent rather than defaulting to false: "not stated" must mean the
+    /// shield is required, never that it was waived.
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? false
+        grantDirectory = try container.decodeIfPresent(String.self, forKey: .grantDirectory) ?? ""
+        signingKeyPath = try container.decodeIfPresent(String.self, forKey: .signingKeyPath) ?? ""
+        grantTTLSeconds = try container.decodeIfPresent(Int.self, forKey: .grantTTLSeconds) ?? 0
+        windowTTLSeconds = try container.decodeIfPresent(Int.self, forKey: .windowTTLSeconds) ?? 0
+        inputRelockGraceMs = try container.decodeIfPresent(Int.self, forKey: .inputRelockGraceMs) ?? 0
+        requireDisplayShield = try container.decodeIfPresent(
+            Bool.self, forKey: .requireDisplayShield)
     }
 
     public var shieldRequired: Bool { requireDisplayShield ?? true }

@@ -108,8 +108,8 @@ func NewServer(cfg *config.Config, registry provider.Registry, store *state.Stor
 	// StartBackground, after its startup scrub establishes a locked baseline.
 	if cfg.ComputerUse.Enabled {
 		s.computerUseCtl = computeruse.NewController(
-			cfg.ComputerUse, cfg.DeviceID, store.DataDir(),
-			computeruse.NewSystem(scriptPath("computer_use.swift")),
+			expandUser(cfg.ComputerUse.HelperSocket),
+			cfg.ComputerUse.Enabled, cfg.ComputerUse.LockedUse.Enabled,
 		)
 	}
 	for _, id := range registry.IDs() {

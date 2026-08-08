@@ -35,6 +35,15 @@ type ComputerUseConfig struct {
 	// drive the desktop after the screen locks. It requires Enabled and the
 	// separately installed Apple Authorization Plug-in.
 	LockedUse LockedUseConfig `json:"locked_use"`
+	// HelperSocket is where remote-agent-desktop listens. The helper owns the
+	// desktop surface and the whole Locked Use state machine; this process only
+	// forwards to it. Defaults to
+	// ~/Library/Application Support/remote-agent/desktop.sock.
+	//
+	// Note that the helper reads this same config file for its own settings.
+	// Nothing about the feature is configured over the socket: Locked Use lets
+	// a machine unlock itself, so the capability is granted on the device.
+	HelperSocket string `json:"helper_socket"`
 }
 
 // LockedUseConfig configures Locked Use. Every field fails closed: an unset or
@@ -148,7 +157,16 @@ const (
 	MaxGrantTTLSeconds = 15
 )
 
+// DefaultHelperSocket is where remote-agent-desktop listens unless config says
+// otherwise. It is under the user's own Application Support directory because
+// the helper runs in the user's GUI session — the only place a process can hold
+// the display shield and post synthetic input.
+const DefaultHelperSocket = "~/Library/Application Support/remote-agent/desktop.sock"
+
 func applyComputerUseDefaults(cu *ComputerUseConfig) {
+	if cu.HelperSocket == "" {
+		cu.HelperSocket = DefaultHelperSocket
+	}
 	lu := &cu.LockedUse
 	lu.GrantTTLSeconds = clampInt(lu.GrantTTLSeconds, 2, MaxGrantTTLSeconds, DefaultGrantTTLSeconds)
 	lu.WindowTTLSeconds = clampInt(lu.WindowTTLSeconds, 15, 900, DefaultWindowTTLSeconds)

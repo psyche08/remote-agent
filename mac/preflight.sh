@@ -2,9 +2,10 @@
 # Preflight for computer use + Locked Use on the target Mac.
 #
 # Everything here is what CI and a Linux container cannot check: the Swift
-# worker and the Objective-C authorization plug-in only compile and run on
-# macOS. Run this first on the machine you intend to use, before installing
-# anything.
+# helper and the Objective-C authorization plug-in only compile and run on
+# macOS, and the two sides of the grant contract can only be run against each
+# other here. Run this first on the machine you intend to use, before
+# installing anything.
 #
 #   cd /path/to/remote-agent && bash mac/preflight.sh
 #
@@ -19,8 +20,10 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SWIFT_WORKER="$REPO/scripts/computer_use.swift"
+HELPER_DIR="$REPO/mac/RemoteAgentDesktop"
 PLUGIN_SRC="$REPO/mac/authorization-plugin/RemoteAgentLockedUse.m"
+GRANT_SRC="$HELPER_DIR/Sources/RemoteAgentDesktopCore/Grant.swift"
+CONFIG_SRC="$HELPER_DIR/Sources/RemoteAgentDesktopCore/LockedUseConfig.swift"
 CHECK_SHIELD=0
 CHECK_LOCK=0
 FAILED=0
@@ -61,88 +64,67 @@ else
   fail "go missing"
 fi
 
-step "go build, vet and tests"
+step "agent builds and its client tests pass"
 if (cd "$REPO" && go build ./... 2>&1); then pass "go build"; else fail "go build"; fi
 if (cd "$REPO" && go vet ./... 2>&1); then pass "go vet"; else fail "go vet"; fi
-# Only the packages this feature owns; the rest of the suite is unrelated here.
-if (cd "$REPO" && go test ./internal/computeruse/... ./internal/config/... 2>&1 | tail -5); then
-  pass "computeruse + config tests"
+# The agent only forwards now; the safeguards are tested in the helper below.
+if (cd "$REPO" && go test ./internal/computeruse/... ./internal/config/... ./internal/api/... 2>&1 | tail -5); then
+  pass "client, config and API tests"
 else
-  fail "computeruse + config tests"
+  fail "client, config and API tests"
 fi
 
-step "swift worker compiles"
-# Type-check without running, so a syntax or API error surfaces as itself
-# rather than as a runtime failure inside one operation.
-if swiftc -typecheck "$SWIFT_WORKER" 2>&1; then
-  pass "computer_use.swift type-checks"
+step "desktop helper builds and its tests pass"
+if (cd "$HELPER_DIR" && swift build -c release 2>&1 | tail -3); then
+  pass "remote-agent-desktop builds"
 else
-  fail "computer_use.swift does not type-check"
+  fail "remote-agent-desktop does not build"
+fi
+# This is where the safeguards live: the action vocabulary and its bounds, the
+# grant contract, and the Locked Use state machine.
+if (cd "$HELPER_DIR" && swift test 2>&1 | tail -3); then
+  pass "helper tests"
+else
+  fail "helper tests"
 fi
 
-# run_worker <json> -> prints stdout, returns worker's success
-run_worker() {
-  swift "$SWIFT_WORKER" "$1" 2>/dev/null
-}
+HELPER="$HELPER_DIR/.build/release/remote-agent-desktop"
 
-step "swift worker read-only operations"
-# These three are what the controller polls constantly. If any of them cannot
-# answer, every safeguard built on it fails closed and Locked Use will not arm.
-LOCK_STATE="$(run_worker '{"op":"lock_state"}')"
-if printf '%s' "$LOCK_STATE" | grep -q '"ok":true'; then
-  pass "lock_state -> $LOCK_STATE"
+step "helper answers the read-only probes"
+# These three are what the controller polls constantly. If any cannot answer,
+# every safeguard built on it fails closed and Locked Use will not arm.
+if [ -x "$HELPER" ]; then
+  PROBES="$("$HELPER" --self-check 2>/dev/null)"
+  for probe in locked idle_seconds engaged; do
+    if printf '%s' "$PROBES" | grep -q "\"$probe\""; then
+      pass "$probe answered"
+    else
+      fail "$probe did not answer (got: ${PROBES:-<empty>})"
+    fi
+  done
 else
-  fail "lock_state did not answer (got: ${LOCK_STATE:-<empty>})"
-fi
-
-IDLE="$(run_worker '{"op":"idle_seconds"}')"
-if printf '%s' "$IDLE" | grep -q '"ok":true'; then
-  pass "idle_seconds -> $IDLE"
-else
-  fail "idle_seconds did not answer (got: ${IDLE:-<empty>})"
-fi
-
-SHIELD_STATE="$(run_worker '{"op":"shield_state"}')"
-if printf '%s' "$SHIELD_STATE" | grep -q '"ok":true'; then
-  pass "shield_state -> $SHIELD_STATE"
-else
-  fail "shield_state did not answer (got: ${SHIELD_STATE:-<empty>})"
-fi
-
-step "swift worker rejects unknown input"
-# The action set is closed. A worker that accepted an unknown op would mean the
-# Go-side validation is the only thing standing between a caller and the desktop.
-BAD="$(run_worker '{"op":"definitely-not-an-op"}')"
-if printf '%s' "$BAD" | grep -q '"ok":false'; then
-  pass "unknown op refused"
-else
-  fail "unknown op was not refused (got: ${BAD:-<empty>})"
-fi
-BAD_ACTION="$(run_worker '{"op":"action","action":"shell.exec"}')"
-if printf '%s' "$BAD_ACTION" | grep -q '"ok":false'; then
-  pass "unknown action refused"
-else
-  fail "unknown action was not refused (got: ${BAD_ACTION:-<empty>})"
-fi
-
-step "there is no unlock operation"
-# The worker must not be able to unlock a Mac. Unlocking belongs to macOS and
-# the authorization plug-in; a worker that could do it directly would make every
-# controller safeguard bypassable.
-if grep -qiE '"(unlock|sac_?unlock)"|SACUnlock' "$SWIFT_WORKER"; then
-  fail "the worker appears to expose an unlock operation"
-else
-  pass "no unlock operation in the worker"
+  fail "helper binary not found at $HELPER"
 fi
 
 step "accessibility permission"
-# Synthetic events silently do nothing without this, which would look like a
-# broken feature rather than a missing permission.
+# Synthetic events silently do nothing without this, which looks like a broken
+# feature rather than a missing permission. Once the helper runs under launchd
+# the grant belongs to the helper; this checks the terminal you are testing in.
 AX="$(osascript -e 'tell application "System Events" to return UI elements enabled' 2>/dev/null)"
 if [ "$AX" = "true" ]; then
   pass "accessibility is granted to this terminal"
 else
   skip "accessibility not granted — grant it in System Settings > Privacy & Security > Accessibility, or synthetic input will do nothing"
+fi
+
+step "there is no unlock operation in the helper"
+# The helper must not be able to unlock a Mac. Unlocking belongs to macOS and
+# the authorization plug-in; a helper that could do it directly would make every
+# controller safeguard bypassable.
+if grep -rqiE '"(unlock|sac_?unlock)"|SACUnlock' "$HELPER_DIR/Sources"; then
+  fail "the helper appears to expose an unlock operation"
+else
+  pass "no unlock operation in the helper"
 fi
 
 step "authorization plug-in builds"
@@ -155,29 +137,30 @@ else
   tail -20 /tmp/ra-plugin-build.log 2>/dev/null | sed 's/^/       /'
 fi
 
-step "plug-in and Go agree on the grant contract"
+step "plug-in and helper agree on the grant contract"
 # These constants are duplicated across a language boundary. A silent drift
-# means the agent mints grants the plug-in will always reject.
+# means the agent mints grants the plug-in will always reject, and the only
+# symptom is a Mac that never unlocks.
 check_const() {
-  local label="$1" objc_pattern="$2" go_pattern="$3"
-  local objc go
-  objc="$(grep -oE "$objc_pattern" "$REPO/mac/authorization-plugin/RemoteAgentLockedUse.m" | head -1)"
-  go="$(grep -oE "$go_pattern" "$REPO/internal/computeruse/grant.go" | head -1)"
-  if [ -n "$objc" ] && [ -n "$go" ]; then
-    pass "$label (plug-in: $objc, go: $go)"
+  local label="$1" objc_pattern="$2" swift_pattern="$3" swift_file="${4:-$GRANT_SRC}"
+  local objc swift
+  objc="$(grep -oE "$objc_pattern" "$PLUGIN_SRC" | head -1)"
+  swift="$(grep -oE "$swift_pattern" "$swift_file" | head -1)"
+  if [ -n "$objc" ] && [ -n "$swift" ]; then
+    pass "$label (plug-in: $objc, helper: $swift)"
   else
-    fail "$label could not be compared (plug-in: '${objc:-?}', go: '${go:-?}')"
+    fail "$label could not be compared (plug-in: '${objc:-?}', helper: '${swift:-?}')"
   fi
 }
-check_const "grant version"  'kGrantVersion[^;]*= *[0-9]+'      'GrantVersion *= *[0-9]+'
-check_const "max grant TTL"  'kMaxGrantTTL[^;]*= *[0-9.]+'      'MaxGrantTTL *= *[0-9]+ *\* *time\.Second'
-check_const "max clock skew" 'kMaxClockSkew[^;]*= *[0-9.]+'     'MaxClockSkew *= *[0-9]+ *\* *time\.Second'
-check_const "grant purpose"  'screensaver-unlock'               'screensaver-unlock'
-check_const "public key size" 'kPublicKeyBytes[^;]*= *[0-9]+'   'PublicKeyBytes *= *[0-9]+'
+check_const "grant version"   'kGrantVersion[^;]*= *[0-9]+'   'let version *= *[0-9]+'
+check_const "max grant TTL"   'kMaxGrantTTL[^;]*= *[0-9.]+'   'let maxTTL: TimeInterval *= *[0-9]+'
+check_const "max clock skew"  'kMaxClockSkew[^;]*= *[0-9.]+'  'let maxClockSkew: TimeInterval *= *[0-9]+'
+check_const "grant purpose"   'screensaver-unlock'            'screensaver-unlock'
+check_const "public key size" 'kPublicKeyBytes[^;]*= *[0-9]+' 'let publicKeyBytes *= *[0-9]+'
 
-PLUGIN_DIR_CONST="$(grep -oE '/Library/Application Support/remote-agent/locked-use' "$REPO/mac/authorization-plugin/RemoteAgentLockedUse.m" | head -1)"
-GO_DIR_CONST="$(grep -oE '/Library/Application Support/remote-agent/locked-use' "$REPO/internal/computeruse/locked.go" | head -1)"
-if [ -n "$PLUGIN_DIR_CONST" ] && [ "$PLUGIN_DIR_CONST" = "$GO_DIR_CONST" ]; then
+PLUGIN_DIR_CONST="$(grep -oE '/Library/Application Support/remote-agent/locked-use' "$PLUGIN_SRC" | head -1)"
+HELPER_DIR_CONST="$(grep -oE '/Library/Application Support/remote-agent/locked-use' "$CONFIG_SRC" | head -1)"
+if [ -n "$PLUGIN_DIR_CONST" ] && [ "$PLUGIN_DIR_CONST" = "$HELPER_DIR_CONST" ]; then
   pass "grant directory matches on both sides"
 else
   fail "grant directory differs — the agent would publish grants where the plug-in never looks"
@@ -207,17 +190,16 @@ else
   skip "cannot locate Security.framework headers in the SDK"
 fi
 
-step "a Go-minted grant verifies in the plug-in's own verifier"
+step "a helper-minted grant verifies in the plug-in's own verifier"
 # The contract has two implementations in two languages and only the ObjC one
-# enforces anything. Nothing in CI can tell "they agree" apart from "each is
-# self-consistent and rejects the other" — which fails silently: the agent
-# mints, the plug-in refuses, and the Mac simply never unlocks. This is the one
-# place the two are run against each other, so it happens on the target Mac.
+# enforces anything. Nothing in either test suite can tell "they agree" apart
+# from "each is self-consistent and rejects the other" — which fails silently:
+# the agent mints, the plug-in refuses, and the Mac simply never unlocks. This
+# is the one place the two are run against each other, so it happens here.
 VECTOR="$(mktemp -t ra-interop-vector)"
 CHECKER="$(mktemp -d -t ra-interop)/interop_check"
-if (cd "$REPO" && RA_INTEROP_VECTOR_OUT="$VECTOR" \
-      go test ./internal/computeruse/ -run TestInteropVector -count=1 >/dev/null 2>&1) &&
-   [ -s "$VECTOR" ]; then
+if (cd "$HELPER_DIR" && RA_INTEROP_VECTOR_OUT="$VECTOR" \
+      swift test --filter testInteropVector >/dev/null 2>&1) && [ -s "$VECTOR" ]; then
   if clang -fobjc-arc -Wno-unused-function -framework Foundation -framework Security \
        -o "$CHECKER" "$REPO/mac/authorization-plugin/interop_check.m" 2>/tmp/ra-interop-build.log; then
     PUB="$(sed -n 1p "$VECTOR")"
@@ -225,9 +207,9 @@ if (cd "$REPO" && RA_INTEROP_VECTOR_OUT="$VECTOR" \
     SIG="$(sed -n 3p "$VECTOR")"
     WRONG_PUB="$(sed -n 4p "$VECTOR")"
     if "$CHECKER" "$PUB" "$PAYLOAD" "$SIG"; then
-      pass "plug-in verifier accepts a grant minted by the Go signer"
+      pass "plug-in verifier accepts a grant minted by the helper"
     else
-      fail "plug-in verifier REJECTED a valid Go-minted grant — the two sides disagree"
+      fail "plug-in verifier REJECTED a valid helper-minted grant — the two sides disagree"
     fi
     # Without a case it must refuse, a verifier that always allowed would pass.
     if "$CHECKER" "$WRONG_PUB" "$PAYLOAD" "$SIG"; then
@@ -240,25 +222,21 @@ if (cd "$REPO" && RA_INTEROP_VECTOR_OUT="$VECTOR" \
     tail -20 /tmp/ra-interop-build.log 2>/dev/null | sed 's/^/       /'
   fi
 else
-  fail "could not mint an interop vector from the Go signer"
+  fail "could not mint an interop vector from the helper"
 fi
 rm -f "$VECTOR"
 rm -rf "$(dirname "$CHECKER")"
 
 if [ "$CHECK_SHIELD" = "1" ]; then
   step "display shield (disruptive)"
-  ENGAGE="$(run_worker '{"op":"shield_engage"}')"
-  if printf '%s' "$ENGAGE" | grep -q '"ok":true'; then
-    sleep 2
-    STATE="$(run_worker '{"op":"shield_state"}')"
-    run_worker '{"op":"shield_release"}' >/dev/null
-    if printf '%s' "$STATE" | grep -q '"engaged":true'; then
-      pass "shield engaged, reported live, and released ($ENGAGE)"
-    else
-      fail "shield engaged but did not report as live (got: $STATE)"
-    fi
+  # Raising and dropping the shield is not a socket operation: a shield any
+  # connected process could release is one that can be taken down while a
+  # window is open. It is reachable only by running this binary directly.
+  SHIELD="$("$HELPER" --check-shield 2>/dev/null | tail -1)"
+  if printf '%s' "$SHIELD" | grep -q '"ok":true'; then
+    pass "shield engaged, reported live, and released ($SHIELD)"
   else
-    fail "shield could not engage (got: ${ENGAGE:-<empty>})"
+    fail "shield did not engage and report live (got: ${SHIELD:-<empty>})"
   fi
 else
   skip "display shield check — pass --check-shield to run it (briefly covers your screen)"
@@ -268,7 +246,7 @@ if [ "$CHECK_LOCK" = "1" ]; then
   step "screen lock (disruptive)"
   echo "  locking in 3s; log back in and re-run to see the result"
   sleep 3
-  LOCKED="$(run_worker '{"op":"lock"}')"
+  LOCKED="$("$HELPER" --check-lock 2>/dev/null | tail -1)"
   if printf '%s' "$LOCKED" | grep -q '"ok":true'; then
     pass "lock succeeded"
   else
@@ -285,8 +263,8 @@ if [ "$FAILED" -eq 0 ]; then
 
   Next, in order:
     1. Re-run with --check-shield --check-lock to exercise the disruptive paths.
-    2. Enable computer_use.enabled in config.json and try /computer_use/action
-       (screen.capture, pointer.move) with locked_use still off.
+    2. Enable computer_use.enabled in config.json, start the helper, and try
+       /computer_use/action (screen.capture, pointer.move) with locked_use off.
     3. Only then read docs/computer-use-locked-user.md "未验证事项" and install
        the plug-in on a spare Mac or VM first. It changes how the Mac unlocks.
 NEXT

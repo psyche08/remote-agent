@@ -161,12 +161,12 @@ func (s *Server) computerUseAction(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	action, err := computeruse.ParseAction(body)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	result, err := ctl.RunAction(action)
+	// The action vocabulary is validated in the helper, which is the only
+	// process that can act on it. Validating here as well would put a second
+	// copy of the vocabulary in a process that cannot enforce it — the socket
+	// is reachable without going through this route — and a copy that drifted
+	// would be worse than none.
+	result, err := ctl.RunAction(body)
 	if err != nil {
 		writeComputerUseError(w, err)
 		return
@@ -175,7 +175,6 @@ func (s *Server) computerUseAction(w http.ResponseWriter, r *http.Request) {
 		result = map[string]any{}
 	}
 	result["ok"] = true
-	result["action"] = string(action.ID)
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -184,6 +183,14 @@ func (s *Server) computerUseAction(w http.ResponseWriter, r *http.Request) {
 // string-matching. Nothing in these messages carries grant or key material.
 func writeComputerUseError(w http.ResponseWriter, err error) {
 	switch {
+	case errors.Is(err, computeruse.ErrBadRequest):
+		writeError(w, http.StatusBadRequest, err.Error())
+	case errors.Is(err, computeruse.ErrHelperUnavailable):
+		// A device whose helper died has computer use configured on and broken.
+		// Reporting that as "not enabled" would hide a fault behind a setting.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"ok": false, "status": "unavailable", "detail": err.Error(),
+		})
 	case errors.Is(err, computeruse.ErrNotEnabled),
 		errors.Is(err, computeruse.ErrLockedUseNotEnabled),
 		errors.Is(err, computeruse.ErrUnsupported):
