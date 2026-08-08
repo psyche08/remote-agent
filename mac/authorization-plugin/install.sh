@@ -29,6 +29,9 @@ RIGHT="system.login.screensaver"
 MECHANISM="RemoteAgentLockedUse:invoke,privileged"
 PUBKEY_SOURCE="${1:-}"
 DEVICE_ID="${RA_DEVICE_ID:-}"
+# The account the agent's desktop helper runs as. It has to be able to fill in
+# the grant file without owning it — see the grant hand-off below.
+AGENT_USER="${RA_AGENT_USER:-${SUDO_USER:-}}"
 
 if [ "$(uname -s)" != "Darwin" ]; then
   echo "Locked Use is macOS-only" >&2
@@ -84,10 +87,35 @@ chmod -R go-w "$PLUGIN_DIR/$BUNDLE_NAME"
 echo "==> preparing $STATE_DIR"
 mkdir -p "$STATE_DIR/consumed"
 chown -R root:wheel "$STATE_DIR"
-# The plug-in reads these as root and rejects anything not root-owned. The
-# staging path the agent writes is handled by the agent's own installer.
+# The plug-in reads these as root and rejects anything not root-owned.
 chmod 0755 "$STATE_DIR"
 chmod 0700 "$STATE_DIR/consumed"
+
+# The grant hand-off crosses a privilege boundary, and this is where it is made
+# possible without adding a privileged component.
+#
+# The plug-in refuses any grant file that is not root-owned, so it can trust
+# what it reads. The desktop helper runs as the user: it cannot create a
+# root-owned file, cannot write into this directory, and cannot unlink from it.
+# Publishing by rename is therefore impossible — the renamed file would be the
+# user's, and the plug-in would reject every grant.
+#
+# So the file is created here, root-owned and writable by the agent's group, and
+# the helper fills it in place. Ownership never changes, so the plug-in's check
+# still holds. Withdrawal truncates it to zero, which the plug-in already
+# rejects, because unlinking would need write permission on this directory.
+#
+# Without this the feature installs cleanly, reports armed, and never unlocks.
+if [ -n "$AGENT_USER" ]; then
+  AGENT_GROUP="$(id -gn "$AGENT_USER" 2>/dev/null || echo staff)"
+  : > "$STATE_DIR/grant.json"
+  chown "root:$AGENT_GROUP" "$STATE_DIR/grant.json"
+  chmod 0620 "$STATE_DIR/grant.json"
+  echo "==> prepared the grant hand-off for $AGENT_USER (group $AGENT_GROUP)"
+else
+  echo "==> NOTE: no agent user known; the helper will not be able to publish grants." >&2
+  echo "    Re-run with RA_AGENT_USER=<the account the agent runs as>." >&2
+fi
 
 if [ -n "$DEVICE_ID" ]; then
   # Binds grants to this Mac. Without it a grant minted for one device would

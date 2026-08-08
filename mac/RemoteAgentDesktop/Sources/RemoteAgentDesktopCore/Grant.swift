@@ -279,30 +279,72 @@ public enum GrantVerifier {
     }
 }
 
+/// Publishing a grant crosses a privilege boundary, and how it crosses is not
+/// an implementation detail.
+///
+/// The plug-in runs as root and refuses any grant file that is not root-owned,
+/// so it can trust what it reads. This process runs as the user and cannot
+/// create a root-owned file, cannot write into the root-owned directory, and
+/// cannot unlink from it either. Publishing by rename is therefore impossible:
+/// the renamed file would be the user's.
+///
+/// So the installer pre-creates `grant.json` root-owned and group-writable, and
+/// this writes it **in place**. The file's ownership never changes, so the
+/// plug-in's check still holds, and no privileged component was added.
+///
+/// Two consequences are deliberate:
+///
+///   * Withdrawing truncates to zero rather than unlinking, because unlinking
+///     needs write permission on the directory, which the user does not have.
+///     The plug-in already rejects an empty file, so an emptied grant is a
+///     withdrawn grant. Truncation happens first and unlink is only attempted
+///     afterwards as tidying — a withdrawal that depended on unlink could fail
+///     and leave a live grant outliving its window.
+///   * A reader can observe a partially written grant, which rename would have
+///     prevented. That is not a security hole: a torn grant fails signature
+///     verification and is refused. It is the cost of not adding a root helper,
+///     and the reason the stronger design in the docs is a root daemon that
+///     writes the file itself.
 public enum GrantStore {
-    /// Publishes a grant for the Authorization Plug-in to read. The file is
-    /// written to a temporary name and renamed, so the plug-in never observes a
-    /// partially written grant it might parse as something else.
+    /// Publishes a grant for the Authorization Plug-in to read.
     public static func write(_ grant: Grant, to directory: String) throws {
         guard !directory.isEmpty else { throw GrantError("locked use has no grant directory") }
+        let path = (directory as NSString).appendingPathComponent(GrantContract.fileName)
+        let body = try JSONEncoder().encode(grant)
+
+        // Write in place when the file exists: the installer made it root-owned
+        // and group-writable so this process can fill it without owning it.
+        let fd = open(path, O_WRONLY | O_TRUNC | O_NOFOLLOW)
+        if fd >= 0 {
+            defer { close(fd) }
+            let wrote = body.withUnsafeBytes { raw in
+                Darwin.write(fd, raw.baseAddress, raw.count)
+            }
+            guard wrote == body.count else {
+                ftruncate(fd, 0)
+                throw GrantError("could not publish the grant")
+            }
+            return
+        }
+        if errno != ENOENT {
+            throw GrantError(
+                "could not publish the grant: \(String(cString: strerror(errno)))")
+        }
+
+        // No pre-created file: a directory this process owns, which is how
+        // tests and any non-root grant directory work. Rename keeps the
+        // publish atomic where it can.
         try FileManager.default.createDirectory(
             atPath: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
-        let body = try JSONEncoder().encode(grant)
-        let staging = (directory as NSString).appendingPathComponent(GrantContract.fileName + ".tmp")
-        let final = (directory as NSString).appendingPathComponent(GrantContract.fileName)
+        let staging = (directory as NSString)
+            .appendingPathComponent(GrantContract.fileName + ".tmp")
         try body.write(to: URL(fileURLWithPath: staging), options: .atomic)
-        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: staging)
-        do {
-            _ = try FileManager.default.replaceItemAt(
-                URL(fileURLWithPath: final), withItemAt: URL(fileURLWithPath: staging))
-        } catch {
-            // replaceItemAt requires the destination to exist on some paths;
-            // rename is the primitive that matters and is atomic either way.
-            guard rename(staging, final) == 0 else {
-                unlink(staging)
-                throw GrantError("could not publish the grant")
-            }
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: staging)
+        guard rename(staging, path) == 0 else {
+            unlink(staging)
+            throw GrantError("could not publish the grant")
         }
     }
 
@@ -311,7 +353,13 @@ public enum GrantStore {
     /// window is precisely the ambient authority to avoid.
     public static func remove(from directory: String) {
         guard !directory.isEmpty else { return }
-        unlink((directory as NSString).appendingPathComponent(GrantContract.fileName))
+        let path = (directory as NSString).appendingPathComponent(GrantContract.fileName)
+        // Emptying is the withdrawal that always works; the plug-in refuses a
+        // zero-length grant. Unlink is attempted afterwards only to tidy up,
+        // and its failure is not a failure to withdraw.
+        let fd = open(path, O_WRONLY | O_TRUNC | O_NOFOLLOW)
+        if fd >= 0 { close(fd) }
+        unlink(path)
         // A crashed mint can leave the staging file behind; it is not a valid
         // grant, but sweeping it keeps the directory's meaning unambiguous.
         unlink((directory as NSString).appendingPathComponent(GrantContract.fileName + ".tmp"))

@@ -300,3 +300,76 @@ final class GrantTests: XCTestCase {
         try Data(lines.utf8).write(to: URL(fileURLWithPath: out))
     }
 }
+
+/// Publishing crosses a privilege boundary: the plug-in refuses a grant file
+/// that is not root-owned, and this process cannot create one. The installer
+/// pre-creates the file root-owned and group-writable, and the helper fills it
+/// in place — so publishing must never replace the file, and withdrawing must
+/// never depend on unlinking it.
+extension GrantTests {
+    func testPublishingFillsAPreCreatedFileInPlace() throws {
+        let directory = NSTemporaryDirectory() + "ra-inplace-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        try FileManager.default.createDirectory(
+            atPath: directory, withIntermediateDirectories: true)
+        let path = (directory as NSString).appendingPathComponent(GrantContract.fileName)
+        // Stand in for the installer's file. Only the inode matters here: on a
+        // real device it is root-owned, and a publish that replaced it would
+        // hand the plug-in a file owned by this user, which it refuses.
+        FileManager.default.createFile(atPath: path, contents: Data())
+        let before = try FileManager.default.attributesOfItem(atPath: path)[.systemFileNumber] as? Int
+
+        let signer = try makeSigner()
+        let (minted, _) = try signer.mint(turnID: "turn-1", ttl: 5, now: Date())
+        try GrantStore.write(minted, to: directory)
+
+        let after = try FileManager.default.attributesOfItem(atPath: path)[.systemFileNumber] as? Int
+        XCTAssertEqual(before, after, "publishing replaced the file instead of filling it")
+
+        let onDisk = try JSONDecoder().decode(
+            Grant.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        XCTAssertEqual(onDisk, minted)
+
+        // A second publish must also stay in place, and must not leave the
+        // previous grant's bytes behind it.
+        let (second, _) = try signer.mint(turnID: "turn-2", ttl: 5, now: Date())
+        try GrantStore.write(second, to: directory)
+        let reread = try JSONDecoder().decode(
+            Grant.self, from: Data(contentsOf: URL(fileURLWithPath: path)))
+        XCTAssertEqual(reread, second, "a shorter grant left a tail of the previous one")
+    }
+
+    /// Withdrawal has to work without unlinking, because the directory belongs
+    /// to root. An empty file is a withdrawn grant: the plug-in rejects a
+    /// zero-length one.
+    func testWithdrawalEmptiesAGrantItCannotUnlink() throws {
+        let directory = NSTemporaryDirectory() + "ra-withdraw-\(UUID().uuidString)"
+        defer {
+            // Restore write permission so the temp tree can be cleaned up.
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: directory)
+            try? FileManager.default.removeItem(atPath: directory)
+        }
+        try FileManager.default.createDirectory(
+            atPath: directory, withIntermediateDirectories: true)
+        let path = (directory as NSString).appendingPathComponent(GrantContract.fileName)
+        FileManager.default.createFile(atPath: path, contents: Data())
+
+        let signer = try makeSigner()
+        let (minted, _) = try signer.mint(turnID: "turn-1", ttl: 5, now: Date())
+        try GrantStore.write(minted, to: directory)
+
+        // Take away the directory write permission, which is what root
+        // ownership means for this process: unlink cannot work.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500], ofItemAtPath: directory)
+
+        GrantStore.remove(from: directory)
+
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: path),
+            "the file could not be unlinked, which is the point of this case")
+        let size = try FileManager.default.attributesOfItem(atPath: path)[.size] as? Int
+        XCTAssertEqual(size, 0, "a grant survived withdrawal in a directory we cannot unlink from")
+    }
+}

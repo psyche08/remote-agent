@@ -128,7 +128,7 @@ public final class LockedUseController: @unchecked Sendable {
         }
         var keyPath = config.lockedUse.signingKeyPath
         if keyPath.isEmpty {
-            keyPath = (grantDirectory as NSString).appendingPathComponent("signing.key")
+            keyPath = defaultSigningKeyPath
         }
         let loaded: GrantSigner
         do {

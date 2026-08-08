@@ -136,3 +136,18 @@ public struct LockedUseConfig: Codable, Sendable {
 /// nowhere the verifier looks: Locked Use would appear armed and simply never
 /// unlock.
 public let defaultGrantDirectory = "/Library/Application Support/remote-agent/locked-use"
+
+/// Where the signing key lives by default.
+///
+/// Deliberately *not* inside the grant directory. That one is root-owned so the
+/// plug-in can trust what it reads, which means this process — running as the
+/// user — cannot create a file there at all. Defaulting the key into it left
+/// Locked Use unable to arm on a real device with "could not create the signing
+/// key: No such file or directory".
+///
+/// The private half belongs to the agent's own state anyway: the plug-in is
+/// provisioned with the public half and never needs to see this file.
+public var defaultSigningKeyPath: String {
+    NSString(string: "~/Library/Application Support/remote-agent/locked-use/signing.key")
+        .expandingTildeInPath
+}
