@@ -62,7 +62,11 @@ they do not ad-hoc re-sign downloaded binaries. (`spctl --type execute` is not
 a valid acceptance check for a bare CLI Mach-O: it reports “not an app” even
 when notarytool accepted the signed payload.)
 
-It cross-builds `remote-agent-darwin-arm64` with the full device console
+It builds and signs the macOS desktop helper first and embeds it, so a release
+stays one artifact with one sha256 and one signing team — the helper holds the
+Accessibility and Screen Recording grants, and TCC binds those to a code
+signature, so it must carry the same Developer ID. It then cross-builds
+`remote-agent-darwin-arm64` with that helper and the full device console
 embedded and uploads it plus `assets/release/manifest.json` (independent
 integer module version + source commit + build datetime in UTC+8; manifest
 uploaded last) to the relay release directory. `VERSION` defines the module's

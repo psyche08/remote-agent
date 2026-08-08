@@ -160,11 +160,8 @@ mv -f "$RUNTIME_BIN.new" "$RUNTIME_BIN"
 echo "==> installed runtime binary $RUNTIME_BIN"
 
 # The native Swift workers are looked up relative to the service's cwd, which is
-# $LIBEXEC_DIR. Install them alongside the binary so the OCR and computer-use
-# helpers resolve at runtime instead of silently reporting "not available".
-# These are workers only: enabling computer use still requires config.json, and
-# Locked Use additionally requires the separately installed authorization
-# plug-in (see docs/computer-use-locked-user.md).
+# $LIBEXEC_DIR. Install them alongside the binary so the OCR worker resolves at
+# runtime instead of silently reporting "not available".
 if [ -d "$REPO_REMOTE_AGENT/scripts" ]; then
   ensure_runtime_dir "$LIBEXEC_DIR/scripts"
   for f in "$REPO_REMOTE_AGENT/scripts/"*.swift; do
@@ -172,6 +169,30 @@ if [ -d "$REPO_REMOTE_AGENT/scripts" ]; then
     install -m 0755 "$f" "$LIBEXEC_DIR/scripts/$(basename "$f")"
   done
   echo "==> installed native workers into $LIBEXEC_DIR/scripts"
+fi
+
+# The computer-use desktop helper is a separate resident process, not a worker
+# script: it owns the display shield as windows it holds, so it has to live in
+# the user's GUI session. It travels inside the agent binary and is written out
+# here, before the LaunchAgent is registered — launchd will not bootstrap a job
+# whose program does not exist yet.
+#
+# Installing the helper does not enable anything. Computer use still requires
+# config.json, and Locked Use additionally requires the separately installed
+# authorization plug-in (see docs/computer-use-locked-user.md).
+if [ "$(uname -s)" = "Darwin" ] && "$RUNTIME_BIN" desktop install >/dev/null 2>&1; then
+  DESKTOP_HELPER="$("$RUNTIME_BIN" desktop install 2>/dev/null)"
+  echo "==> installed desktop helper $DESKTOP_HELPER"
+  if [ -x "$REPO_REMOTE_AGENT/mac/launchagent/install.sh" ] && [ "$(id -u)" != "0" ]; then
+    bash "$REPO_REMOTE_AGENT/mac/launchagent/install.sh" \
+      --config "$CFG" --helper "$DESKTOP_HELPER" || \
+      echo "==> NOTE: could not register the desktop LaunchAgent; run mac/launchagent/install.sh by hand"
+  else
+    echo "==> NOTE: run mac/launchagent/install.sh --config $CFG as the logged-in user"
+    echo "    to start the desktop helper; a LaunchAgent belongs to a user session."
+  fi
+else
+  echo "==> no embedded desktop helper in this build; computer use will report unavailable"
 fi
 
 # Reject an ambiguous state layout before stopping the currently healthy

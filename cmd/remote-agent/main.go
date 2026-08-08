@@ -19,6 +19,7 @@ import (
 	"github.com/psyche08/remote-agent/internal/autoupdate"
 	"github.com/psyche08/remote-agent/internal/buildinfo"
 	"github.com/psyche08/remote-agent/internal/config"
+	"github.com/psyche08/remote-agent/internal/desktopasset"
 	"github.com/psyche08/remote-agent/internal/logupload"
 	"github.com/psyche08/remote-agent/internal/provider"
 	"github.com/psyche08/remote-agent/internal/state"
@@ -38,6 +39,9 @@ func run(args []string) int {
 	}
 	if len(args) > 0 && args[0] == "update" {
 		return runUpdate(args[1:])
+	}
+	if len(args) > 0 && args[0] == "desktop" {
+		return runDesktop(args[1:])
 	}
 	if len(args) > 0 && args[0] == "version" {
 		b, _ := json.Marshal(buildinfo.Info())
@@ -70,6 +74,17 @@ func run(args []string) int {
 	if err := applyListenerOverrides(cfg, *listen, *uds); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
+	}
+	// Keep the desktop helper on disk and current before serving. A release
+	// ships one artifact, so the helper travels inside this binary; writing it
+	// out here is what makes an auto-update actually update the half that
+	// drives the desktop. Failing is not fatal: computer use then reports
+	// unavailable, which is the honest state, rather than taking the agent down
+	// with it.
+	if cfg.ComputerUse.Enabled && desktopasset.Embedded() {
+		if _, err := desktopasset.EnsureCurrent(desktopasset.DefaultHelperPath()); err != nil {
+			fmt.Fprintf(os.Stderr, "desktop helper not installed: %v\n", err)
+		}
 	}
 	stateDir := config.ResolveStateDir(cfg, baseDir)
 	store := state.New(filepath.Join(stateDir, "data"))

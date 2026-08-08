@@ -94,6 +94,21 @@ fi
 OUT="$(mktemp -d)"
 trap 'rm -rf "$OUT"' EXIT
 
+# The macOS desktop helper travels inside the agent binary, so a release stays
+# one artifact with one sha256 and one signing team. It is built and signed
+# first, with the same Developer ID: the helper holds the Accessibility and
+# Screen Recording grants, and TCC binds those to a code signature, so a helper
+# signed with anything else would lose every permission the user granted.
+DESKTOP_ASSET="$SRC_DIR/internal/desktopasset/assets/remote-agent-desktop"
+if [ -d "$SRC_DIR/mac/RemoteAgentDesktop" ]; then
+  echo "==> building and signing the desktop helper"
+  RA_SIGN_IDENTITY="$SIGN_IDENTITY" bash "$SRC_DIR/mac/RemoteAgentDesktop/build.sh" \
+    --out "$DESKTOP_ASSET"
+  verify_team_signature "$DESKTOP_ASSET"
+else
+  die "mac/RemoteAgentDesktop is missing; this checkout cannot produce a release"
+fi
+
 echo "==> building ${BIN_NAME} version=remote-agent.${MODULE_VERSION} commit=${COMMIT} built_at=${BUILT_AT}"
 BUILDINFO_PKG="github.com/psyche08/remote-agent/internal/buildinfo"
 ( cd "$SRC_DIR" && GOCACHE="$GOCACHE" GOOS=darwin GOARCH=arm64 "$GO" build -trimpath \

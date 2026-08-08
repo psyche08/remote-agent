@@ -38,7 +38,7 @@ flowchart TB
     Plugin -->|"verify + consume nonce"| Unlock["macOS unlock flow"]
     Plugin -.->|"不反对(Allow)"| Password["正常密码机制"]
 
-    Ctl -->|"lock / idle / shield / action"| Swift["scripts/computer_use.swift"]
+    Ctl -->|"newline-JSON over UDS"| Helper["mac/RemoteAgentDesktop<br/>remote-agent-desktop"]
     Swift --> Desktop["CoreGraphics 桌面"]
 
     Ctl --> Audit["audit ring (no secrets)"]
@@ -187,24 +187,53 @@ relay 的 30s 超时。控制器**不使用请求的 context**：客户端断开
 
 ### 0. 先跑 preflight
 
-Swift worker 与 ObjC plug-in 只能在 macOS 上编译和运行，CI 与 Linux 容器都无法
-验证它们。**在装任何东西之前**，先在目标机器上跑一次：
+Swift helper 与 ObjC plug-in 只能在 macOS 上编译和运行，而 grant 契约的两侧
+（helper 签发 / plug-in 验签）也只有在这里才能被拿来互相跑一遍。CI 与 Linux
+容器都做不到这些。**在装任何东西之前**，先在目标机器上跑一次：
 
 ```bash
 cd /path/to/remote-agent && bash mac/preflight.sh
 ```
 
 默认**只读**：不锁屏、不升遮罩、不安装 plug-in、不改 authorization database。
-它检查工具链、Go 构建/测试、Swift worker 能否 type-check 并回答三个只读操作、
-未知 op/action 是否被拒、worker 里确实没有 unlock 操作、Accessibility 是否授权、
-plug-in 能否编译，以及 **Go 与 plug-in 之间那几个跨语言常量是否漂移**
-（`GrantVersion`、`MaxGrantTTL`、`MaxClockSkew`、grant 目录）——漂移会让 agent
-签发的 grant 永远被 plug-in 拒绝。
+它检查工具链、Go 构建/vet/测试、helper 能否构建并通过自己的测试（护栏、词表、
+grant 契约都在那里）、三个只读探针能否回答、helper 里确实没有 unlock 操作、
+Accessibility 是否授权、plug-in 能否编译，以及三件跨语言的事：
+
+* **常量是否漂移**（`version`、`maxTTL`、`maxClockSkew`、公钥长度、grant 目录）
+  ——漂移会让 helper 签发的 grant 永远被 plug-in 拒绝，唯一症状是"就是解不开锁"。
+* **plug-in 是否只用公开 Security API**——它引用的每个 `kSec*` 常量都必须在公开
+  头文件里有声明。绑定私有符号的 mechanism 会在 authd 内部加载失败，那是锁死方向。
+* **helper 真实签出的 grant，能否被 plug-in 自己的验签函数接受**，并且换一把
+  公钥必须被拒绝（否则一个"永远放行"的验证器也能通过检查）。
 
 两个会打断桌面的检查需要显式开启：`--check-shield`（短暂遮挡屏幕）、
-`--check-lock`（锁屏）。
+`--check-lock`（锁屏）。它们是二进制的一次性命令行开关，**不是 socket 操作**：
+一个任何已连接进程都能释放的遮罩，等于可以在窗口开着时被掀掉。
 
-### 1. 构建并安装 plug-in
+### 1. 安装桌面 helper
+
+桌面能力与全部 Locked Use 护栏都在常驻进程 `remote-agent-desktop` 里。它随 agent
+二进制一起分发（release 仍然只有一个产物、一个 sha256、一套签名），安装时落盘：
+
+```bash
+remote-agent desktop install                       # 写出 helper，打印路径
+mac/launchagent/install.sh --config /path/config.json   # 以登录用户身份运行
+```
+
+必须是**用户会话里的 LaunchAgent**，两条理由不可互换：遮罩是真实窗口，
+需要 Aqua 会话；而 TCC 把 Accessibility / Screen Recording 归属到*责任进程*，
+由 agent 派生的子进程会把授权记到 agent 头上，合成事件于是静默失效——看起来像
+功能坏了，而不是缺权限。
+
+装好后要在「系统设置 > 隐私与安全性」里给 **helper 二进制本身**授予
+Accessibility 与 Screen Recording。
+
+`deploy/install.sh` 会在首次安装时自动做完这两步。后续的 relay 自动更新只替换
+agent 二进制，agent 启动时会把内嵌的 helper 写出并在内容变化时 `launchctl
+kickstart -k` 重启它——否则更新会落盘但不生效：launchd 仍在跑旧进程。
+
+### 2. 构建并安装 plug-in
 
 plug-in 必须在目标 Mac 上编译和签名（它会被加载进 SecurityAgent 进程），CI 不构建它。
 
@@ -214,7 +243,8 @@ RA_PLUGIN_SIGN_IDENTITY="Developer ID Application: ..." ./build.sh
 sudo ./install.sh                     # 安装 bundle，注册 mechanism
 ```
 
-安装后读取 agent 的公钥并 provision：
+安装后读取公钥并 provision。签名私钥由 helper 持有（`P256`，base64 PKCS#8，0600），
+公钥经 agent 的状态接口发布——它只能验签、不能签发，所以公开它不授予任何东西：
 
 ```bash
 curl --unix-socket <agent.sock> http://localhost/computer_use   # locked_use.public_key
@@ -222,7 +252,10 @@ sudo install -o root -g wheel -m 0600 <key-file> \
   "/Library/Application Support/remote-agent/locked-use/public.key"
 ```
 
-然后在 `config.json` 打开两个开关并重启 `remote-agent`。
+然后在 `config.json` 打开两个开关，重启 `remote-agent` 与 helper。
+
+一台已经跑过旧版本（Go 侧签发 grant）的设备**不需要重新 provision 公钥**：
+helper 能读同一份 PKCS#8 私钥并导出完全相同的公钥，这条由测试里的金标向量钉住。
 
 ### 部署注意
 
@@ -230,10 +263,11 @@ grant 目录默认就是 plug-in 编译期常量
 `/Library/Application Support/remote-agent/locked-use`。若改成别处，plug-in 将
 读不到 grant——Locked Use 会显示 armed 却永远解不开锁。
 
-`scripts/computer_use.swift` 由 `deploy/install.sh` 安装到 `$LIBEXEC_DIR/scripts`
-（服务的 cwd），因为 worker 是按 cwd 相对查找的。**relay 自动更新只替换二进制**，
-不会分发 scripts——已有设备需要跑一次 `deploy/install.sh` 才会拿到这个 worker。
-在此之前 `/computer_use` 会如实报告 `available:false`，功能保持关闭而不是半开。
+桌面能力与全部 Locked Use 护栏都在常驻 helper `remote-agent-desktop` 里，
+agent 只通过 UDS 转发。helper 自己读设备的 config.json——**配置永远不经 socket
+下发**：Locked Use 让机器能自解锁，这个能力必须在设备上授予，否则任何能连上
+socket 的本地进程都能把它打开。helper 未运行时 `/computer_use` 如实报告
+`available:false` 并对操作返回 503，功能保持关闭而不是半开。
 
 完全回退：
 
@@ -321,8 +355,9 @@ grant 能否真正缩短解锁流程，取决于该 right 的 mechanism 列表�
 | grant 签发/校验/单次消费 | `internal/computeruse/grant.go` |
 | 窗口状态机、safeguard、审计 | `internal/computeruse/locked.go` |
 | 封闭动作集与校验 | `internal/computeruse/action.go` |
-| 系统边界接口 + darwin/stub 实现 | `internal/computeruse/system*.go` |
+| agent 侧转发客户端 | `internal/computeruse/client.go` |
+| 桌面 helper（护栏与 grant 的实现处） | `mac/RemoteAgentDesktop/Sources/` |
 | API 路由与截屏闸门 | `internal/api/computeruse.go` |
 | Authorization Plug-in（执行副本） | `mac/authorization-plugin/RemoteAgentLockedUse.m` |
 | 构建/安装/卸载 | `mac/authorization-plugin/*.sh` |
-| CoreGraphics worker | `scripts/computer_use.swift` |
+| CoreGraphics 与遮罩 | `mac/RemoteAgentDesktop/Sources/RemoteAgentDesktopCore/Desktop.swift` |

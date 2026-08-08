@@ -46,10 +46,10 @@ remote-agent/
 │   └── index.html               # full console embedded into the agent binary
 ├── mac/
 │   ├── preflight.sh             # on-Mac checks for computer use / Locked Use
+│   ├── RemoteAgentDesktop/      # resident desktop helper: shield, safeguards, grants
 │   └── authorization-plugin/    # Locked Use Apple Authorization Plug-in (built on the Mac)
 ├── scripts/
-│   ├── ocr_vision.swift         # local Apple Vision OCR worker
-│   └── computer_use.swift       # CoreGraphics computer-use worker
+│   └── ocr_vision.swift         # local Apple Vision OCR worker
 ├── deploy/
 │   └── private-tunnel.example.yaml   # how to expose the agent via ../private-tunnel
 └── screenshots/
@@ -231,9 +231,13 @@ Both are **opt-in per device and default off**, and both must be turned on in th
 device's own `config.json` — no API call can enable them.
 
 * **Computer use** exposes a closed action vocabulary (`screen.capture`,
-  `pointer.move/click/scroll`, `keyboard.type/key`). Unknown ids are refused at
-  the API boundary; nothing reaches a shell, and every coordinate, text length,
-  and chord size is bounded.
+  `pointer.move/click/scroll`, `keyboard.type/key`). Unknown ids are refused;
+  nothing reaches a shell, and every coordinate, text length, and chord size is
+  bounded. The desktop itself is driven by `remote-agent-desktop`, a resident
+  helper in the user's GUI session that owns the display shield as windows it
+  holds — the agent only forwards to it over a unix socket, and cannot
+  configure it: Locked Use lets a machine unlock itself, so that capability is
+  granted on the device, never over a wire.
 * **Locked Use** lets an authorized turn keep driving the desktop after the
   screen locks, through an **Apple Authorization Plug-in** that participates in
   the macOS unlock flow. The plug-in **never touches the password** and is
