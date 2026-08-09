@@ -333,40 +333,29 @@ public final class LockedUseController: @unchecked Sendable {
             event: "grant_published", turnID: turnID,
             noncePrefix: Self.noncePrefix(minted.1.nonce))
 
-        // The unlock itself is performed by macOS. This process does not supply
-        // a credential; it has only asserted, verifiably, that an authorized
-        // turn is asking. The Authorization Plug-in decides — and on a real
-        // locked Mac it does exactly what it should. Measured directly:
+        // The unlock itself is performed by macOS. This process only asserts,
+        // verifiably, that an authorized turn is asking; the Authorization
+        // Plug-in is meant to decide.
         //
-        //   authd: running mechanism CodexComputerUseAuthorizationPlugin:allow
-        //   authd: running mechanism RemoteAgentLockedUse:invoke,privileged
-        //   authd: Succeeded authorizing right 'system.login.screensaver'
+        // On macOS 26.5 it does not get the chance. `SecurityAgentHelper` is a
+        // platform binary, and its Library Validation rejects loading a
+        // non-platform (Developer ID) SecurityAgent plug-in into it:
         //
-        // So the grant contract, the plug-in, and the rule wiring are sound;
-        // the k-of-n=1 order works, with the other agent's branch declining
-        // and ours authorizing. What is missing is narrower and is structural,
-        // not a timing gap, and it is not in this codebase's reach.
+        //   authorizationhosthelper: Error loading …/RemoteAgentLockedUse.bundle
+        //     code signature not valid for use in process: mapping process is a
+        //     platform binary, but mapped file is not
         //
-        // The login window has two unlock paths. provokeUnlockAttempt below
-        // (IOPMAssertionDeclareUserActivity) reliably makes it *begin* an
-        // unlock — logged as `startUnlock: kLWUnlockFromUserActive` — but that
-        // software-declared activity always begins on the PAM path
-        // (`LWPAMManager _beginServiceNamed: screensaver`), which our mechanism
-        // is not part of. Captured live, that path reports:
-        //
-        //   MechanismTree=(1) · AvailableMechanisms=( ) · User interaction required.
-        //
-        // and stops, never consulting an authorization plug-in. The
-        // authorizationdb path — the one that runs our mechanism — is reached
-        // only by an evaluation the login window initiates for some other
-        // reason (observed once, as T0), and no user-space API reproduces that
-        // entry: local/remote activity, display sleep→wake, shown lock UI,
-        // CGEventPostToPid, synthetic HID (which cannot reach the HID layer
-        // while locked at all), a held display assertion, and evaluating the
-        // right with a username in the environment were all tried and all
-        // stopped at the same PAM branch. Kept because it is the correct thing
-        // to attempt and harmless; the close of the gap is documented in
-        // docs/locked-unlock-investigation.md, not pending here.
+        // So our plug-in's code never runs — `AuthorizationPluginCreate` is
+        // never logged for our bundle — and a locked screen is never unlocked
+        // this way. This is not a gap in our implementation: OpenAI's own
+        // signed plug-in is rejected identically on 26.5 (openai/codex #24013).
+        // The provocation below still reliably makes the login window *begin*
+        // an unlock, but with no loadable mechanism it goes to the password
+        // path and stops. It is kept because it is harmless and correct in
+        // shape, and because a future platform-authorized signing could make
+        // the plug-in load. The full evidence and the alternative that does
+        // work (the Accessibility channel, which needs no unlock) are in
+        // docs/locked-unlock-investigation.md.
         if lockedAtOpen {
             system.provokeUnlockAttempt()
         }
