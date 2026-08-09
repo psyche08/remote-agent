@@ -40,7 +40,64 @@ authorizationhosthelper: Error loading …/StagedPlugins/RemoteAgentLockedUse.bu
 注册——在真机 26.5 上均正确且已执行。** 早先"plug-in 被平台策略拒绝、从未运行"的
 结论作废。
 
-## 二之前置：根因已定位 —— "screenLock delay is immediate" 禁用了 auto-unlock
+## 零、最终真相（由 24h 全量日志确证，取代本文以下所有早期结论）
+
+**Codex 在这台机器上过去 24 小时多次成功完成锁屏操作——24h 内有 5 次"3-mechanism
+完整解锁"。我此前"从无非密码解锁"的结论是错的，错因是一个致命的过滤失误。**
+
+我用"排除 `_authSuccessUsingPassword`"去找"非密码解锁"，把成功案例全滤掉了——因为
+**Codex 的成功解锁在日志里同样标记为 "with password"**。真相是那个 password 不是人
+敲的，是**程序化注入**的。成功解锁（08-08 21:42、21:52 等）的实证序列：
+
+```
+loginwindow: _checkAuthWithContinuityHints:…username:password: | no activity semaphore, continuing auth
+loginwindow: _authCopyRightsWithUsername:password: | The current user is trying to unlock the screen
+authd: running mechanism CodexComputerUseAuthorizationPlugin:allow (1 of 1)
+authd: running mechanism builtin:reset-password,privileged (2 of 3)
+authd: running mechanism builtin:authenticate,privileged (3 of 3)
+authd: UID 0 authenticated as user sheng (UID 501) for right 'system.login.screensaver'
+loginwindow: _authSuccessUsingPassword | Unlock succeeded, with password
+```
+
+**真正的机制（可复制）**：
+
+1. Codex 的 client **持有用户凭据**（用户在 Codex 中授权登录时提供），很可能经
+   `com.apple.LocalAuthenticationRemoteService`（其 client 二进制引用了它）。
+2. 远程 Computer Use 请求到达 → client 通过 loginwindow 的
+   `checkAuthWithContinuityHints:username:password:` **程序化提交 username+password**
+   （`no activity semaphore` = 不等人输入）。
+3. authd 求值 `system.login.screensaver`：Codex 的 `:allow` 门卫确认"存在合法的
+   Computer Use 待处理授权"，随后 **`builtin:authenticate` 用注入的凭据真正认证** →
+   解锁成功。
+4. 解锁后用 AX（window API）或坐标（desktop API）操作。
+
+**结论修正——这不是"免密绕过"，是"程序化提交存储的凭据"。** 我们缺的**不是**触发、
+**不是** right 挂错、**不是** plug-in 没执行（这些早期结论均作废或不完整）。我们缺的是
+**第 1–2 步：一个持有用户凭据、并经 LocalAuthentication/authorization-context 程序化
+提交 username+password 的机制。** 我们的 plug-in 作为门卫已就位（rule 数组中
+`com.psyche08.remote-agent.locked-use` 与 Codex 分支并存），但没有凭据注入这一环，
+authd 的链停在 `1 of 1`，永远走不到 `builtin:authenticate`。
+
+**这也回答了"屏幕必须锁"的矛盾**：Codex 的方式下屏幕**确实经历真实的系统级解锁**
+（setScreenIsLocked→0），操作完再锁回。它不是"遮罩伪装"，是持凭据的真解锁。安全模型
+是"用户预先把凭据托付给 Codex，Codex 在收到经认证的远程请求时代为提交"——凭据的
+保管与提交授权由 Codex 账户体系背书。
+
+**要在本仓库复刻，需实现凭据托管 + 程序化提交**：安全地保存用户解锁凭据（Keychain /
+Secure Enclave），在收到经 mTLS/账户认证的远程 turn 时，经
+`checkAuthWithContinuityHints:username:password:` 或 LocalAuthentication remote service
+提交。这是**明确的、有官方先例的实现路径**，非平台不可达——但它涉及在设备上保管用户
+解锁凭据，是重大安全设计决策，需用户明确授权与专门的凭据保护设计后再实现。
+
+---
+
+## 二之前置：（历史）曾疑为根因的 "screenLock delay is immediate"
+
+（下文为发现最终真相前的调查过程，保留以记录方法论。`screenLock immediate` 影响的是
+Apple Watch 式 auto-unlock，与上述"程序化提交凭据"路径是不同机制；后者才是 Codex 实际
+使用并成功的路径。）
+
+### （原）根因假设 —— "screenLock delay is immediate" 禁用了 auto-unlock
 
 （本节是整个调查的真正答案，晚于下面各节被发现，置顶。）
 

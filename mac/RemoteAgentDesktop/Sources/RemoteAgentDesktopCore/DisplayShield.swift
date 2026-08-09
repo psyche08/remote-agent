@@ -14,9 +14,21 @@ private final class ShieldWindow: NSWindow {
         frameRect
     }
 
-    // The shield covers the screen; it must never take focus or become the
-    // key window, or it would start receiving the keystrokes it is standing
-    // in front of.
+    // The shield is not key, so it does not steal the keyboard focus the
+    // agent's target app needs. The agent's own synthetic events go through
+    // CGEventPost at the HID tap and reach the frontmost app regardless of this
+    // window.
+    //
+    // Consequence — a known residual, honestly stated: because the shield is
+    // not key, a *physical* keystroke by a bystander is not absorbed here and
+    // reaches whatever app has focus behind the black cover. Mouse is absorbed
+    // (`ignoresMouseEvents = false`); keyboard is not. The "untouchable" half of
+    // the barrier is therefore complete for the pointer and partial for the
+    // keyboard. Closing it (a key, event-swallowing shield that still lets the
+    // agent's synthetic keys through) is a change to focus routing that must be
+    // verified on an unlocked session before it ships, because getting it wrong
+    // silently breaks the agent's own typing. Tracked in
+    // docs/locked-unlock-investigation.md; not changed unverified.
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
 }
