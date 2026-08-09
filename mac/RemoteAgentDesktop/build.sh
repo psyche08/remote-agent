@@ -38,19 +38,24 @@ BINARY="$HERE/.build/arm64-apple-macosx/release/remote-agent-desktop"
 [ -x "$BINARY" ] || BINARY="$HERE/.build/release/remote-agent-desktop"
 [ -x "$BINARY" ] || { echo "build produced no binary" >&2; exit 1; }
 
+# The entitlements give the helper its keychain access group, which the
+# unlock-credential storage (data-protection keychain) requires and which binds
+# that item to this signed binary.
+ENTITLEMENTS="$HERE/remote-agent-desktop.entitlements"
+
 echo "==> signing"
 if [ "$ADHOC" = "1" ]; then
   # An ad-hoc signature is acceptable only on a development machine you own.
   # It gives the helper an identity that does not survive a rebuild, so TCC
   # will re-prompt and previously granted permissions will not apply.
   echo "    WARNING: ad-hoc signature — development only, TCC grants will not persist"
-  codesign --force --sign - --timestamp=none "$BINARY"
+  codesign --force --sign - --timestamp=none --entitlements "$ENTITLEMENTS" "$BINARY"
 else
   IDENTITY="${RA_SIGN_IDENTITY:-}"
   [ -n "$IDENTITY" ] || { echo "RA_SIGN_IDENTITY is required (or pass --adhoc)" >&2; exit 2; }
   # The hardened runtime is what lets this binary hold TCC grants under a
   # stable identity across updates.
-  codesign --force --options runtime --timestamp --sign "$IDENTITY" "$BINARY"
+  codesign --force --options runtime --timestamp --entitlements "$ENTITLEMENTS" --sign "$IDENTITY" "$BINARY"
 fi
 codesign --verify --strict --verbose=2 "$BINARY"
 

@@ -17,9 +17,14 @@ import Security
 ///
 ///   * The credential lives in the Keychain, not in a file or in this
 ///     process's memory beyond the moment of a submission. It is stored with
-///     `kSecAttrAccessibleWhenUnlockedThisDeviceOnly`, so it is readable only
-///     while the user's keychain is unlocked and never leaves the device or
-///     syncs.
+///     `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`: readable after the
+///     first unlock following boot and thereafter *even while the screen is
+///     locked* — which is exactly when a Locked Use turn needs it — but never
+///     before first unlock, never off the device, never synced. (WhenUnlocked
+///     is wrong here: it ties access to the login keychain being unlocked,
+///     which it is not while the screen is locked, so both storing and reading
+///     failed with errSecAuthFailed at precisely the moment the credential is
+///     needed.)
 ///   * It is retrieved only inside `submit`, only when the controller has an
 ///     armed Locked Use turn that already passed grant verification and the
 ///     idle/shield safeguards. There is no op that returns the credential; the
@@ -55,6 +60,14 @@ public enum UnlockCredential {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
+            // The data-protection keychain, not the file-based login keychain.
+            // On macOS the kSecAttrAccessible* classes (AfterFirstUnlock) are
+            // honored only here; the login keychain instead locks with the
+            // screen, which is why an AfterFirstUnlock item stored there was
+            // still refused with errSecAuthFailed while locked. This keychain
+            // is also what an ACL bound to the helper's code signature applies
+            // to.
+            kSecUseDataProtectionKeychain as String: true,
         ]
     }
 
@@ -111,7 +124,7 @@ public enum UnlockCredential {
         var attributes = baseQuery()
         attributes[kSecValueData as String] = Data(password.utf8)
         attributes[kSecAttrAccessible as String] =
-            kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         SecItemDelete(baseQuery() as CFDictionary)
         let status = SecItemAdd(attributes as CFDictionary, nil)
         guard status == errSecSuccess else {
