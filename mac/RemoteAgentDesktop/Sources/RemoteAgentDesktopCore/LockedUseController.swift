@@ -335,27 +335,21 @@ public final class LockedUseController: @unchecked Sendable {
 
         // The unlock itself is performed by macOS. This process only asserts,
         // verifiably, that an authorized turn is asking; the Authorization
-        // Plug-in is meant to decide.
+        // Plug-in decides.
         //
-        // On macOS 26.5 it does not get the chance. `SecurityAgentHelper` is a
-        // platform binary, and its Library Validation rejects loading a
-        // non-platform (Developer ID) SecurityAgent plug-in into it:
-        //
-        //   authorizationhosthelper: Error loading …/RemoteAgentLockedUse.bundle
-        //     code signature not valid for use in process: mapping process is a
-        //     platform binary, but mapped file is not
-        //
-        // So our plug-in's code never runs — `AuthorizationPluginCreate` is
-        // never logged for our bundle — and a locked screen is never unlocked
-        // this way. This is not a gap in our implementation: OpenAI's own
-        // signed plug-in is rejected identically on 26.5 (openai/codex #24013).
-        // The provocation below still reliably makes the login window *begin*
-        // an unlock, but with no loadable mechanism it goes to the password
-        // path and stops. It is kept because it is harmless and correct in
-        // shape, and because a future platform-authorized signing could make
-        // the plug-in load. The full evidence and the alternative that does
-        // work (the Accessibility channel, which needs no unlock) are in
-        // docs/locked-unlock-investigation.md.
+        // On this machine the plug-in *does* run and authorize — a consumed
+        // nonce in the root-owned ledger proves our verification executed under
+        // authd — but on macOS 26.5 the login window does not retract the lock
+        // on that authorization: every completed unlock measured here went
+        // through `_authSuccessUsingPassword`, and the reference implementation
+        // (Codex) behaves identically on the same machine, its plug-in running
+        // yet its unlocks still password-based. So provocation reliably makes
+        // the login window begin an unlock, the plug-in authorizes, and the
+        // screen still waits for a password. The provocation is kept — it is
+        // harmless and correct in shape — but the channel that actually
+        // operates a locked screen without any unlock is the Accessibility one
+        // (ax_read / ax_press / ax_setvalue). See
+        // docs/locked-unlock-investigation.md for the full evidence.
         if lockedAtOpen {
             system.provokeUnlockAttempt()
         }

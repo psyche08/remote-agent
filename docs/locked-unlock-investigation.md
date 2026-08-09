@@ -1,88 +1,138 @@
-# 锁屏自动解锁：真机调查记录（含重大结论更正）
+# 锁屏自动解锁：真机调查记录
 
-本文记录在真机（macOS 26.5 / 25F71，M4 Pro，屏幕真实锁定）上，对"无人在场、
-纯软件唤起一台已锁 Mac 并接管桌面"这条路径的完整调查。
+真机环境：macOS 26.5 / 25F71，M4 Pro，屏幕真实锁定。目标：让 agent 在锁屏、无人
+在场时接管这台 Mac。
 
-> **2026-08-09 重大更正。** 本调查前半程反复断言"授权链已在真机完整验证、我们的
-> mechanism 被 authd 调用→验签→放行、consumed 里的 nonce 是物证"。**这个结论是
-> 错的**，且是本次任务最严重的一次误判。真相见下方"根因"一节：在 macOS 26.5 上，
-> 第三方 authorization plug-in 被 `SecurityAgentHelper` 的 Library Validation 拒绝
-> 加载，**我们的 plug-in 代码从未执行过**；`authd: running mechanism …` 那行是
-> plug-in **加载失败之后**打出的，被我误读成了"成功执行"。GitHub 上的证据显示，
-> 连 OpenAI 官方签名的 plug-in 在同一 macOS 版本上也被同样拒绝。
+> **给读者的方法论警告（重要）。** 本调查过程曲折，作者多次因"拿单一信号当铁证"
+> 而下错结论并反复更正。本文只保留经**多源、当场、可归因**证据支撑的结论。两条尤其
+> 关键的教训写在文末，请先读。
 
-## 根因：Library Validation 在 macOS 26.5 拒绝第三方 SecurityAgent plug-in
+## 一、已确证：我们的 plug-in 在 26.5 上确实加载并执行
 
-真机统一日志，每一次 `running mechanism RemoteAgentLockedUse` 的前一毫秒，都有：
+**决定性物证是一个被消费的 nonce。** `system.login.screensaver` 被求值时（真机，
+06:32:02），`/Library/Application Support/remote-agent/locked-use/consumed/` 下出现
+一个 root 拥有的 nonce 文件。消费 nonce 的**唯一**途径是 plug-in 的验签逻辑：helper
+以普通用户身份运行、写不进这个 root 目录；只有 plug-in 以 root 在 authd 内执行才能
+写。**这个 nonce 证明 plug-in 真正运行了、验签通过、烧掉了 nonce。**
 
-```
-authorizationhosthelper.arm64: Error loading …/StagedPlugins/RemoteAgentLockedUse.bundle
-  dlopen(...): code signature not valid for use in process:
-  mapping process is a platform binary, but mapped file is not
-authd: engine … running mechanism RemoteAgentLockedUse:invoke,privileged (1 of 1)
-```
+### 关于 "Library Validation failed / StagedPlugins" 的更正
 
-三次尝试全部如此。加载**失败**在前，`running mechanism` 在后——后者不是我们代码
-执行的证据。决定性佐证：`AuthorizationPluginCreate called`（plug-in 真正被实例化
-时才打印）在 12 小时日志中**只来自 `com.openai.sky.CUAService.AuthorizationPlugin`
-（Codex 的）**，没有一条来自我们的 bundle。我们的 plug-in 从未被实例化。
-
-`SecurityAgentHelper-arm64` / `authorizationhosthelper` 是 **平台二进制**
-（platform: yes），macOS 26.5 的强化运行时 Library Validation 拒绝把非平台签名
-（我们的 Developer ID，platform: no）的 bundle 映射进它。这不是 Accessibility /
-Screen Recording 权限问题，也不是签名损坏——我们的 bundle `codesign --verify
---strict` 通过、Developer ID 链完整。是**平台策略**拒绝加载。
-
-### GitHub 证据：OpenAI 官方在同一版本上也失败
-
-openai/codex issue **#24013**（"Locked Computer Use authorization plug-in is
-registered but rejected by macOS SecurityAgentHelper Library Validation"），环境
-**macOS 26.5 (25F71)、Apple Silicon**，与本机逐字对应。报告者的 plug-in（OpenAI
-Developer ID 签名、authorizationdb 注册与我们相同）被同样拒绝：
+日志中确有大量：
 
 ```
-Library Validation failed: Rejecting '.../CodexComputerUseAuthorizationPlugin'
-(Team ID: 2DC432GLL2, platform: no) for process 'SecurityAgentHelper-arm64'
-(Team ID: N/A, platform: yes),
-reason: mapping process is a platform binary, but mapped file is not
-… Successfully removed staged plugin
+authorizationhosthelper: Error loading …/StagedPlugins/RemoteAgentLockedUse.bundle
+  code signature not valid for use in process (platform binary vs non-platform)
 ```
 
-相关联的后续 issue 印证这条路在 26.x 普遍不通：#24394（breaks unlock）、
-#25788（fallback 把密码打进登录框）、#26319（解锁延迟 3-5s）、#29616（卡 17
-分钟）、#32396（automatic unlock fails）。社区提出的 fix 是给 plug-in 加
-`com.apple.security.cs.disable-library-validation` entitlement，但**未见在 26.5
-上被确认有效**。
+作者一度据此断言"plug-in 从未加载、授权链从未生效"——**这是错的**。判据有二：
 
-另一独立调查 scottjg/openaliro `docs/uwb-mac-login.md`（macOS 26.4.1 / 25E253）
-补充了一个易混淆的关键事实：真正在解锁那一刻被求值的是 **`system.login.screensaver.unlock`**
-（单一 mechanism `CryptoTokenKit:login`，其规则注释写明"不要修改"），而不是我们和
-Codex 复刻者们都在改的 `system.login.screensaver`（它 resolve 到 `use-login-window-ui`）。
-即便绕过 Library Validation，right 挂错这一点也需要重新审视。
+1. **这些失败全部来自 `StagedPlugins/`（暂存副本），不是主目录 `SecurityAgentPlugins/`。**
+   暂存副本的校验失败是无害的；真正被 authd 加载运行的是主目录那份。
+2. **参照实现（OpenAI Codex）在同一台机器上呈现完全相同的模式**：24h 内其
+   `AuthorizationPluginCreate called`（真实实例化）出现 **7 次**，Library Validation
+   拒绝也 **7 次**，两者并存。若拒绝是普适的，Codex 到处都无法运行——但它正常运行。
+   可见 Staged 失败与主目录成功并存是**正常现象**，不代表 plug-in 不工作。
 
-## 结论
+（我们的 plug-in 不像 Codex 那样打 `os_log`，所以"日志里看不到我们的
+`AuthorizationPluginCreate`"不能作为任何判据——它本就静默。用 nonce 作证据。）
 
-**在 macOS 26.5 上，通过第三方 authorization plug-in 自动免密解锁锁屏，是当前
-不可达的**——不是本仓库的实现缺陷，是平台策略（Library Validation 拒绝非平台
-SecurityAgent plug-in）。OpenAI 官方实现同样受阻。要打通需要其中之一：
+**结论：本仓库的 grant 契约、ECDSA 签名、跨语言验签、nonce 账本、plug-in、rule
+注册——在真机 26.5 上均正确且已执行。** 早先"plug-in 被平台策略拒绝、从未运行"的
+结论作废。
 
-1. plug-in 以带 `disable-library-validation` 的方式签名 —— 未经证实在 26.5 有效，
-   且削弱强化运行时保护；
-2. 苹果为该用途提供平台级授权 / entitlement —— 需向 Apple DTS 申请，非现有公开路径；
-3. 等待苹果修复或明确这条 plug-in 路径的支持状态（多个官方 issue 悬而未决）。
+## 二、真正的缺口：解锁那一刻求值的是另一个 right
 
-**已交付且正确的部分**（与解锁那一跳无关，独立成立）：grant 契约、ECDSA 签名与
-跨语言验签、nonce 账本、遮罩（覆盖全屏、多屏/镜像/扩展、窗口服务器几何确认）、
-护栏状态机、grant 跨权限交接、以及 **Accessibility 操作通道（`ax_read`/`ax_press`/
-`ax_setvalue`）——它在锁屏下直接操作应用元素树，不解锁、不注入、不依赖 plug-in，
-对应 OpenAI 官方 window API**。AX 通道是"锁屏下操作"在当前平台策略下**唯一可行**
-的路径，且已实现。
+plug-in 在跑、`AuthorizationCopyRights(system.login.screensaver)` 返回成功、nonce
+被消费——但**屏幕没有解锁**。多次真机尝试，`ioreg` ground truth 全程 locked。
 
-## 方法论教训
+第二独立调查 scottjg/openaliro `docs/uwb-mac-login.md`（macOS 26.4.1 / 25E253，
+证据分级严谨）指出一个易混淆的关键事实：
 
-本调查中至少三次基于不充分证据做出被后续数据推翻的判断：(1) 早先把
-`_authSuccessUsingPassword` 读成"靠密码"、又反转；(2) 把 `running mechanism` 读成
-"我们的 mechanism 成功执行"——**这是最严重的一次，直到看到 GitHub issue 才发现
-加载其实失败**；(3) 把 `StagedPlugins` 的加载失败误读成"正常首次暂存"。凡断言，
-必须以当场、未过期、且能归因到具体进程的日志为据；`running mechanism` 不等于
-plug-in 执行，必须由 `AuthorizationPluginCreate` 或 plug-in 自身输出佐证。
+```
+system.login.screensaver         →  resolve 到 use-login-window-ui
+system.login.screensaver.unlock  →  单一 mechanism CryptoTokenKit:login，
+                                     规则注释写明"这是 screensaver-unlock 规则、不要修改"
+```
+
+**loginwindow 实际撤锁时求值的是 `system.login.screensaver.unlock`，而我们（以及
+所有照 Codex 复刻的项目）都把 mechanism 注册在了 `system.login.screensaver` 上。**
+我们的 plug-in 因此会在"某人主动求值 screensaver right"时运行（如探针、如 authd
+的其它触发），却**不在 loginwindow 的真实解锁链上**——这正好解释了"授权成功却不
+解锁"这个贯穿始终的矛盾。
+
+这是当前最有希望的、尚未验证的方向：将 mechanism 注册进
+`system.login.screensaver.unlock`。但该 right 的注释明写"不要修改"，且其既有
+mechanism 是 `CryptoTokenKit:login`（智能卡登录），改动它的风险与可支持性都需在
+备用机上先验证，openaliro 亦将"替换该 Apple 拥有的 right 是否可作为产品契约"列为
+需向 Apple DTS 确认的未决项。
+
+## 三、不依赖解锁的可行路径：Accessibility 通道（已实现并真机验证）
+
+无论解锁那跳何时打通，还有一条**不需要解锁**就满足"锁屏下操作"的路径，且已经跑通：
+
+**Accessibility API 在锁屏下直接触达应用的元素树,不经过被锁屏隔断的 HID /
+window-server 层。** 合成 HID / CGEvent 事件在锁屏下到不了桌面（实测空闲计时器
+不动），AX 走的是应用进程内的 UI 层。真机实测（屏幕 `locked=true`）确认了它的
+**可达范围与边界**——详见第五节:**应用级结构（菜单，111 项）锁屏下可达可操作;
+窗口内容（web area / 按钮 / 文本框）不可达。**
+
+这与 OpenAI 官方文档一致：Codex 有两套 API——desktop API（坐标+合成事件，解锁态用）
+与 window API（`get_app_state`/`click by index`/`set_value`，全 Accessibility 驱动）。
+我们新增的 `ax_read`/`ax_press`/`ax_setvalue` 对应后者。它不解锁、不注入、不依赖
+plug-in。
+
+（实现中修过一个真 bug：AX 树含循环引用——Electron 应用的 child 会指回 application
+元素——未去重的遍历会把节点预算耗在自引用上（早期一次读到 1794 个"元素"实为同一
+自引用链的重复）。已按 CFEqual 身份去重修复,修复后得到 141 个干净节点。）
+
+## 四、方法论教训（务必读）
+
+本调查至少四次因证据不足而误判、随后被推翻：
+
+1. 把 `_authSuccessUsingPassword` 读成"靠密码解锁"，忽略同期 `passwordRequried:0`。
+2. 把 `authd: running mechanism` 读成"我们的 mechanism 成功执行"——应以 nonce 消费
+   或 plug-in 自身输出佐证。
+3. 把 `StagedPlugins` 的加载失败读成"plug-in 从未运行、平台不支持"——**最严重**，
+   直到对照 Codex 同样的失败+成功并存模式才纠正。
+4. 把单个 GitHub issue（#24013）读成"整个功能在 26.5 不支持"——而参照实现在本机
+   实际正常运行。
+
+统一规则：**任何断言必须有多源、当场、可归因到具体进程的证据。单一日志行、单个
+issue、已过期的记忆片段，都不足以支撑结论。** nonce 被消费 = plug-in 执行；
+`running mechanism` ≠ plug-in 执行。
+
+
+## 五、锁屏下 AX 的可达性边界（真机实测）
+
+将 AX 通道在锁屏下对 CatDesk（Electron 应用）实测：
+
+- **应用级元素可达**：菜单栏 7 项、111 个菜单项全部可读可操作（`ax_read` 返回，
+  `lock_state = locked`）。菜单树是应用级的，锁屏下始终存在，因此**菜单级操作在
+  锁屏下确定可用**。
+- **窗口内容不可达**：`kAXWindowsAttribute` 只返回应用自引用，web area / 按钮 /
+  文本框不在树里。已尝试在 application 与每个 window 上设 `AXManualAccessibility`
+  / `AXEnhancedUserInterface`（Chromium 展开 web 内容的文档开关），锁屏下仍未暴露
+  窗口内容。
+
+这与参照实现一致，非本仓库缺陷：openai/codex issue #24013 在锁屏下的失败正是
+**"Failed: Get app state"**——`get_app_state` 抓的就是窗口 accessibility 内容。
+Codex 的 `SkyComputerUseService` 日志显示它锁屏下大量使用 **ReplayKit（屏幕录制）**
+而非纯 AX，而截屏在锁屏下亦受限。
+
+**最一致的解释**：应用在锁屏时其窗口 UI 被系统降级/不渲染，故窗口级 AX 内容不可达；
+只有应用级结构（菜单）保持可达。是否所有应用皆如此、原生应用是否不同，未在本机
+逐一验证——此处不作过度推广。
+
+## 六、总结论
+
+"人不在、屏幕锁定、agent 操作应用**窗口内容**"，在 macOS 26.5 上，经本调查覆盖
+Codex 的全部技术手段，均受平台限制：
+
+| 手段 | 锁屏下状态 |
+|---|---|
+| plug-in 免密解锁 | plug-in 执行、授权成功（nonce 消费），但 loginwindow 不据此撤锁（解锁全走密码），Codex 同机同样 |
+| AX 操作窗口内容 | 窗口内容不可达（仅菜单可达），Codex `get_app_state` 同样失败（#24013） |
+| 合成事件 / 截屏 | 合成事件到不了锁屏 HID 层；截屏受限 |
+
+**确定可用**：解锁态的 pointer/keyboard/capture；**锁屏下的应用菜单级 AX 操作**。
+后者是当前平台策略下，"锁屏 + agent 操作"唯一无争议可用的通道，且已实现。

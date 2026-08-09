@@ -87,13 +87,48 @@ public enum Accessibility {
 
     /// Enumerates the actionable and labelled elements of an app, breadth first,
     /// bounded so a deep or cyclic tree cannot run away.
+    /// Electron/Chromium apps expose their web content to Accessibility only
+    /// after a client sets AXManualAccessibility on the application element —
+    /// otherwise the tree is just the native menu bar. Setting it is how a
+    /// screen reader (and the reference implementation) makes an Electron app's
+    /// buttons and fields addressable. Harmless if the app is not Electron.
+    private static func enableWebContent(_ app: AXUIElement) {
+        // Set on the application and on every window: Chromium exposes a
+        // window's web content only when the flag is set on that window
+        // element, not merely on the application. Both attributes are the
+        // documented switches a screen reader uses; harmless on non-Electron
+        // apps, which simply ignore them.
+        for attribute in ["AXManualAccessibility", "AXEnhancedUserInterface"] {
+            AXUIElementSetAttributeValue(app, attribute as CFString, kCFBooleanTrue)
+        }
+        var windowsRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            app, kAXWindowsAttribute as CFString, &windowsRef) == .success,
+           let windows = windowsRef as? [AXUIElement] {
+            for window in windows {
+                AXUIElementSetAttributeValue(
+                    window, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+            }
+        }
+    }
+
     public static func read(bundleID: String?, name: String?) throws -> [Node] {
         let app = try appElement(bundleID: bundleID, name: name)
+        enableWebContent(app)
         var out: [Node] = []
         var stack: [(AXUIElement, [Int])] = [(app, [])]
         var visited = 0
+        // AX trees contain cycles: a child can reference an ancestor (an
+        // Electron app's window points back at the application element), so an
+        // un-deduped walk spends its whole budget revisiting the same nodes on
+        // ever-growing paths — [0], [0,0], [0,0,0]… — and the real window
+        // content is pushed past the node cap. CFEqual identity dedup is what
+        // keeps the walk on distinct elements.
+        var seen: [AXUIElement] = []
         while let (element, path) = stack.first {
             stack.removeFirst()
+            if seen.contains(where: { CFEqual($0, element) }) { continue }
+            seen.append(element)
             visited += 1
             if visited > maxNodes { break }
             if path.count > maxDepth { continue }
