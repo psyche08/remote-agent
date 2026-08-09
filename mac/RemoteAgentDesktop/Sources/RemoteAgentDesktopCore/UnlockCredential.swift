@@ -39,6 +39,12 @@ import Security
 public enum UnlockCredential {
     private static let service = "com.psyche08.remote-agent.locked-use.unlock"
     private static let account = "unlock-credential"
+    /// The keychain access group, matching the helper's entitlement. Naming it
+    /// explicitly (rather than defaulting to the first entitled group) is what
+    /// scopes the item to exactly this signed helper — the binding the security
+    /// model depends on. Must equal the group in
+    /// remote-agent-desktop.entitlements, Team ID prefix included.
+    private static let accessGroup = "89LGY6BD53.com.psyche08.remote-agent.locked-use"
 
     public struct CredentialError: Error, CustomStringConvertible {
         public let message: String
@@ -68,6 +74,7 @@ public enum UnlockCredential {
             // is also what an ACL bound to the helper's code signature applies
             // to.
             kSecUseDataProtectionKeychain as String: true,
+            kSecAttrAccessGroup as String: accessGroup,
         ]
     }
 
