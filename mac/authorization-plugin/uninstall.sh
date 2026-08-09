@@ -33,6 +33,14 @@ if [ -f "$BACKUP" ]; then
     echo "==> restored the original $RIGHT from backup"
     rm -rf "${PLUGIN_DIR:?}/$BUNDLE_NAME"
     rm -rf "$STATE_DIR"
+    # Also remove the standalone rule definition. Restoring the right from
+    # backup drops the *reference* to this rule, but the rule itself lives in
+    # the authorization database independently and outlives the right — an
+    # orphan naming a now-removed bundle makes a later reinstall behave
+    # differently from a first one. This ran only in the fallback path before
+    # the exit below, so a normal backup-restore left the orphan behind.
+    security authorizationdb remove "$RULE_NAME" >/dev/null 2>&1 && \
+      echo "==> removed rule $RULE_NAME" || true
     echo
     echo "==> done. Screen unlock is back to stock macOS behavior."
     exit 0
