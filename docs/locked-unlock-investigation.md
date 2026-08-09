@@ -40,7 +40,50 @@ authorizationhosthelper: Error loading …/StagedPlugins/RemoteAgentLockedUse.bu
 注册——在真机 26.5 上均正确且已执行。** 早先"plug-in 被平台策略拒绝、从未运行"的
 结论作废。
 
-## 二、真正的缺口：解锁那一刻求值的是另一个 right
+## 二之前置：根因已定位 —— "screenLock delay is immediate" 禁用了 auto-unlock
+
+（本节是整个调查的真正答案，晚于下面各节被发现，置顶。）
+
+唯一一次 loginwindow 自己发起求值的解锁（T0）日志里有决定性一行：
+
+```
+loginwindow: -[LWAuthServiceManager activateAppropriateServicesAllowingAutoUnlock…] |
+             lock mode doesn't allow enabling auto unlock
+```
+
+而 `sysadminctl -screenLock status` 返回：
+
+```
+screenLock delay is immediate
+```
+
+**这台机器设为"锁屏后立即要求密码"。macOS 的 auto-unlock（涵盖 Apple Watch 与
+authorization-plugin 这类免密路径）只在有宽限期时才被允许启用；"立即"这个设置直接
+让 loginwindow 在 `activateAppropriateServicesAllowingAutoUnlock` 一步判定
+"lock mode doesn't allow enabling auto unlock"，从而不据 plug-in 的授权撤锁，退回
+密码。**
+
+这解释了全部现象且完全自洽：
+- plug-in 确实执行、授权成功（nonce 被消费）；
+- 但 `screenLock delay = immediate` → auto-unlock 被系统禁用 → 授权不转化为撤锁；
+- 每一次解锁都走密码（24h 内 4 次 `_authSuccessUsingPassword`，8/8 起全量日志中
+  **从无一次非密码解锁**）；
+- 参照实现 Codex 在同机同样被挡——这不是我们或 Codex 的实现缺陷，是**这台机器的
+  锁屏策略**。
+
+**可验证的下一步（需用户决定）**：将 screenLock delay 从 immediate 改为一个宽限期
+（如 5 秒 / 1 分钟），auto-unlock 才可能被允许，plug-in 的授权才可能真正解锁。
+命令示例（**会降低这台机器的锁屏安全性，属安全权衡，未擅自执行**）：
+
+```
+sysadminctl -screenLock 60 -password <你的密码>   # 60 秒宽限
+# 或在 系统设置 > 锁定屏幕 > 「在屏幕关闭或开始屏保后要求输入密码」改为非"立即"
+```
+
+FileVault 为 Off（已确认），不是此处的阻断因素。是否存在 MDM/配置描述文件强制该
+策略需 `sudo profiles` 确认。
+
+## 二、（历史）曾误判的方向：解锁那一刻求值的是另一个 right
 
 plug-in 在跑、`AuthorizationCopyRights(system.login.screensaver)` 返回成功、nonce
 被消费——但**屏幕没有解锁**。多次真机尝试，`ioreg` ground truth 全程 locked。
