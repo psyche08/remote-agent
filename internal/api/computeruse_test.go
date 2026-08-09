@@ -431,3 +431,55 @@ func TestCaptureGateRefusesWhenLockedUseHelperIsUnreachable(t *testing.T) {
 		t.Fatal("capture gate refused on a device without Locked Use")
 	}
 }
+
+// The Accessibility route forwards element-tree operations that work while the
+// screen is locked. Like the action route, the vocabulary is enforced in the
+// helper; what this layer owns is the op allow-list and faithful forwarding.
+func TestComputerUseAXForwardsAndGatesOps(t *testing.T) {
+	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
+		return map[string]any{"ok": true, "elements": []any{
+			map[string]any{"role": "AXButton", "label": "新任务", "path": []any{0, 2}},
+		}}
+	})
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+
+	// A good read forwards and returns the elements.
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/ax",
+		`{"op":"ax_read","app":"CatDesk"}`)
+	if code != http.StatusOK {
+		t.Fatalf("ax_read status=%d body=%#v", code, body)
+	}
+	if _, ok := body["elements"].([]any); !ok {
+		t.Fatalf("ax_read did not return elements: %#v", body)
+	}
+
+	// The op allow-list is this layer's own check and must be refused before
+	// reaching the helper.
+	code, _ = doJSON(t, srv, http.MethodPost, "/computer_use/ax", `{"op":"ax_teleport"}`)
+	if code != http.StatusBadRequest {
+		t.Errorf("unknown ax op status=%d, want 400", code)
+	}
+	for _, req := range helper.seen() {
+		if req["op"] == "ax_teleport" {
+			t.Error("an unknown ax op was forwarded to the helper")
+		}
+	}
+
+	// Set-value fields forward faithfully, including a unicode value.
+	code, _ = doJSON(t, srv, http.MethodPost, "/computer_use/ax",
+		`{"op":"ax_setvalue","app":"CatDesk","path":[1,4],"value":"你好"}`)
+	if code != http.StatusOK {
+		t.Fatalf("ax_setvalue status=%d", code)
+	}
+	seen := helper.seen()
+	last := seen[len(seen)-1]
+	if last["op"] != "ax_setvalue" || last["value"] != "你好" {
+		t.Errorf("ax_setvalue forwarded wrong: %#v", last)
+	}
+	if p, ok := last["path"].([]any); !ok || len(p) != 2 {
+		t.Errorf("ax_setvalue path forwarded wrong: %#v", last["path"])
+	}
+}

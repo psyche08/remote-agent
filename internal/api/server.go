@@ -205,6 +205,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/computer_use/locked_use", s.computerUseLockedUse)
 	mux.HandleFunc("/computer_use/window", s.computerUseWindow)
 	mux.HandleFunc("/computer_use/action", s.computerUseAction)
+	mux.HandleFunc("/computer_use/ax", s.computerUseAX)
 	mux.HandleFunc("/sessions", s.sessions)
 	mux.HandleFunc("/native_sessions", s.nativeSessions)
 	mux.HandleFunc("/session_options", s.sessionOptions)

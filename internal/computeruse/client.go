@@ -359,3 +359,40 @@ func (c *Controller) RunAction(req ActionRequest) (map[string]any, error) {
 	delete(res, "ok")
 	return res, nil
 }
+
+// AXRequest is the wire shape for an Accessibility operation. Unlike the
+// pointer/keyboard actions, these reach an app's element tree in-process, so
+// they work while the screen is locked — this is the channel that operates a
+// locked machine without unlocking it. Validation lives in the helper, which is
+// the only process that can act on it.
+type AXRequest struct {
+	Op       string `json:"op"`
+	App      string `json:"app"`
+	BundleID string `json:"bundle_id"`
+	Path     []int  `json:"path"`
+	Value    string `json:"value"`
+}
+
+// RunAX forwards an Accessibility operation. op is one of ax_read, ax_press,
+// ax_setvalue; the helper refuses anything else.
+func (c *Controller) RunAX(req AXRequest) (map[string]any, error) {
+	payload := map[string]any{"op": req.Op}
+	if req.App != "" {
+		payload["app"] = req.App
+	}
+	if req.BundleID != "" {
+		payload["bundle_id"] = req.BundleID
+	}
+	if req.Path != nil {
+		payload["path"] = req.Path
+	}
+	if req.Value != "" {
+		payload["value"] = req.Value
+	}
+	res, err := c.call(callTimeout, payload)
+	if err != nil {
+		return nil, err
+	}
+	delete(res, "ok")
+	return res, nil
+}

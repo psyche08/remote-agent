@@ -22,12 +22,19 @@ public struct Request: Decodable, Sendable {
     public let turnID: String?
     public let reason: String?
     public let active: Bool?
+    // Accessibility addressing: which app, which element, what value.
+    public let app: String?
+    public let bundleID: String?
+    public let path: [Int]?
+    public let value: String?
 
     enum CodingKeys: String, CodingKey {
         case op, action, x, y, button, count, text, keys, reason, active
+        case app, path, value
         case deltaX = "delta_x"
         case deltaY = "delta_y"
         case turnID = "turn_id"
+        case bundleID = "bundle_id"
     }
 
     var actionRequest: ActionRequest {
@@ -167,6 +174,54 @@ public struct RequestRouter: @unchecked Sendable {
                     return .ok(["action": action.id.rawValue])
                 case .captured(let path):
                     return .ok(["action": action.id.rawValue, "path": path])
+                }
+            } catch {
+                return Self.failure(for: error)
+            }
+
+        // Accessibility ops. Unlike the pointer/keyboard actions, these reach an
+        // app's element tree in-process, so they work while the screen is
+        // locked — this is the channel that makes "operate while locked" real.
+        // They require the helper to be trusted for Accessibility; without it
+        // every call fails, reported as such rather than as a broken feature.
+        case "ax_read", "ax_press", "ax_setvalue":
+            guard Accessibility.isTrusted() else {
+                return .failure(
+                    "the helper is not trusted for Accessibility; grant it in System Settings",
+                    code: .unsupported)
+            }
+            do {
+                switch request.op {
+                case "ax_read":
+                    let nodes = try Accessibility.read(
+                        bundleID: request.bundleID, name: request.app)
+                    return .ok(["elements": nodes.map { node in
+                        [
+                            "role": node.role,
+                            "label": node.label,
+                            "value": node.value ?? "",
+                            "actionable": node.actionable,
+                            "path": node.path,
+                        ] as [String: Any]
+                    }])
+                case "ax_press":
+                    guard let path = request.path else {
+                        return .failure("path is required", code: .badRequest)
+                    }
+                    try Accessibility.press(
+                        bundleID: request.bundleID, name: request.app, path: path)
+                    return .ok()
+                default:  // ax_setvalue
+                    guard let path = request.path else {
+                        return .failure("path is required", code: .badRequest)
+                    }
+                    guard let value = request.value else {
+                        return .failure("value is required", code: .badRequest)
+                    }
+                    try Accessibility.setValue(
+                        bundleID: request.bundleID, name: request.app,
+                        path: path, value: value)
+                    return .ok()
                 }
             } catch {
                 return Self.failure(for: error)

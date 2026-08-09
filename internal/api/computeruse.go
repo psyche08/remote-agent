@@ -178,6 +178,47 @@ func (s *Server) computerUseAction(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
+// computerUseAX drives an application through its Accessibility element tree.
+//
+// This is the channel that operates a locked machine: the pointer/keyboard
+// actions post synthetic events that a locked session partitions away, but the
+// Accessibility API reaches an app's elements in-process, which the lock screen
+// does not partition. It neither unlocks the screen nor injects input — it is
+// the ordinary Accessibility automation macOS grants a trusted process, which
+// the resident helper is, and it mirrors the reference implementation's
+// element-indexed window API (get_app_state / click / set_value).
+func (s *Server) computerUseAX(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	ctl := s.computerUseCtl
+	if ctl == nil {
+		writeError(w, http.StatusConflict, "computer use is not configured on this device")
+		return
+	}
+	var body computeruse.AXRequest
+	if !decodeJSON(w, r, &body) {
+		return
+	}
+	switch body.Op {
+	case "ax_read", "ax_press", "ax_setvalue":
+	default:
+		writeError(w, http.StatusBadRequest, `op must be ax_read, ax_press, or ax_setvalue`)
+		return
+	}
+	result, err := ctl.RunAX(body)
+	if err != nil {
+		writeComputerUseError(w, err)
+		return
+	}
+	if result == nil {
+		result = map[string]any{}
+	}
+	result["ok"] = true
+	writeJSON(w, http.StatusOK, result)
+}
+
 // writeComputerUseError maps controller errors onto status codes so a client
 // can distinguish "not turned on here" from "refused right now" without
 // string-matching. Nothing in these messages carries grant or key material.
