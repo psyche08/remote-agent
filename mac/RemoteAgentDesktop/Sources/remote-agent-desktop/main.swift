@@ -46,10 +46,35 @@ while let argument = arguments.first {
     case "--self-check": selfCheck = true
     case "--check-shield": checkShield = true
     case "--check-lock": checkLock = true
+    case "--set-unlock-credential":
+        // Provision the unlock credential from an interactive terminal only.
+        // Never a socket op: the credential must be set by the user at the
+        // device, not by anything that can reach the helper over a wire. The
+        // value is read from stdin, not from argv, so it does not land in the
+        // process table or shell history.
+        if !UnlockCredential.isProvisioned() {
+            FileHandle.standardError.write(Data("Enter unlock password (not echoed): ".utf8))
+        }
+        guard let password = readLine(strippingNewline: true), !password.isEmpty else {
+            fail("no password read from stdin", code: 2)
+        }
+        do {
+            try UnlockCredential.provision(password: password)
+            print("unlock credential provisioned")
+        } catch {
+            fail("\(error)", code: 1)
+        }
+        exit(0)
+    case "--clear-unlock-credential":
+        UnlockCredential.remove()
+        print("unlock credential cleared")
+        exit(0)
     case "-h", "--help":
         print("""
             usage: remote-agent-desktop [--socket <path>] [--config <path>]
                    remote-agent-desktop --self-check [--check-shield] [--check-lock]
+                   remote-agent-desktop --set-unlock-credential   (reads password from stdin)
+                   remote-agent-desktop --clear-unlock-credential
             """)
         exit(0)
     default:

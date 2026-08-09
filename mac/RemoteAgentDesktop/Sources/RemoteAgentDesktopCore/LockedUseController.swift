@@ -333,25 +333,34 @@ public final class LockedUseController: @unchecked Sendable {
             event: "grant_published", turnID: turnID,
             noncePrefix: Self.noncePrefix(minted.1.nonce))
 
-        // The unlock itself is performed by macOS. This process only asserts,
-        // verifiably, that an authorized turn is asking; the Authorization
-        // Plug-in decides.
+        // The unlock is a chain, not a single verdict. Our published grant and
+        // plug-in are the *gate* — they let authd know a Locked Use turn is
+        // pending — but macOS then runs builtin:authenticate, which needs an
+        // actual credential. The reference implementation supplies one
+        // programmatically; that is the step that turns an authorized gate into
+        // a retracted lock, verified in the logs as a three-mechanism chain
+        // (gate → reset-password → authenticate). See
+        // docs/locked-unlock-investigation.md.
         //
-        // On this machine the plug-in *does* run and authorize — a consumed
-        // nonce in the root-owned ledger proves our verification executed under
-        // authd — but on macOS 26.5 the login window does not retract the lock
-        // on that authorization: every completed unlock measured here went
-        // through `_authSuccessUsingPassword`, and the reference implementation
-        // (Codex) behaves identically on the same machine, its plug-in running
-        // yet its unlocks still password-based. So provocation reliably makes
-        // the login window begin an unlock, the plug-in authorizes, and the
-        // screen still waits for a password. The provocation is kept — it is
-        // harmless and correct in shape — but the channel that actually
-        // operates a locked screen without any unlock is the Accessibility one
-        // (ax_read / ax_press / ax_setvalue). See
-        // docs/locked-unlock-investigation.md for the full evidence.
+        // So: provoke the login window to begin an unlock, then submit the
+        // provisioned credential to complete authentication. If no credential
+        // is provisioned the submission fails plainly and the screen simply
+        // stays locked — the safe direction, unchanged from before.
         if lockedAtOpen {
             system.provokeUnlockAttempt()
+            if UnlockCredential.isProvisioned() {
+                do {
+                    try UnlockCredential.submit(
+                        reason: "Remote Agent Locked Use is completing an authorized turn")
+                    audit(event: "credential_submitted", turnID: turnID)
+                } catch {
+                    // Not fatal: the unlock just will not complete, and
+                    // awaitUnlock below will time out into the normal abort.
+                    audit(
+                        event: "credential_submit_failed", turnID: turnID,
+                        reason: "\(error)")
+                }
+            }
         }
         let unlockError = awaitUnlock(payload: minted.1)
         // Withdraw the grant regardless of outcome so nothing can ride it later.
