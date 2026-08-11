@@ -23,7 +23,11 @@ public struct LockScreenAuthorizationError: Error, Equatable, CustomStringConver
 }
 
 /// Starts the screensaver/loginwindow authorization flow through the control
-/// macOS exposes for that purpose. It never reads or writes the password value.
+/// macOS exposes for that purpose. It never reads the password value or writes
+/// a credential. After focusing the exact field it explicitly writes an empty
+/// AX value to ask loginwindow to observe an edit before this implementation's
+/// existing semantic submit action. On-device E2E remains the authority for
+/// whether that submit action is needed and harmless on each supported macOS.
 ///
 /// The exact identifier is intentionally the only selectable target. Falling
 /// back to a title such as "Unlock" would be localization-dependent and, more
@@ -58,6 +62,47 @@ public final class SystemLockScreenAuthorizationInteractor:
         }
     }
 
+    /// Pure status classification seams keep the credential-free field
+    /// preparation contract testable without depending on a live loginwindow.
+    /// A caller may submit the field only after both checks return.
+    static func requireEmptyValueWritable(
+        queryStatus: AXError, isSettable: Bool
+    ) throws {
+        try requireResponsive(
+            queryStatus,
+            operation: "checking whether the lock-screen authorization field accepts an empty value")
+        guard queryStatus == .success else {
+            throw LockScreenAuthorizationError(
+                "could not verify that the macOS lock-screen authorization field accepts an empty value (AX error \(queryStatus.rawValue))")
+        }
+        guard isSettable else {
+            throw LockScreenAuthorizationError(
+                "the macOS lock-screen authorization field does not accept an empty value")
+        }
+    }
+
+    static func requireEmptyValueWritten(_ status: AXError) throws {
+        try requireResponsive(
+            status,
+            operation: "writing an empty lock-screen authorization value")
+        guard status == .success else {
+            throw LockScreenAuthorizationError(
+                "could not write an empty value to the macOS lock-screen authorization field (AX error \(status.rawValue))")
+        }
+    }
+
+    /// The empty AX assignment can itself be the event that starts the system
+    /// authorization transaction. Keep it and the following semantic action
+    /// in a single, non-retrying boundary so a failed confirm can never cause
+    /// this request to assign the empty value a second time.
+    static func performSingleSubmission(
+        prepareEmptyValue: () throws -> Void,
+        confirm: () throws -> Void
+    ) throws {
+        try prepareEmptyValue()
+        try confirm()
+    }
+
     private static func before(_ deadline: Date, operation: String) throws {
         guard Date() <= deadline else {
             throw LockScreenAuthorizationError(
@@ -87,13 +132,12 @@ public final class SystemLockScreenAuthorizationInteractor:
 
         let deadline = Date().addingTimeInterval(Self.discoveryTimeout)
         var lastFailure = "the macOS lock-screen password field was not found"
-        var submittedField: AXUIElement?
+        var focusedField: AXUIElement?
         while Date() <= deadline {
             do {
                 let field = try passwordField(deadline: deadline)
                 try focus(field, deadline: deadline)
-                try confirm(field, deadline: deadline)
-                submittedField = field
+                focusedField = field
                 break
             } catch let error as LockScreenAuthorizationError {
                 lastFailure = error.detail
@@ -102,13 +146,26 @@ public final class SystemLockScreenAuthorizationInteractor:
             }
             Thread.sleep(forTimeInterval: Self.pollInterval)
         }
-        guard let submittedField else {
+        guard let focusedField else {
             throw LockScreenAuthorizationError(lastFailure)
         }
+
+        // The retryable discovery phase ends before the first possible
+        // trigger. From the empty-value attempt onward, every failure is
+        // ambiguous and must escape unchanged; never loop, rewrite, or submit
+        // again within this request.
+        try Self.performSingleSubmission(
+            prepareEmptyValue: {
+                try self.prepareEmptySubmission(focusedField, deadline: deadline)
+            },
+            confirm: {
+                try self.confirm(focusedField, deadline: deadline)
+            })
+
         // Never re-submit after this boundary. A lifecycle failure is
         // ambiguous and must reach controller quarantine unchanged.
         try waitForTransactionCompletion(
-            field: submittedField,
+            field: focusedField,
             completionReceiptObserved: completionReceiptObserved,
             isLocked: isLocked)
     }
@@ -263,6 +320,32 @@ public final class SystemLockScreenAuthorizationInteractor:
             throw LockScreenAuthorizationError(
                 "macOS rejected the lock-screen authorization action (AX error \(result.rawValue))")
         }
+    }
+
+    private func prepareEmptySubmission(
+        _ field: AXUIElement, deadline: Date
+    ) throws {
+        try Self.configureTimeout(field, deadline: deadline)
+        try Self.before(
+            deadline,
+            operation: "checking whether the lock-screen authorization field accepts an empty value")
+        var settable = DarwinBoolean(false)
+        let query = AXUIElementIsAttributeSettable(
+            field, kAXValueAttribute as CFString, &settable)
+        try Self.requireEmptyValueWritable(
+            queryStatus: query, isSettable: settable.boolValue)
+
+        // This is a deliberately credential-free empty public AX assignment,
+        // not a sentinel. Never copy/read the secure field's current value.
+        // Although the resulting field value is empty, the assignment itself
+        // may trigger authorization and therefore must never be retried.
+        // If loginwindow cannot acknowledge this edit, do not perform either
+        // AXConfirm or AXPress: the authorization request is not attributable.
+        try Self.before(
+            deadline, operation: "writing an empty lock-screen authorization value")
+        let written = AXUIElementSetAttributeValue(
+            field, kAXValueAttribute as CFString, "" as CFString)
+        try Self.requireEmptyValueWritten(written)
     }
 
     private func string(

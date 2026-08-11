@@ -146,10 +146,14 @@ else
 fi
 INTERACTOR="$HELPER_DIR/Sources/AgentHaloDesktopCore/LockScreenAuthorizationInteractor.swift"
 if grep -q 'UserPasswordTextField' "$INTERACTOR" 2>/dev/null && \
-   grep -q 'kAXConfirmAction' "$INTERACTOR" 2>/dev/null; then
-  pass "unlock request targets the exact loginwindow authorization control"
+   grep -q 'kAXConfirmAction' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'prepareEmptySubmission' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'performSingleSubmission' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'AXUIElementIsAttributeSettable' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'kAXValueAttribute as CFString, "" as CFString' "$INTERACTOR" 2>/dev/null; then
+  pass "unlock request prepares the exact loginwindow control with an empty public AX value"
 else
-  fail "the bounded loginwindow AX authorization interactor is missing"
+  fail "the bounded credential-free loginwindow AX authorization interactor is missing"
 fi
 
 step "authorization plug-in builds"

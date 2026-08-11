@@ -1,6 +1,6 @@
 # Computer Use / Locked Use — 状态与验收门禁
 
-更新时间：2026-08-09。当前分支：`feature/computer-use-locked-use`。
+更新时间：2026-08-11。当前分支：`feature/computer-use-locked-use`。
 
 ## 目标
 
@@ -25,6 +25,20 @@
 
 ### 1. 模型工具与权威 turn
 
+- Claude 默认使用 `desktop_computer_use`，以 Claude Desktop 的原生会话作为问答和授权界面的
+  唯一可变 owner；每个 logical session 持久绑定一个 session-sticky route，绑定后不能因单次
+  发送失败在 Desktop 与 CLI 之间切换。
+- Claude Desktop 的 prompt 输入、`AskUserQuestion` 回答和工具授权都在固定
+  provider/logical-session/turn 的短时进程内 Computer Use transaction 内完成。问答支持单选、
+  多选、`Other`、`Next` 和 `Submit`，并通过 transcript 严格核对 question→answer；授权只允许
+  精确点击 `Allow once` 或 `Deny`，拒绝 `Always`、session/task 级等扩大权限的选项。
+- 每个 UI/CLI 副作用前先持久创建独立的 attempted tombstone；Claude `/send_prompt` 还要求稳定
+  `operation_id`。进程崩溃、PWA 重试或 API 重启只能恢复相同请求的已知/不确定结果，不能再次
+  输入或提交。route、native session binding、operation tombstone 与 task/session outcome 都是
+  durable state，不能靠 observer hook 的可改写输出决定是否重发。
+- `stream_json_cli` 只是 fallback：仅全新、尚未 committed 的 logical session，且 Desktop
+  capability preflight 在任何 UI mutation 之前失败时才可选择；一旦触及 Desktop UI 或投递结果
+  不确定，必须返回 `needs_manual`，不得通过 CLI 补发。
 - Codex 新建 thread 在 `thread/start` 注册 `computer_use` dynamic tools：
   `get_app_state`、`press`、`set_value`、`click`、`type_text`、`press_key`、`scroll`。
 - 工具请求必须同时匹配当前 app-server generation、active thread、权威 turn ID 和 call ID；恢复的旧 thread、过期 generation、错误 thread/turn 均失败关闭。
@@ -33,7 +47,9 @@
 - 模型工具通过进程内 broker 调用 helper，不把 session/turn 参数当作模型提供的权限。
 - 配置 Locked Use 后，裸 HTTP `window open`、`action` 和 `ax` 默认拒绝；只有设备本地显式设置 `computer_use.debug_http_actions=true` 才用于调试。HTTP close 始终保留，因为它只能收权和重锁。
 
-当前只把上述**模型原生闭环**接到 Codex 新建 thread。Codex resume 不能安全补发 thread-only dynamic tools，因此失败关闭；Claude 的受管 CLI/MCP 父进程证明尚未实现，不能声称支持。
+Codex resume 仍不能安全补发 thread-only dynamic tools，因此失败关闭。Claude Desktop-first 闭环
+已经实现并进入 m4pro 真机验收，但首次锁屏 prompt 暴露的 loginwindow 空 `AXValue` 触发缺口修复
+尚待重签部署和 E2E，不能把 Claude Locked Use 写成已验收完成。
 
 ### 2. Apple Authorization Plug-in 解锁链
 
@@ -52,7 +68,13 @@
   且系统必须一直 locked；只有 complete 后的 field lifecycle completion + unlocked +
   shield coverage 才能把窗口置为 open。complete 前的真人、Apple Watch 或其他分支
   解锁一律 fail closed、重锁并进入 quarantine。
-- 解锁触发走 loginwindow 自身的 Accessibility 控件 `UserPasswordTextField` + confirm/press，不提交任何 credential。Apple public API 未保证 `MechanismDestroy` 晚于 loginwindow
+- 解锁触发走 loginwindow 自身的 Accessibility 控件：精确 focus `UserPasswordTextField`，确认
+  public `kAXValueAttribute` 可写后显式写入空字符串，再执行 confirm/press；全程不读取字段值，
+  不写入 sentinel 或 credential；空值虽不改变凭据状态，赋值事件本身可能启动授权，因此
+  discovery/focus 的有界重试在首次空值尝试前结束，
+  从空值写入尝试起任一步 AX 失败都直接返回，不会在同一 request 内重写或再次 submit。该顺序是
+  AgentHalo 当前的真机诊断实现，不代表对其他产品内部调用序列的声明；是否仍需 confirm/press
+  且其行为无害，以目标 macOS 的真实锁屏 E2E 为准。Apple public API 未保证 `MechanismDestroy` 晚于 loginwindow
   的可见解锁副作用，所以 complete → unlock 顺序仍是目标机 E2E 门禁。
 
 旧的 `LAContext.setCredential(.applicationPassword)` / 登录密码托管实现已删除。LocalAuthentication policy evaluation 是独立认证上下文，不能证明它参与 loginwindow 的当前撤锁事务。
@@ -106,40 +128,65 @@ swift test --disable-sandbox
 
 cd ../..
 GOCACHE=/tmp/remote-agent-go-cache go test ./...
+GOCACHE=/tmp/remote-agent-go-cache go test -race -count=1 ./...
 GOCACHE=/tmp/remote-agent-go-cache go vet ./...
 bash -n deploy/install.sh deploy/publish-release.sh mac/preflight.sh
 (cd mac/authorization-plugin && ./build.sh --adhoc)
 git diff --check
 ```
 
-2026-08-09 当前工作树的实际结果：
+2026-08-11 当前工作树的实际结果：
 
-- Swift 全量测试 `150/150` 通过；
-- `go test ./...` 与 `go vet ./...` 通过；
-- computeruse/API/provider 定向 race tests 通过；
+- Swift 全量测试 `163/163` 通过；
+- Go 全量 `go test -count=1 ./...`、全量 race `go test -race -count=1 ./...` 与
+  `go vet ./...` 通过；
 - Authorization Plug-in ad-hoc build/sign/verify 通过（仅编译验证，禁止部署）；
-- 非破坏 preflight 的所有 attempted checks 通过；3 项按设计 skip：真实 plug-in rule
-  未安装、display-shield 扰动检查未运行、screen-lock 扰动检查未运行；
+- 默认非破坏 preflight 的所有 attempted checks 通过；已安装的 plug-in/rule 检查通过，2 项
+  破坏性检查按设计 skip：display-shield 扰动和 screen-lock 扰动未运行；
 - 相关 shell 脚本 `bash -n` 和 `git diff --check` 通过。
 
 覆盖重点包括：grant/receipt 的 owner、mode、symlink、精确字节；open/close 并发与 late unlock；物理输入 latch；屏幕 PNG 内存编码；AX 越界；signed peer；provider generation/thread/turn；inspect-before-mutate；provider 终态重锁；HTTP 搭车拒绝；helper mode/restart/config reload。
 
 ## 真实设备状态与硬门禁
 
-截至 2026-08-09，本机只读检查结果：
+截至 2026-08-11，m4pro 的实际状态：
 
-- macOS 26.5.2 (25F84), arm64；
-- 系统已有 OpenAI 的 Authorization Plug-in 分支和正常 `use-login-window-ui` 分支；
-- AgentHalo plug-in、helper、socket 和 LaunchAgent **均未安装**；
-- 当前 shell 的 `security find-identity -v -p codesigning` 显示 `0 valid identities found`。
+- Developer ID 正式构建已完成签名和 Apple 公证；`AgentHalo.4` main/helper（commit
+  `bce49e4`）已部署，main identifier=`dev.linsheng.agenthalo`、helper
+  identifier=`dev.linsheng.agenthalo.desktop`、Team=`89LGY6BD53`，签名校验通过；
+- 正式签名的 `AgentHaloLockedUse` Plug-in 已安装并通过签名校验；
+  `system.login.screensaver` 已链接独立的 `dev.linsheng.agenthalo.locked-use` 子 rule，正常
+  `use-login-window-ui` 密码分支仍保留；
+- Locked Use key 已在登录 Keychain 中完成 provisioning，配置、运行目录、socket 和 hook 权限已
+  收紧；helper 的 Screen Recording/Accessibility TCC 已配置。AgentHalo 默认
+  `computer_use.enabled=true`、`locked_use.enabled=true`，部署后的 startup gate 曾读回
+  `armed=true`、`active=true`、`quarantined=false`；
+- 首个真实 locked Claude prompt 使用 `desktop_computer_use`，在 grant TTL 内没有收到
+  authorization receipt，任务安全结束为 `needs_manual` / `delivery_outcome=unknown`；没有 CLI
+  fallback、没有重复输入，窗口关闭且机器保持锁定。审计确认当次 loginwindow 交互只做了
+  focus + confirm/press，没有显式执行空 `kAXValueAttribute` 写入，因此没有启动
+  `system.login.screensaver` transaction，Plug-in 未被调用；
+- 代码现已在 exact `UserPasswordTextField` 上增加“确认 public AXValue 可写 → 显式写空值 →
+  confirm/press”的 credential-free、单次 fail-closed 顺序，并由 `163/163` Swift 测试和
+  preflight 覆盖；**该修复尚待重新正式签名、部署到 m4pro 并完成真实锁屏 E2E**；
+- 旧 `remote-agent` 仍保留运行，只有下列真实 E2E 全部通过后才执行最终删除/切流。
 
-因此本轮代码可以完成，但**不能诚实地把真实“锁定 → 无人值守授权解锁 → 模型截图/操作 → 重锁”标记为已通过**。必须先由设备所有者提供/解锁 Developer ID 签名身份，并明确授权安装 plug-in、修改 authorizationdb 和实际锁屏。完整步骤见 SETUP 文档。
+因此安装、签名、公证和基础启动门禁已经落地，但**不能诚实地把“锁定 → 无人值守授权解锁 →
+Claude 截图/问答/授权/操作 → 重锁”标记为已通过**。完整操作步骤见 SETUP 文档。
 
 真实验收必须同时满足：
 
-- [ ] helper、agent、plug-in 的签名/Team/identifier 验证通过；显式 provisioning 能创建/读取 creator-ACL-bound Keychain item，正常 runtime 只读，login Keychain 锁定时重启会 fail closed；
+- [x] helper、agent、plug-in 的签名/Team/identifier 验证通过；显式 provisioning 已创建并可读取 creator-ACL-bound Keychain item；
+- [ ] 修复后的 main/helper 重新正式签名、公证并部署；正常 runtime 只读，login Keychain 锁定时重启会 fail closed；
 - [ ] 安装后人工密码解锁仍正常，卸载/Recovery 路径已准备；
-- [ ] 锁屏且现场无人时，远端启动一个**新 Codex turn**；
+- [ ] 锁屏且现场无人时，远端创建 Claude fresh logical session；确认 session-sticky route 为
+  `desktop_computer_use`，并完成一次 prompt input/response；
+- [ ] 在同一 Claude Desktop native session 完成 `AskUserQuestion` 单选、多选、`Other`、`Next`、
+  `Submit`，远端答案与最终 transcript 的 question→answer 精确一致；
+- [ ] 分别完成一次 Claude 工具 `Allow once` 和一次 `Deny`；不点击或接受任何 `Always`、
+  session/task 级授权；
+- [ ] 对 prompt、问答和授权使用相同 `operation_id`/request 重试，并覆盖 agent/PWA 重启；
+  attempted tombstone 必须保证每项副作用最多发生一次，未知结果不得 CLI fallback；
 - [ ] `get_app_state` 返回非黑 PNG 和目标应用 AX 树；
 - [ ] 模型至少完成一次 AX mutation 和一次键鼠 mutation；
 - [ ] authd/loginwindow 日志、root pending/final/complete proofs、helper audit 能归因到同一 nonce/turn；
@@ -148,11 +195,15 @@ git diff --check
 - [ ] 物理键盘和鼠标事件被屏蔽，并立即触发重锁与 automatic-unlock suppression；
 - [ ] 外接扩展显示器下无遮挡泄露；普通后台录屏保留黑罩；在左侧/上方/下方显示器按 composite PNG 坐标点击或滚动命中正确目标；
 - [ ] helper 正常退出/更新时重锁；崩溃恢复行为被实测并记录。
+- [ ] 上述门禁全部通过后才停用并删除 m4pro 上的旧 `remote-agent`，并复核 AgentHalo ingress、
+  provider/session、Locked Use 和回滚状态。
 
 ## 仍需明确保留的生产边界
 
 1. **没有独立 root deadman。** helper 遭 `SIGKILL`、内核崩溃或 WindowServer 故障时，进程内遮罩和监控会一起消失；launchd 重启后的 startup scrub 会重锁，但中间仍可能有暴露窗口。面向不可信本地环境的正式版本应增加独立特权 guardian/heartbeat。
-2. **Codex resume 与 Claude 尚未接入模型工具闭环。** 当前只保证 AgentHalo 新建的 Codex thread；其他 provider 必须先实现不可伪造的父进程/turn 绑定。
+2. **Codex resume 仍不支持 dynamic-tool 闭环；Claude 尚未完成真机 E2E。** Claude Desktop-first
+   route、durable operation tombstone、问答和一次性授权操作已经实现，但空 `AXValue` 修复还需重签
+   部署和锁屏验证。任何 Desktop mutation 之后都禁止切到 CLI；不能把 `needs_manual` 当作可重试发送。
 3. **ScreenCaptureKit、loginwindow AX 与 authorizationdb 都是系统版本敏感边界。** 单元测试不能替代目标 macOS 版本上的真实锁屏验收。
 4. **Authorization Plug-in 分发仍是管理员操作。** 自动更新不能在没有明确管理员授权时静默改 authorizationdb。
 5. **code signature 不是实例身份。** helper UDS 的 Team/identifier pin 不能区分受管 agent 与同 UID 另起的、字节相同的已签名副本；后者可自配 provider/agent 形成 living-off-the-land 路径。hostile same-UID 场景需要 root-owned launchd broker/Mach service，把 capability 绑定到唯一受管 audit token/PID；仅 pin path、签名或 creator-ACL-bound Keychain secret 不足以区分满足同一 designated requirement 的副本。
@@ -160,4 +211,6 @@ git diff --check
 7. **post-terminal 解锁归因没有公开的因果回调。** 代码已对 `receipt.complete` 前的 field 变化/提前解锁永久失败关闭；但 complete 后的 Apple Watch/另一 authorization transaction 可以产生与本 transaction 相同的 `field disappeared + unlocked` 快照。Apple Authorization Plug-in 公开 API 不提供把 loginwindow 可见撤锁绑定到 nonce 的 transaction ID。在每个目标 macOS 版本的真机竞态验收通过，或实现独立 guardian/client completion 之前，无人值守环境必须确保 alternate unlock 不可用/不在场；当前不声称已对该竞态提供生产保证。
 8. **锁状态 generation 只对已观测边沿 sticky。** 已开窗口和普通 unlocked 操作都在入口/出口比对 generation，watcher 观测到重锁后即使又 unlocked 也会撤权并丢弃结果。但 macOS 没有向该用户会话 helper 提供文档化、无损的 lock-transition notification；完全落在两次 `CGSession` probe 之间的极短 locked→unlocked 边沿仍不可观测。真机验收必须覆盖这类竞态；不能把当前轮询表述为与 WindowServer 原子同步。
 
-在上述真实 E2E 门禁打勾前，状态应写为：**实现已落地；自动化结果按最终交付记录逐项陈述；真机 Locked Use 待设备所有者验收**，而不是“生产完成”。
+在上述真实 E2E 门禁打勾前，状态应写为：**实现已落地，AgentHalo.4 已正式部署；首次 Claude
+Locked Use E2E 安全失败，空 AXValue 修复待重签部署和复测；旧 remote-agent 继续保留**，而不是
+“生产完成”。

@@ -221,4 +221,84 @@ final class AccessibilityRoutingTests: XCTestCase {
             XCTAssertTrue(error is LockScreenAuthorizationError)
         }
     }
+
+    func testEmptyLockScreenValueRequiresASettableAttribute() {
+        XCTAssertNoThrow(try SystemLockScreenAuthorizationInteractor.requireEmptyValueWritable(
+            queryStatus: .success, isSettable: true))
+
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireEmptyValueWritable(
+                queryStatus: .success, isSettable: false)) { error in
+            XCTAssertEqual(
+                (error as? LockScreenAuthorizationError)?.detail,
+                "the macOS lock-screen authorization field does not accept an empty value")
+        }
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireEmptyValueWritable(
+                queryStatus: .attributeUnsupported, isSettable: true)) { error in
+            XCTAssertTrue(
+                (error as? LockScreenAuthorizationError)?.detail.contains("could not verify") == true)
+        }
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireEmptyValueWritable(
+                queryStatus: .cannotComplete, isSettable: true)) { error in
+            XCTAssertTrue(
+                (error as? LockScreenAuthorizationError)?.detail.contains("timed out") == true)
+        }
+    }
+
+    func testEmptyLockScreenValueWriteMustSucceedBeforeSubmit() {
+        XCTAssertNoThrow(
+            try SystemLockScreenAuthorizationInteractor.requireEmptyValueWritten(.success))
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireEmptyValueWritten(.failure)) { error in
+            XCTAssertTrue(
+                (error as? LockScreenAuthorizationError)?.detail.contains("could not write") == true)
+        }
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireEmptyValueWritten(.cannotComplete)) {
+                error in
+            XCTAssertTrue(
+                (error as? LockScreenAuthorizationError)?.detail.contains("timed out") == true)
+        }
+    }
+
+    func testConfirmFailureNeverRetriesTheEmptyValueAssignment() {
+        var preparationCount = 0
+        var confirmationCount = 0
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.performSingleSubmission(
+                prepareEmptyValue: {
+                    preparationCount += 1
+                },
+                confirm: {
+                    confirmationCount += 1
+                    throw LockScreenAuthorizationError("confirm failed")
+                })) { error in
+            XCTAssertEqual(
+                (error as? LockScreenAuthorizationError)?.detail, "confirm failed")
+        }
+        XCTAssertEqual(preparationCount, 1)
+        XCTAssertEqual(confirmationCount, 1)
+    }
+
+    func testEmptyValueFailureNeverAttemptsConfirm() {
+        var preparationCount = 0
+        var confirmationCount = 0
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.performSingleSubmission(
+                prepareEmptyValue: {
+                    preparationCount += 1
+                    throw LockScreenAuthorizationError("empty value failed")
+                },
+                confirm: {
+                    confirmationCount += 1
+                })) { error in
+            XCTAssertEqual(
+                (error as? LockScreenAuthorizationError)?.detail,
+                "empty value failed")
+        }
+        XCTAssertEqual(preparationCount, 1)
+        XCTAssertEqual(confirmationCount, 0)
+    }
 }
