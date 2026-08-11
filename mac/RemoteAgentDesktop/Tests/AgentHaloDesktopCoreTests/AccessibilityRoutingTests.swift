@@ -216,6 +216,9 @@ final class AccessibilityRoutingTests: XCTestCase {
             .success, operation: "test AX read"))
 
         XCTAssertLessThan(SystemLockScreenAuthorizationInteractor.messagingTimeout, 2)
+        XCTAssertEqual(
+            SystemLockScreenAuthorizationInteractor.discoveryTimeout, 8,
+            "wake-to-field discovery must be bounded without consuming grant TTL")
         XCTAssertThrowsError(try SystemLockScreenAuthorizationInteractor.requireResponsive(
             .cannotComplete, operation: "test loginwindow read")) { error in
             XCTAssertTrue(error is LockScreenAuthorizationError)
@@ -300,5 +303,50 @@ final class AccessibilityRoutingTests: XCTestCase {
         }
         XCTAssertEqual(preparationCount, 1)
         XCTAssertEqual(confirmationCount, 0)
+    }
+
+    func testSubmissionPreflightFailurePublishesNoGrant() {
+        let directory = NSTemporaryDirectory() + "agenthalo-ax-preflight-\(UUID().uuidString)"
+        let grantPath = (directory as NSString).appendingPathComponent("grant.json")
+        addTeardownBlock { try? FileManager.default.removeItem(atPath: directory) }
+        var grantPreparationCount = 0
+        var submissionCount = 0
+
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.performGrantGatedSubmission(
+                preflight: { () -> String in
+                    throw LockScreenAuthorizationError(
+                        "the exact field exposes no confirmation action")
+                },
+                prepareGrant: {
+                    grantPreparationCount += 1
+                    try FileManager.default.createDirectory(
+                        atPath: directory, withIntermediateDirectories: true)
+                    try Data("ambient authority".utf8).write(
+                        to: URL(fileURLWithPath: grantPath))
+                },
+                submit: { _ in submissionCount += 1 })) { error in
+            XCTAssertEqual(
+                (error as? LockScreenAuthorizationError)?.detail,
+                "the exact field exposes no confirmation action")
+        }
+        XCTAssertEqual(grantPreparationCount, 0)
+        XCTAssertEqual(submissionCount, 0)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: grantPath),
+            "failed value/action preflight published ambient grant authority")
+    }
+
+    func testPreparedSubmissionCallsGrantExactlyOnceBeforeMutation() throws {
+        var events: [String] = []
+        try SystemLockScreenAuthorizationInteractor.performGrantGatedSubmission(
+            preflight: {
+                events.append("preflight")
+                return kAXConfirmAction as String
+            },
+            prepareGrant: { events.append("grant") },
+            submit: { action in events.append("submit:\(action)") })
+        XCTAssertEqual(
+            events, ["preflight", "grant", "submit:\(kAXConfirmAction as String)"])
     }
 }

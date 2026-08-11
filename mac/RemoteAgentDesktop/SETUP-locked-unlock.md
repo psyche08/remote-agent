@@ -14,6 +14,14 @@ Apple Authorization Plug-in 对短时、单次、签名 grant 作出 Allow；普
 `MechanismDestroy` 写入。complete 前 loginwindow password field 必须保持同一 AX
 element 且系统保持 locked；complete 后才能接受 field lifecycle completion + unlocked。
 
+锁屏 wake 和 loginwindow UI ready 是两个时刻。helper 先 wake，再在最长 8 秒的不授权、
+pre-submission 阶段查找并 focus exact `UserPasswordTextField`，并等待空 `AXValue` 可写性和
+exact AXConfirm/AXPress action 同时 ready；这期间磁盘上没有 grant。全部 ready 后先记录
+`authorization_field_ready`，
+controller callback 重新核对 opening owner、真人输入、locked state 和 primary console user，
+再按当前时间 mint/write 10 秒 grant，随后只执行一次空 `AXValue` + confirm。callback 前取消、
+真人输入或 discovery 失败不会发布 grant；callback 后 AX 失败不会重新 mint、rewrite 或 submit。
+
 ## 0. 前提与恢复路径
 
 先准备：
@@ -43,9 +51,10 @@ security find-identity -v -p codesigning
 如果显示 `0 valid identities found`，先在 Keychain Access 中恢复/解锁对应证书及私钥；
 不要继续安装一个无法以稳定身份运行的 helper。
 
-### 本轮本机实测状态（2026-08-09）
+### 历史开发机记录（2026-08-09，非 m4pro）
 
-这不是所有目标机的通用前提，只记录本轮验证所用 Mac 的现场状态：
+以下仅是早期本地开发机的历史记录，不是当前 m4pro 的部署真值；m4pro 当前正式签名、Plug-in、
+authorizationdb 和 AgentHalo 版本以 [STATUS-and-TODO.md](STATUS-and-TODO.md) 为准：
 
 - `security find-identity -v -p codesigning` 返回 `0 valid identities found`；
 - 新旧 LaunchAgent label 均未加载；新旧 Authorization Plug-in bundle、Locked Use state
@@ -251,27 +260,40 @@ sudo ./uninstall.sh
 
 ## 7. 无人值守模型闭环
 
-1. 在远端准备一个**新建的 Codex task**；不要使用旧 task 的 resume。当前 dynamic
-   tools 只在新 thread 的 `thread/start` 注入。
-2. 让目标应用保持已启动，例如 TextEdit，并准备一个可辨识但不敏感的测试文档。
+Claude 是主验收路径：
+
+1. 在远端创建一个 **Claude fresh logical session**，确认 session-sticky route 为
+   `desktop_computer_use`，并绑定新的 Claude Desktop native session；不要 resume 旧 session。
+2. 让 Claude Desktop 和目标应用保持已启动，例如 TextEdit，并准备一个可辨识但不敏感的测试文档。
 3. 锁定目标 Mac，现场不要触碰键鼠。
-4. 从远端给 Codex 一个明确任务，例如：读取 TextEdit 当前界面，把指定文本写入目标
-   输入框，再报告最终界面。
-5. 模型第一步必须调用 `computer_use.get_app_state`，随后才可 mutation。
+4. 发送一个新 `operation_id` 的明确 prompt：先截图/读取目标界面，完成一次文本输入和一次键鼠
+   操作，再报告最终界面；同一 native session 还要触发并回答 `AskUserQuestion`。
+5. 同一轮分别验证一次工具 `Allow once` 和一次 `Deny`；不得选择 `Always`、session/task 级授权。
+   Desktop UI 一旦发生 mutation，任何失败都不得切到 `stream_json_cli` 补发。
 
 验收证据必须同时包含：
 
-- dynamic tool 返回的 PNG 不是黑图，并且带目标应用 Accessibility 树；
+- Claude route 始终为 `desktop_computer_use`，native session/turn/operation tombstone 保持相同，
+  没有 CLI fallback 或重复 prompt；
+- Computer Use 返回的 PNG 不是黑图，并且带目标应用 Accessibility 树；
 - `click`/`scroll` 使用该 composite PNG 的左上角原点坐标，不能把未经转换的 CG global
   坐标或旧截图坐标混入当前观察；
 - 模型至少成功执行一次 `press`/`set_value` 和一次键鼠动作；
+- Claude transcript 精确显示 question→answer，并分别完成 exact `Allow once` 与 `Deny`；
 - helper audit 出现同一 turn 的 `grant_published`、`grant_consumed`、`window_opened`、
   `window_closed`；
+- `grant_published` 必须晚于 wake 后 exact field ready；较慢的 loginwindow UI discovery 不得占用
+  grant TTL；同一 turn 的 `authorization_field_ready` 必须早于 `grant_published`；
+  `authorization_request_returned` 失败项必须带不含 nonce/secret 的诊断 `reason`；
 - root-owned `pending`、`final`、`complete` 均匹配同一 nonce，且日志/时序显示
   complete 之前 exact field 保持同一且系统保持 locked；
 - 目标机实测顺序为 `complete -> field lifecycle completion -> unlocked`；
 - authd/loginwindow 日志显示 AgentHalo mechanism 被求值；
 - turn completed 后，独立系统读数确认屏幕已锁。
+
+Codex 只做独立兼容验收：另开**新 Codex task**（不要 resume 旧 task），确认 `thread/start`
+注入 `computer_use` dynamic tools，并单独验证 `get_app_state → one mutation → get_app_state`；它不能
+替代上述 Claude Desktop-first 的问答和授权门禁。
 
 查看授权日志：
 

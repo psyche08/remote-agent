@@ -31,6 +31,11 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
     private var receiptVisible = true
     private var publishFinalReceipt = true
     private var authorizationRequests = 0
+    private var grantPreparationCallbacks = 0
+    private var grantPreparationCallsPerRequest = 1
+    private var authorizationFailureBeforePreparation: Error?
+    private var authorizationFailureAfterPreparation: Error?
+    private var mostRecentGrantPayload: GrantPayload?
     private var delayedUnlockGate: Latch?
     private var transactionDestroyGate: Latch?
     private var authorizationTransactionTimeout: TimeInterval = 5
@@ -117,16 +122,37 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
     /// `isLocked()` remains a pure observation so polling cannot manufacture a
     /// successful unlock.
     func requestUnlockAuthorization(
-        completionReceiptObserved: @escaping @Sendable () throws -> Bool
+        authorizationFieldReady: @Sendable () -> Void,
+        prepareGrant: @Sendable () throws -> Void,
+        completionReceiptObserved: @Sendable () throws -> Bool
     ) throws {
         mutex.lock()
         authorizationRequests += 1
         authorizationFieldValid = true
         let gate = authorizationGate
         let directory = grantDirectory
+        let failureBeforePreparation = authorizationFailureBeforePreparation
+        let preparationCalls = grantPreparationCallsPerRequest
         mutex.unlock()
         authorizationStarted.close()
         gate?.wait()
+        if let failureBeforePreparation { throw failureBeforePreparation }
+        authorizationFieldReady()
+
+        // This gate represents the production wake + exact field discovery
+        // phase. It must finish before the callback publishes short-lived
+        // authority. Tests can deliberately violate the one-call contract to
+        // prove the controller rejects a second callback before reminting.
+        for _ in 0..<preparationCalls {
+            mutex.lock()
+            grantPreparationCallbacks += 1
+            mutex.unlock()
+            try prepareGrant()
+        }
+        mutex.lock()
+        let failureAfterPreparation = authorizationFailureAfterPreparation
+        mutex.unlock()
+        if let failureAfterPreparation { throw failureAfterPreparation }
 
         let grantPath = (directory as NSString)
             .appendingPathComponent(GrantContract.fileName)
@@ -153,6 +179,9 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
             throw GrantError("fake received a malformed grant")
         }
         let payload = try JSONDecoder().decode(GrantPayload.self, from: payloadData)
+        mutex.lock()
+        mostRecentGrantPayload = payload
+        mutex.unlock()
 
         // AX submission and the authorization engine advance independently.
         // Start the fake engine only after the interactor has sampled the exact
@@ -243,7 +272,7 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
     }
 
     private func waitForAuthorizationTransaction(
-        completionReceiptObserved: @escaping @Sendable () throws -> Bool,
+        completionReceiptObserved: @Sendable () throws -> Bool,
         monitorStarted: Latch,
         terminalSamplingFinished: Latch
     ) throws {
@@ -336,9 +365,34 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
         defer { mutex.unlock() }
         return authorizationRequests
     }
+    var grantPreparationCallbackCount: Int {
+        mutex.lock()
+        defer { mutex.unlock() }
+        return grantPreparationCallbacks
+    }
+    var lastGrantPayload: GrantPayload? {
+        mutex.lock()
+        defer { mutex.unlock() }
+        return mostRecentGrantPayload
+    }
     func setAuthorizationGate(_ gate: Latch?) {
         mutex.lock()
         authorizationGate = gate
+        mutex.unlock()
+    }
+    func setAuthorizationFailureAfterPreparation(_ error: Error?) {
+        mutex.lock()
+        authorizationFailureAfterPreparation = error
+        mutex.unlock()
+    }
+    func setAuthorizationFailureBeforePreparation(_ error: Error?) {
+        mutex.lock()
+        authorizationFailureBeforePreparation = error
+        mutex.unlock()
+    }
+    func setGrantPreparationCallsPerRequest(_ count: Int) {
+        mutex.lock()
+        grantPreparationCallsPerRequest = max(0, count)
         mutex.unlock()
     }
     func setVerificationGate(_ gate: Latch?) {
@@ -458,7 +512,9 @@ final class UnavailableSystem: LockedUseSystem, @unchecked Sendable {
     func physicalInputObserved() -> Bool { false }
     func confirmShieldCoverage(timeout: TimeInterval) -> Bool { false }
     func requestUnlockAuthorization(
-        completionReceiptObserved: @escaping @Sendable () throws -> Bool
+        authorizationFieldReady: @Sendable () -> Void,
+        prepareGrant: @Sendable () throws -> Void,
+        completionReceiptObserved: @Sendable () throws -> Bool
     ) throws { throw LockedUseError.unsupported }
     func run(_ action: Action) throws -> DesktopService.ActionResult {
         throw LockedUseError.unsupported
@@ -575,7 +631,10 @@ final class LockedUseControllerTests: XCTestCase {
 
         XCTAssertThrowsError(try controller.openWindow(turnID: "turn-other-session"))
         eventually("non-console refusal cleanup") { !controller.isWindowClosing() }
-        XCTAssertEqual(system.authorizationRequestCount, 0)
+        XCTAssertEqual(
+            system.authorizationRequestCount, 1,
+            "field readiness must precede the final console-identity revalidation")
+        XCTAssertEqual(system.grantPreparationCallbackCount, 1)
         XCTAssertTrue(system.isScreenLocked)
         XCTAssertFalse(
             controller.auditEntries().contains { $0.event == "grant_published" },
@@ -1196,6 +1255,9 @@ final class LockedUseControllerTests: XCTestCase {
             openDone.close()
         }
         XCTAssertTrue(system.authorizationStarted.wait(timeout: 2))
+        XCTAssertFalse(
+            controller.auditEntries().contains { $0.event == "grant_published" },
+            "field discovery published the grant before it was ready")
         DispatchQueue.global().async {
             controller.closeWindow(reason: "cancel opening")
             closeDone.close()
@@ -1213,6 +1275,10 @@ final class LockedUseControllerTests: XCTestCase {
         XCTAssertFalse(
             controller.auditEntries().contains { $0.event == "window_opened" },
             "a cancelled opener was published as open")
+        XCTAssertFalse(
+            controller.auditEntries().contains { $0.event == "grant_published" },
+            "cancellation before field readiness still published a grant")
+        XCTAssertEqual(system.grantPreparationCallbackCount, 1)
     }
 
     func testWindowStateExposesAndCloseCancelsAnOpeningOwner() throws {
@@ -1486,6 +1552,8 @@ final class LockedUseControllerTests: XCTestCase {
             openDone.close()
         }
         XCTAssertTrue(system.authorizationStarted.wait(timeout: 2))
+        XCTAssertFalse(
+            controller.auditEntries().contains { $0.event == "grant_published" })
         system.set(idle: 0)
         eventually("opening input suppression") {
             let status = controller.status()["locked_use"] as? [String: Any]
@@ -1495,6 +1563,10 @@ final class LockedUseControllerTests: XCTestCase {
         gate.close()
         XCTAssertTrue(openDone.wait(timeout: 5))
         eventually("opening-input cleanup") { !controller.isWindowClosing() }
+        XCTAssertFalse(
+            controller.auditEntries().contains { $0.event == "grant_published" },
+            "human presence before field readiness still published a grant")
+        XCTAssertEqual(system.grantPreparationCallbackCount, 1)
         XCTAssertTrue(system.isScreenLocked)
         XCTAssertThrowsError(try controller.openWindow(turnID: "turn-2")) { error in
             XCTAssertEqual(error as? LockedUseError, .localInput)
@@ -1852,6 +1924,162 @@ extension LockedUseControllerTests {
 /// Publishing a grant alone starts no authorization transaction. The controller
 /// must drive loginwindow's own authorization control after publishing it.
 extension LockedUseControllerTests {
+    func testSlowFieldReadinessConsumesNoGrantLifetime() {
+        let system = FakeSystem()
+        let fieldReady = Latch()
+        system.setAuthorizationGate(fieldReady)
+        let controller = makeController(system: system) { config in
+            config.lockedUse.grantTTLSeconds = 2
+        }
+        let openDone = Latch()
+        let failures = NSMutableArray()
+        let failureLock = NSLock()
+
+        DispatchQueue.global().async {
+            do { try controller.openWindow(turnID: "turn-slow-field") }
+            catch {
+                failureLock.lock()
+                failures.add(String(describing: error))
+                failureLock.unlock()
+            }
+            openDone.close()
+        }
+        XCTAssertTrue(system.authorizationStarted.wait(timeout: 2))
+
+        // Longer than the configured grant TTL: a grant minted before this
+        // simulated wake/discovery delay would be expired when the field became
+        // ready. No grant or callback may exist yet.
+        Thread.sleep(forTimeInterval: 2.2)
+        XCTAssertEqual(system.grantPreparationCallbackCount, 0)
+        XCTAssertFalse(
+            controller.auditEntries().contains { $0.event == "grant_published" })
+        let grantPath = (system.grantDirectory as NSString)
+            .appendingPathComponent(GrantContract.fileName)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: grantPath))
+
+        let fieldReadyReleasedAt = Int64(Date().timeIntervalSince1970)
+        fieldReady.close()
+        XCTAssertTrue(openDone.wait(timeout: 5))
+        XCTAssertEqual(failures.count, 0, "slow discovery consumed grant TTL: \(failures)")
+        XCTAssertEqual(system.grantPreparationCallbackCount, 1)
+        XCTAssertEqual(
+            controller.auditEntries().filter { $0.event == "grant_published" }.count, 1)
+        let payload = try? XCTUnwrap(system.lastGrantPayload)
+        XCTAssertGreaterThanOrEqual(payload?.issuedAt ?? 0, fieldReadyReleasedAt)
+        XCTAssertEqual(
+            (payload?.expiresAt ?? 0) - (payload?.issuedAt ?? 0), 2,
+            "the fresh payload did not retain its full configured TTL")
+        XCTAssertGreaterThanOrEqual(
+            payload?.expiresAt ?? 0, Int64(Date().timeIntervalSince1970),
+            "the grant was already expired when the prepared transaction completed")
+        XCTAssertEqual(controller.openWindowTurn(), "turn-slow-field")
+    }
+
+    func testDiscoveryOrReadinessFailurePublishesNoGrant() {
+        let system = FakeSystem()
+        system.setAuthorizationFailureBeforePreparation(
+            LockScreenAuthorizationError(
+                "lock-screen value/action readiness did not complete"))
+        let controller = makeController(system: system)
+
+        XCTAssertThrowsError(
+            try controller.openWindow(turnID: "turn-readiness-failed"))
+        eventually("readiness failure cleanup") { !controller.isWindowClosing() }
+
+        XCTAssertEqual(system.authorizationRequestCount, 1)
+        XCTAssertEqual(system.grantPreparationCallbackCount, 0)
+        XCTAssertFalse(
+            controller.auditEntries().contains { $0.event == "authorization_field_ready" })
+        XCTAssertFalse(
+            controller.auditEntries().contains { $0.event == "grant_published" })
+        let returned = controller.auditEntries().last {
+            $0.event == "authorization_request_returned"
+        }
+        XCTAssertTrue(returned?.reason?.contains("value/action readiness") == true)
+        let grantPath = (system.grantDirectory as NSString)
+            .appendingPathComponent(GrantContract.fileName)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: grantPath))
+    }
+
+    func testAdversarialSecondPreparationCallbackIsRejectedBeforeRemint() {
+        let system = FakeSystem()
+        system.setGrantPreparationCallsPerRequest(2)
+        let controller = makeController(system: system) { config in
+            config.lockedUse.grantTTLSeconds = 2
+        }
+
+        XCTAssertThrowsError(
+            try controller.openWindow(turnID: "turn-double-preparation"))
+        eventually("double callback cleanup") { !controller.isWindowClosing() }
+
+        XCTAssertEqual(system.grantPreparationCallbackCount, 2)
+        XCTAssertEqual(
+            controller.auditEntries().filter { $0.event == "authorization_field_ready" }.count,
+            1)
+        XCTAssertEqual(
+            controller.auditEntries().filter { $0.event == "grant_published" }.count, 1,
+            "the second callback reminted or rewrote a grant")
+        let returned = controller.auditEntries().last {
+            $0.event == "authorization_request_returned"
+        }
+        XCTAssertTrue(returned?.reason?.contains("more than once") == true)
+        let grantPath = (system.grantDirectory as NSString)
+            .appendingPathComponent(GrantContract.fileName)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: grantPath),
+            "the first grant survived rejection of a second callback")
+    }
+
+    func testFailureAfterGrantPreparationNeverRemintsOrRewrites() {
+        let system = FakeSystem()
+        let secretLikeToken = String(repeating: "A", count: 64)
+        system.setAuthorizationFailureAfterPreparation(
+            LockScreenAuthorizationError(
+                "empty-value assignment failed\nsecret \(secretLikeToken)"))
+        let controller = makeController(system: system) { config in
+            config.lockedUse.grantTTLSeconds = 2
+        }
+
+        XCTAssertThrowsError(
+            try controller.openWindow(turnID: "turn-single-preparation"))
+        eventually("post-preparation failure cleanup") { !controller.isWindowClosing() }
+
+        XCTAssertEqual(system.authorizationRequestCount, 1)
+        XCTAssertEqual(system.grantPreparationCallbackCount, 1)
+        XCTAssertEqual(
+            controller.auditEntries().filter { $0.event == "grant_published" }.count, 1,
+            "an ambiguous AX failure reminted or rewrote grant authority")
+        let returned = controller.auditEntries().last {
+            $0.event == "authorization_request_returned"
+        }
+        let reason = returned?.reason ?? ""
+        XCTAssertTrue(reason.contains("empty-value assignment failed"))
+        XCTAssertFalse(reason.contains(secretLikeToken))
+        XCTAssertFalse(reason.contains("\n"))
+        XCTAssertTrue(reason.contains("[redacted]"))
+        let grantPath = (system.grantDirectory as NSString)
+            .appendingPathComponent(GrantContract.fileName)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: grantPath),
+            "the single published grant survived ambiguous AX failure cleanup")
+    }
+
+    func testAuthorizationFailureReasonRedactsExactNonceControlsAndLength() {
+        let nonce = String(repeating: "ab", count: 16)
+        let reason = LockedUseController.sanitizedAuthorizationFailureReason(
+            LockScreenAuthorizationError(
+                "confirm failed\nnonce=\(nonce)\u{0000}"
+                    + String(repeating: " noisy", count: 200)),
+            nonce: nonce)
+
+        XCTAssertFalse(reason.contains(nonce))
+        XCTAssertFalse(reason.unicodeScalars.contains {
+            CharacterSet.controlCharacters.contains($0)
+        })
+        XCTAssertEqual(reason.count, 512)
+        XCTAssertTrue(reason.contains("[redacted]"))
+    }
+
     func testOpeningFromALockedScreenRequestsAuthorization() throws {
         let system = FakeSystem()
         let controller = makeController(system: system)

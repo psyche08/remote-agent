@@ -146,14 +146,20 @@ else
 fi
 INTERACTOR="$HELPER_DIR/Sources/AgentHaloDesktopCore/LockScreenAuthorizationInteractor.swift"
 if grep -q 'UserPasswordTextField' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'discoveryTimeout: TimeInterval = 8' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'try prepareGrant()' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'submissionDeadline' "$INTERACTOR" 2>/dev/null && \
    grep -q 'kAXConfirmAction' "$INTERACTOR" 2>/dev/null && \
-   grep -q 'prepareEmptySubmission' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'preflightEmptySubmission' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'confirmationAction' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'performGrantGatedSubmission' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'writeEmptySubmission' "$INTERACTOR" 2>/dev/null && \
    grep -q 'performSingleSubmission' "$INTERACTOR" 2>/dev/null && \
    grep -q 'AXUIElementIsAttributeSettable' "$INTERACTOR" 2>/dev/null && \
    grep -q 'kAXValueAttribute as CFString, "" as CFString' "$INTERACTOR" 2>/dev/null; then
-  pass "unlock request prepares the exact loginwindow control with an empty public AX value"
+  pass "unlock request discovers the exact field before publishing, then submits one empty public AX value"
 else
-  fail "the bounded credential-free loginwindow AX authorization interactor is missing"
+  fail "the bounded two-phase credential-free loginwindow AX authorization interactor is missing"
 fi
 
 step "authorization plug-in builds"

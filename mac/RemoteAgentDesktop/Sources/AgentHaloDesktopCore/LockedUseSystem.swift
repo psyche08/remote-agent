@@ -77,9 +77,13 @@ public protocol LockedUseSystem: AnyObject, Sendable {
     /// implementation wakes the lock screen, locates its password field through
     /// Accessibility, and confirms that field without supplying a credential.
     /// The Authorization Plug-in is the branch that decides whether this exact
-    /// transaction may retract the lock.
+    /// transaction may retract the lock. `prepareGrant` runs exactly once only
+    /// after the exact field is ready, immediately before empty-value
+    /// submission, so lock-screen wake/discovery consumes no grant lifetime.
     func requestUnlockAuthorization(
-        completionReceiptObserved: @escaping @Sendable () throws -> Bool
+        authorizationFieldReady: @Sendable () -> Void,
+        prepareGrant: @Sendable () throws -> Void,
+        completionReceiptObserved: @Sendable () throws -> Bool
     ) throws
     /// Executes a validated action. The result is action-specific (e.g. PNG
     /// bytes held in memory); it never exposes a helper filesystem path.
@@ -130,13 +134,17 @@ public final class DesktopSystem: LockedUseSystem {
     }
 
     public func requestUnlockAuthorization(
-        completionReceiptObserved: @escaping @Sendable () throws -> Bool
+        authorizationFieldReady: @Sendable () -> Void,
+        prepareGrant: @Sendable () throws -> Void,
+        completionReceiptObserved: @Sendable () throws -> Bool
     ) throws {
         // A grant on disk does not itself make loginwindow evaluate the unlock
         // right. Wake the lock screen first, then drive its own authorization
         // control. No password is read, stored, or injected on this path.
         desktop.provokeUnlockAttempt()
         try lockScreenAuthorization.requestAuthorization(
+            authorizationFieldReady: authorizationFieldReady,
+            prepareGrant: prepareGrant,
             completionReceiptObserved: completionReceiptObserved,
             isLocked: { [self] in try isLocked() })
     }

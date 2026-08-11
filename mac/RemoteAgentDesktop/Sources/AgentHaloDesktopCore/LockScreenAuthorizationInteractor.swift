@@ -7,8 +7,10 @@ import Foundation
 /// alternate unlock surface.
 public protocol LockScreenAuthorizationRequesting: Sendable {
     func requestAuthorization(
-        completionReceiptObserved: @escaping @Sendable () throws -> Bool,
-        isLocked: @escaping @Sendable () throws -> Bool
+        authorizationFieldReady: @Sendable () -> Void,
+        prepareGrant: @Sendable () throws -> Void,
+        completionReceiptObserved: @Sendable () throws -> Bool,
+        isLocked: @Sendable () throws -> Bool
     ) throws
 }
 
@@ -38,10 +40,15 @@ public final class SystemLockScreenAuthorizationInteractor:
 {
     static let passwordFieldIdentifier = "UserPasswordTextField"
     private static let pollInterval: TimeInterval = 0.05
-    /// Strictly below the minimum two-second grant lifetime. A hung
-    /// loginwindow cannot strand `.opening` (and its shield) beyond the grant
-    /// boundary; the controller receives a failure and runs normal cleanup.
-    private static let discoveryTimeout: TimeInterval = 1.5
+    /// Wake-to-ready is not instantaneous on real hardware. Discovery/focus is
+    /// a non-authorizing, pre-submission phase and deliberately runs before the
+    /// controller publishes a grant, so this wait consumes none of its TTL.
+    static let discoveryTimeout: TimeInterval = 8
+    /// Once the exact field is focused and the grant has been published, the
+    /// empty assignment plus confirm remains a short, single-attempt boundary.
+    /// A fresh deadline prevents slow discovery from stealing this phase's
+    /// bounded AX IPC budget.
+    private static let submissionTimeout: TimeInterval = 1.5
     /// This is a system-version-sensitive lifecycle acknowledgement, not a
     /// sleep used as proof. The request succeeds only after an exact terminal
     /// receipt is bracketed by the same live field + locked state, followed by
@@ -103,6 +110,21 @@ public final class SystemLockScreenAuthorizationInteractor:
         try confirm()
     }
 
+    /// Orders every non-authorizing readiness check before grant publication.
+    /// `submit` is the first phase allowed to write the empty value or perform
+    /// the preselected action. Keeping this orchestration as a pure seam makes
+    /// it impossible for a failed value/action preflight to publish ambient
+    /// authority, and keeps that invariant testable without live loginwindow.
+    static func performGrantGatedSubmission<Action>(
+        preflight: () throws -> Action,
+        prepareGrant: () throws -> Void,
+        submit: (Action) throws -> Void
+    ) throws {
+        let preparedAction = try preflight()
+        try prepareGrant()
+        try submit(preparedAction)
+    }
+
     private static func before(_ deadline: Date, operation: String) throws {
         guard Date() <= deadline else {
             throw LockScreenAuthorizationError(
@@ -122,8 +144,10 @@ public final class SystemLockScreenAuthorizationInteractor:
     }
 
     public func requestAuthorization(
-        completionReceiptObserved: @escaping @Sendable () throws -> Bool,
-        isLocked: @escaping @Sendable () throws -> Bool
+        authorizationFieldReady: @Sendable () -> Void,
+        prepareGrant: @Sendable () throws -> Void,
+        completionReceiptObserved: @Sendable () throws -> Bool,
+        isLocked: @Sendable () throws -> Bool
     ) throws {
         guard AXIsProcessTrusted() else {
             throw LockScreenAuthorizationError(
@@ -133,11 +157,18 @@ public final class SystemLockScreenAuthorizationInteractor:
         let deadline = Date().addingTimeInterval(Self.discoveryTimeout)
         var lastFailure = "the macOS lock-screen password field was not found"
         var focusedField: AXUIElement?
+        var selectedAction: String?
         while Date() <= deadline {
             do {
                 let field = try passwordField(deadline: deadline)
                 try focus(field, deadline: deadline)
+                // loginwindow can expose the field before its value/action
+                // surface is ready. Treat all of that as one pregrant polling
+                // phase so staged UI readiness cannot cause an early failure.
+                try preflightEmptySubmission(field, deadline: deadline)
+                let action = try confirmationAction(field, deadline: deadline)
                 focusedField = field
+                selectedAction = action
                 break
             } catch let error as LockScreenAuthorizationError {
                 lastFailure = error.detail
@@ -146,20 +177,38 @@ public final class SystemLockScreenAuthorizationInteractor:
             }
             Thread.sleep(forTimeInterval: Self.pollInterval)
         }
-        guard let focusedField else {
+        guard let focusedField, let selectedAction else {
             throw LockScreenAuthorizationError(lastFailure)
         }
 
-        // The retryable discovery phase ends before the first possible
-        // trigger. From the empty-value attempt onward, every failure is
-        // ambiguous and must escape unchanged; never loop, rewrite, or submit
-        // again within this request.
-        try Self.performSingleSubmission(
-            prepareEmptyValue: {
-                try self.prepareEmptySubmission(focusedField, deadline: deadline)
+        // The entire find/focus/value/action readiness phase above completed
+        // before this gate. From prepareGrant onward no action discovery or
+        // readiness query is allowed, and no failure is retried.
+        try Self.performGrantGatedSubmission(
+            preflight: { selectedAction },
+            prepareGrant: {
+                // Called exactly once only after every read-only readiness
+                // check passed. The controller revalidates the turn and mints
+                // from now inside this callback.
+                authorizationFieldReady()
+                try prepareGrant()
             },
-            confirm: {
-                try self.confirm(focusedField, deadline: deadline)
+            submit: { selectedAction in
+                // Freshly bound after grant preparation, so slow wake,
+                // discovery, focus, and readiness checks consume none of this
+                // single submission's bounded AX budget.
+                let submissionDeadline = Date().addingTimeInterval(
+                    Self.submissionTimeout)
+                try Self.performSingleSubmission(
+                    prepareEmptyValue: {
+                        try self.writeEmptySubmission(
+                            focusedField, deadline: submissionDeadline)
+                    },
+                    confirm: {
+                        try self.performConfirmation(
+                            focusedField, action: selectedAction,
+                            deadline: submissionDeadline)
+                    })
             })
 
         // Never re-submit after this boundary. A lifecycle failure is
@@ -219,8 +268,8 @@ public final class SystemLockScreenAuthorizationInteractor:
 
     private func waitForTransactionCompletion(
         field: AXUIElement,
-        completionReceiptObserved: @escaping @Sendable () throws -> Bool,
-        isLocked: @escaping @Sendable () throws -> Bool
+        completionReceiptObserved: @Sendable () throws -> Bool,
+        isLocked: @Sendable () throws -> Bool
     ) throws {
         let deadline = Date().addingTimeInterval(Self.completionTimeout)
         var terminalObserved = false
@@ -275,7 +324,11 @@ public final class SystemLockScreenAuthorizationInteractor:
         let query = AXUIElementIsAttributeSettable(
             field, kAXFocusedAttribute as CFString, &settable)
         try Self.requireResponsive(query, operation: "focusing the lock-screen authorization field")
-        if query == .success, settable.boolValue {
+        guard query == .success else {
+            throw LockScreenAuthorizationError(
+                "could not inspect focus for the macOS lock-screen authorization field (AX error \(query.rawValue))")
+        }
+        if settable.boolValue {
             try Self.before(deadline, operation: "focusing the lock-screen authorization field")
             let result = AXUIElementSetAttributeValue(
                 field, kAXFocusedAttribute as CFString, kCFBooleanTrue)
@@ -286,9 +339,21 @@ public final class SystemLockScreenAuthorizationInteractor:
                     "could not focus the macOS lock-screen authorization field (AX error \(result.rawValue))")
             }
         }
+        try Self.before(deadline, operation: "confirming lock-screen authorization focus")
+        var focusedValue: CFTypeRef?
+        let readback = AXUIElementCopyAttributeValue(
+            field, kAXFocusedAttribute as CFString, &focusedValue)
+        try Self.requireResponsive(
+            readback, operation: "confirming lock-screen authorization focus")
+        guard readback == .success, focusedValue as? Bool == true else {
+            throw LockScreenAuthorizationError(
+                "the macOS lock-screen authorization field did not become focused (AX error \(readback.rawValue))")
+        }
     }
 
-    private func confirm(_ field: AXUIElement, deadline: Date) throws {
+    private func confirmationAction(
+        _ field: AXUIElement, deadline: Date
+    ) throws -> String {
         try Self.configureTimeout(field, deadline: deadline)
         try Self.before(deadline, operation: "reading lock-screen authorization actions")
         var values: CFArray?
@@ -313,8 +378,18 @@ public final class SystemLockScreenAuthorizationInteractor:
             throw LockScreenAuthorizationError(
                 "the macOS lock-screen authorization field cannot be confirmed")
         }
+        return selected
+    }
+
+    private func performConfirmation(
+        _ field: AXUIElement, action: String, deadline: Date
+    ) throws {
+        guard action == kAXConfirmAction as String || action == kAXPressAction as String else {
+            throw LockScreenAuthorizationError(
+                "the prepared lock-screen authorization action is invalid")
+        }
         try Self.before(deadline, operation: "submitting lock-screen authorization")
-        let result = AXUIElementPerformAction(field, selected as CFString)
+        let result = AXUIElementPerformAction(field, action as CFString)
         try Self.requireResponsive(result, operation: "submitting lock-screen authorization")
         guard result == .success else {
             throw LockScreenAuthorizationError(
@@ -322,7 +397,7 @@ public final class SystemLockScreenAuthorizationInteractor:
         }
     }
 
-    private func prepareEmptySubmission(
+    private func preflightEmptySubmission(
         _ field: AXUIElement, deadline: Date
     ) throws {
         try Self.configureTimeout(field, deadline: deadline)
@@ -334,7 +409,11 @@ public final class SystemLockScreenAuthorizationInteractor:
             field, kAXValueAttribute as CFString, &settable)
         try Self.requireEmptyValueWritable(
             queryStatus: query, isSettable: settable.boolValue)
+    }
 
+    private func writeEmptySubmission(
+        _ field: AXUIElement, deadline: Date
+    ) throws {
         // This is a deliberately credential-free empty public AX assignment,
         // not a sentinel. Never copy/read the secure field's current value.
         // Although the resulting field value is empty, the assignment itself

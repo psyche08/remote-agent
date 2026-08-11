@@ -189,6 +189,45 @@ public final class LockedUseController: @unchecked Sendable {
         }
     }
 
+    /// Thread-safe handoff between the controller's grant-preparation callback
+    /// and the receipt callback owned by the system interactor. Both callbacks
+    /// are independently `@Sendable`, so the payload must not live in an
+    /// unsynchronized local capture. The one-way preparation flag also makes a
+    /// buggy second callback fail before it can mint or rewrite a grant.
+    private final class AuthorizationAttempt: @unchecked Sendable {
+        private let mutex = NSLock()
+        private var preparationBegan = false
+        private var preparedPayload: GrantPayload?
+
+        func beginPreparation() throws {
+            mutex.lock()
+            defer { mutex.unlock() }
+            guard !preparationBegan else {
+                throw LockedUseError.systemFailure(
+                    "lock-screen grant preparation was requested more than once")
+            }
+            preparationBegan = true
+        }
+
+        func publish(_ payload: GrantPayload) {
+            mutex.lock()
+            preparedPayload = payload
+            mutex.unlock()
+        }
+
+        var began: Bool {
+            mutex.lock()
+            defer { mutex.unlock() }
+            return preparationBegan
+        }
+
+        var payload: GrantPayload? {
+            mutex.lock()
+            defer { mutex.unlock() }
+            return preparedPayload
+        }
+    }
+
     /// One Locked Use state transition. It deliberately carries no grant body,
     /// no nonce beyond a short prefix, and no key material: the agent's log is
     /// uploaded off-device, so anything recorded here leaves the machine.
@@ -566,47 +605,64 @@ public final class LockedUseController: @unchecked Sendable {
 
             if lockedAtOpen {
                 guard let minter else { throw GrantError.noSigningKey }
-                let consoleUser: ConsoleUserIdentity
-                do {
-                    consoleUser = try consoleUserProvider()
-                } catch {
-                    throw LockedUseError.systemFailure(
-                        "could not bind authorization to the active console user: \(error)")
-                }
-                guard consoleUser.uid == getuid(), consoleUser.uid > 0 else {
-                    throw LockedUseError.systemFailure(
-                        "this helper is not the active console user's process")
-                }
-                let minted = try minter.mint(
-                    turnID: turnID,
-                    ttl: TimeInterval(config.lockedUse.grantTTLSeconds), now: Date(),
-                    consoleUID: consoleUser.uid,
-                    consoleUsername: consoleUser.username)
-                lock.lock()
-                opened.authorizationNonce = minted.1.nonce
-                lock.unlock()
-                try GrantStore.write(minted.0, to: grantDirectory)
-                audit(
-                    event: "grant_published", turnID: turnID,
-                    noncePrefix: Self.noncePrefix(minted.1.nonce))
-                try ensureOpening(opened)
-
-                lock.lock()
-                guard window === opened, opened.phase == .opening else {
-                    lock.unlock()
-                    throw openingCancelled(opened)
-                }
-                // Mark before crossing into the system call. Even a throwing
-                // implementation may have initiated work before it learned it
-                // could not finish, so cleanup must treat it as in flight.
-                opened.authorizationRequested = true
-                lock.unlock()
+                let attempt = AuthorizationAttempt()
                 var requestFailure: Error?
                 do {
-                    try system.requestUnlockAuthorization {
-                        try self.completionReceiptVerifier(
-                            minted.1.nonce, self.grantDirectory)
-                    }
+                    try system.requestUnlockAuthorization(
+                        authorizationFieldReady: {
+                            self.audit(
+                                event: "authorization_field_ready", turnID: turnID)
+                        },
+                        prepareGrant: {
+                            try attempt.beginPreparation()
+                            // Wake/discovery may have taken seconds. Revalidate
+                            // every owner, presence, and console-session
+                            // boundary at the last pre-submission point, then
+                            // mint from now so that wait consumes no grant TTL.
+                            try self.ensureOpening(opened)
+                            try self.ensureNoLocalInput(opened)
+                            guard try self.system.isLocked() else {
+                                throw LockedUseError.systemFailure(
+                                    "the screen unlocked before grant publication")
+                            }
+                            let consoleUser: ConsoleUserIdentity
+                            do {
+                                consoleUser = try self.consoleUserProvider()
+                            } catch {
+                                throw LockedUseError.systemFailure(
+                                    "could not bind authorization to the active console user: \(error)")
+                            }
+                            guard consoleUser.uid == getuid(), consoleUser.uid > 0 else {
+                                throw LockedUseError.systemFailure(
+                                    "this helper is not the active console user's process")
+                            }
+                            let minted = try minter.mint(
+                                turnID: turnID,
+                                ttl: TimeInterval(self.config.lockedUse.grantTTLSeconds),
+                                now: Date(), consoleUID: consoleUser.uid,
+                                consoleUsername: consoleUser.username)
+                            try self.ensureOpening(opened)
+                            try self.ensureNoLocalInput(opened)
+                            self.lock.lock()
+                            opened.authorizationNonce = minted.1.nonce
+                            self.lock.unlock()
+                            try GrantStore.write(minted.0, to: self.grantDirectory)
+                            attempt.publish(minted.1)
+                            self.lock.lock()
+                            opened.authorizationRequested = true
+                            self.lock.unlock()
+                            self.audit(
+                                event: "grant_published", turnID: turnID,
+                                noncePrefix: Self.noncePrefix(minted.1.nonce))
+                        },
+                        completionReceiptObserved: {
+                            guard let payload = attempt.payload else {
+                                throw LockedUseError.systemFailure(
+                                    "authorization receipt was requested before grant publication")
+                            }
+                            return try self.completionReceiptVerifier(
+                                payload.nonce, self.grantDirectory)
+                        })
                     lock.lock()
                     opened.authorizationUICompleted = true
                     lock.unlock()
@@ -615,18 +671,33 @@ public final class LockedUseController: @unchecked Sendable {
                     requestFailure = LockedUseError.systemFailure(
                         "could not request lock-screen authorization: \(error)")
                 }
-                audit(event: "authorization_request_returned", turnID: turnID)
+                audit(
+                    event: "authorization_request_returned", turnID: turnID,
+                    reason: requestFailure.map {
+                        Self.sanitizedAuthorizationFailureReason(
+                            $0, nonce: attempt.payload?.nonce)
+                    })
+
+                guard let payload = attempt.payload else {
+                    // Discovery/focus failure never published a grant and may
+                    // return directly. If preparation began, scrub anyway: a
+                    // failed write can be partially visible even though no
+                    // payload reached the receipt observer.
+                    if attempt.began { try withdrawGrant(turnID: turnID) }
+                    throw requestFailure ?? LockedUseError.systemFailure(
+                        "lock-screen authorization returned without preparing a grant")
+                }
 
                 // Even a throwing interactor may have crossed the AX boundary
                 // before learning it could not finish. Observe the exact
                 // receipt/lock result before cleanup so that transition cannot
                 // arrive after our relock.
-                try awaitUnlock(window: opened, payload: minted.1)
+                try awaitUnlock(window: opened, payload: payload)
                 try withdrawGrant(turnID: turnID)
                 if let requestFailure { throw requestFailure }
                 audit(
                     event: "grant_consumed", turnID: turnID,
-                    noncePrefix: Self.noncePrefix(minted.1.nonce))
+                    noncePrefix: Self.noncePrefix(payload.nonce))
 
                 if config.lockedUse.shieldRequired,
                    !system.confirmShieldCoverage(timeout: Self.shieldConfirmTimeout) {
@@ -1714,5 +1785,28 @@ public final class LockedUseController: @unchecked Sendable {
     private static func noncePrefix(_ nonce: String) -> String? {
         guard nonce.count > 8 else { return nil }
         return String(nonce.prefix(8))
+    }
+
+    /// Authorization-return reasons are useful remote diagnostics, but audit
+    /// entries leave the machine. Strip control characters, the exact nonce,
+    /// and any long token-shaped value before bounding the record size.
+    static func sanitizedAuthorizationFailureReason(
+        _ error: Error, nonce: String?
+    ) -> String {
+        var reason = String(describing: error)
+        if let nonce, !nonce.isEmpty {
+            reason = reason.replacingOccurrences(of: nonce, with: "[redacted]")
+        }
+        reason = reason.unicodeScalars.map { scalar in
+            CharacterSet.controlCharacters.contains(scalar) ? " " : String(scalar)
+        }.joined()
+        if let expression = try? NSRegularExpression(
+            pattern: #"(?i)\b[0-9a-f]{16,}\b|[A-Za-z0-9+_=/\-]{32,}"#)
+        {
+            let range = NSRange(reason.startIndex..<reason.endIndex, in: reason)
+            reason = expression.stringByReplacingMatches(
+                in: reason, range: range, withTemplate: "[redacted]")
+        }
+        return String(reason.prefix(512))
     }
 }
