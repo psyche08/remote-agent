@@ -1,8 +1,9 @@
 # Provider 架构
 
-本文描述 `remote-agent` 当前生产 Go 路径中的 provider 架构。范围包括
-provider 注册、会话身份、原生会话发现、发送路由、stream/status 和审批。旧的
-Python provider、Claude Desktop wrapper/broker 和 tmux backend 已从仓库删除。
+本文描述 AgentHalo 当前生产 Go 路径中的 provider 架构。范围包括
+provider 注册、会话身份、原生会话发现、发送路由、stream/status、审批，以及
+Claude Desktop 的进程内 Computer Use / Locked Use 控制。旧的 Python provider、
+Claude Desktop wrapper 和 tmux backend 已从仓库删除。
 
 ## 结论先行
 
@@ -11,11 +12,15 @@ Python provider、Claude Desktop wrapper/broker 和 tmux backend 已从仓库删
   命名空间。
 - `claude_cli`、`claude_desktop` 是旧数据和旧客户端的兼容别名，API 会把它们
   归一化为 `claude`；它们不是独立 provider，也不拥有独立会话命名空间。
-- Claude Desktop 和 CLI 的发现数据按同一个 Claude transcript UUID 合并，但
-  当前所有写操作都由 remote-agent 管理的 standalone Claude CLI
-  `stream-json` 进程完成。
+- Claude Desktop 和 CLI 的发现数据按同一个 Claude transcript UUID 合并。新
+  logical session 默认绑定 session-sticky `desktop_computer_use`；prompt、
+  `AskUserQuestion` 和一次性工具 allow/deny 通过短时进程内 Computer Use /
+  Locked Use transaction 完成。
+- `stream_json_cli` 只是在全新 session 的 capability preflight 于任何 UI mutation
+  之前失败时可选定的 fallback。已有 Desktop owner、安全拒绝、任何可能已发生的
+  mutation 或未知投递结果都禁止 CLI 重发。
 - Codex 只有一个 provider id，但内部有两条明确的 delivery route：
-  remote-agent 自己的 headless `codex app-server`，以及 Codex Desktop
+  AgentHalo 自己的 headless `codex app-server`，以及 Codex Desktop
   owner/follower IPC。路由属于 logical session，不能在一次发送失败后静默切换。
 - 所有可变状态和控制操作必须至少按 `(provider_id, session_id)` 作用域化；涉及
   native runtime 时再通过持久化映射找到 `transcript_id` / `native_session_id`。
@@ -30,9 +35,12 @@ flowchart LR
     API <--> WS["session-scoped WebSocket"]
 
     Registry --> Claude["claude provider"]
-    Claude --> ClaudeDiscovery["CLI transcripts + Desktop metadata"]
-    Claude --> ClaudeCLI["managed claude stream-json child"]
-    ClaudeCLI --> ClaudeTranscript["~/.claude/projects transcript"]
+    Claude --> ClaudeDiscovery["observer hooks + transcripts + Desktop metadata"]
+    Claude --> ClaudeDesktop["short Computer Use / Locked Use transaction"]
+    ClaudeDesktop --> ClaudeApp["exact Claude Desktop bundle / Team / session"]
+    Claude -. "new-session pre-mutation fallback" .-> ClaudeCLI["managed claude stream-json child"]
+    ClaudeApp --> ClaudeTranscript["~/.claude/projects transcript"]
+    ClaudeCLI --> ClaudeTranscript
 
     Registry --> Codex["codex provider"]
     Codex --> CodexDiscovery["thread/list + local index/rollout"]
@@ -45,7 +53,7 @@ flowchart LR
     GenericPTY --> PTYChild["one fixed CLI + PTY per logical session"]
 ```
 
-`cmd/remote-agent/main.go` 只负责加载 config/state、调用
+`cmd/agenthalo/main.go` 只负责加载 config/state、调用
 `provider.BuildRegistry`、创建 API server，并把 provider 的 stream publisher 接到
 按 session 分组的 WebSocket fan-out。provider 不直接处理 HTTP，也不保存 PWA
 tab 状态。
@@ -55,8 +63,9 @@ tab 状态。
 `internal/provider/provider.go` 的 `BuildRegistry` 执行以下规则：
 
 1. 配置中的 `claude`、`claude_cli`、`claude_desktop` 不逐个注册。
-2. 优先读取旧的 `claude_cli` 配置，否则读取 `claude` 配置，最终只注册
-   `reg["claude"] = NewClaudeCLI(...)`。
+2. 优先读取 canonical `claude` 配置；旧的 `claude_cli` 配置仅作为兼容输入，最终
+   只注册 `reg["claude"]`。默认 primary/fallback 分别是
+   `desktop_computer_use` / `stream_json_cli`，而不是两个 provider。
 3. 其他配置项声明 `"type": "pty"` 时，注册 generic PTY provider；只执行固定
    `command` + `args`，不经 shell，也不会继承 structured approval/steer 等能力。
 4. `codex` 注册为 Go `NewCodex(...)`；未配置时也会补一个默认实例。
@@ -87,6 +96,7 @@ Go `Provider` 接口要求实现：
 | logical/native 绑定 | `BindTranscript(...)`、`BindDesktopTranscript(...)` | 重建 logical id 到 transcript/thread 的内存映射和 Codex route |
 | 精确运行态 | `SessionRunning(...)`、`SessionSettings(...)` | 避免 provider-global 状态污染其他 tab |
 | 人机交互 | `ApprovalRequest(...)`、`RelayApprovalRequest(...)`、`AnswerQuestion(...)` | request-scoped approval / question |
+| provider 桌面事务 | `ComputerUseAutomationHost` | 服务端固定 provider/session/op 身份并为 Claude 创建短时进程内 lease；无 HTTP open/action 回路 |
 | 消息回退重发 | `UserMessageRewinder` | Codex thread rollback 后创建新 logical session |
 | 实时事件 | `SetStreamPublisher(...)` | provider event 转到 session-scoped WebSocket |
 
@@ -103,11 +113,12 @@ action 明确 `endpoint`、`scope`、`risk`、`supported`；PWA 的 steer/interr
 |---|---|---|
 | `device_id` | 部署实例 | Mac/账号隔离边界 |
 | `provider_id` | registry | canonical provider：内置 `claude` / `codex` 或配置的 PTY provider id |
-| `session_id` | remote-agent | PWA/API 使用的 logical session id，也是任务、附件和控制操作的主键 |
+| `session_id` | AgentHalo | PWA/API 使用的 logical session id，也是任务、附件和控制操作的主键 |
 | `native_session_id` | provider runtime | Claude transcript UUID 或 Codex thread UUID；表示可激活的 native handle |
 | `transcript_id` | durable read side | transcript/rollout 的合并键；通常与 native id 相同，但语义上是持久读侧 |
 | `origin` | discovery | `cli` / `desktop` / `both` 等元数据，只说明从哪里发现，不决定发送路由 |
 | `source` | runtime/read side | `claude_cli_stream`、`claude_turnstate`、Codex local/app-server 等观测来源，不决定 owner |
+| `claude_control_route` | persisted logical session | Claude mutable owner 的权威字段：`desktop_computer_use` / `stream_json_cli`；不能因一次发送失败跨 route 重试 |
 | `codex_control_route` | persisted logical session | Codex mutable owner 的权威字段：`shared_daemon` / `stdio` / `desktop_ipc`；配置漂移时内存绑定降为 `unavailable` 并拒绝写入 |
 | `delivery_route` | persisted logical session | Codex shared-daemon record 暂时写 `desktop_ipc` 作为旧 binary 的 fail-closed 回滚标记；当前 binary 以 `codex_control_route` 为准。legacy stdio record 保持缺省，旧 `r0...` / `r-codex-...` logical id 仍有 Desktop-route 兼容识别 |
 
@@ -130,7 +141,7 @@ API 查找和所有 mutating control 仍必须带 provider scope，并在调用 
 | 视图 | API | 数据含义 |
 |---|---|---|
 | Native discovery | `/native_sessions?provider_id=...` | provider 原生存储中的历史会话，可只读预览，尚不一定有 logical record |
-| Stored logical sessions | `/sessions` | remote-agent 已创建/激活、可承载任务和附件的 record |
+| Stored logical sessions | `/sessions` | AgentHalo 已创建/激活、可承载任务和附件的 record |
 | Runtime/live sessions | `/live_sessions` | provider runtime、stored record 和可选 native row 的合并结果 |
 
 `/live_sessions` 以 `(provider_id, transcript_id)` 去重：runtime 的 live/state/source
@@ -173,56 +184,125 @@ preview、恢复、发送与控制仍保留。
 4. `/interrupt`、`/steer`、`/approval`、`/question_answer` 都先执行同样的 session
    hydration；不得直接把一个未知 id 当作 transcript/thread id。
 
+Claude 新 session 在第一次 mutation 前持久化 concrete `claude_control_route`。
+Desktop transaction 只允许 server 绑定的 provider/session/op identity；调用方不能
+构造 lease。若 provider 报告 mutation 可能已发生，API 必须保留
+`delivery_unknown`，不得把 record 改绑到 CLI 后重试。
+
 ## Claude provider
 
-### 当前边界
+### Route 选择与所有权
 
-生产实例是 `NewClaudeCLI("claude", ...)`，backend 为
-`claude_stream_json_go`：
+canonical `claude` 内部有两条 route，但每个 logical session 只能绑定其中一条：
 
-- 每个 logical session 对应一个受管的 standalone `claude`
-  child 和一组双向 NDJSON pipe。
-- 新 transcript 使用 `--session-id`，恢复使用 `--resume`，fork 加
-  `--fork-session`。
-- prompt 以完整 SDK `user` frame 写 stdin；assistant/tool/control 事件从 stdout
-  进入 WebSocket 和 session buffer。
-- interrupt、approval、`AskUserQuestion` 都使用 request-scoped
-  `control_request` / `control_response`，不模拟终端按键。
+| route | 用途 | 选择时机 |
+|---|---|---|
+| `desktop_computer_use` | 默认；操作 Claude Desktop 的 exact native session | fresh session 或 Desktop-origin attach；绑定后不跨 route |
+| `stream_json_cli` | 受管 standalone Claude CLI fallback | 仅 fresh session，且 Desktop capability preflight 在任何 UI mutation 前失败 |
 
-Claude provider 不再有 wrapper、broker、tmux 或 raw-key fallback。旧部署上的
-watcher drop-in、enable marker 和 wrapper binaries 由 installer/updater 一次性清理；
-Desktop 只贡献 metadata，mutating control 始终进入 standalone stream-json child。
+配置键与 `config.example.json` 一致：
 
-### Discovery 与 owner handoff
+```json
+"claude": {
+  "primary_route": "desktop_computer_use",
+  "fallback_route": "stream_json_cli",
+  "desktop_bundle_id": "com.anthropic.claudefordesktop",
+  "desktop_team_id": "Q6L2SF6YDW",
+  "desktop_app_path": "/Applications/Claude.app",
+  "ui_operation_timeout_seconds": 30,
+  "interaction_dir": "~/.claude/agenthalo-interactions",
+  "turnstate_dir": "~/.claude/agenthalo-turnstate"
+}
+```
+
+fallback 不是失败重试。判定必须发生在打开 transaction、激活/切换 Desktop、写 AX、
+click/press/type 或任何其他可能改变 UI 的动作之前。满足下列任一条件时都不能启动 CLI：
+
+- session 已绑定 Desktop owner，或由 Desktop-origin native row 激活；
+- transaction 已开始 mutation，结果超时、断连或无法证明是否投递；
+- exact bundle/Team/session/request 不匹配；
+- local physical input、shield/input guard、owner 或锁态检查触发安全拒绝；
+- 旧 Desktop transcript 是否仍有 owner 无法证明。
+
+可能已 mutation 但无法确认结果时返回 `delivery_unknown`。重发 prompt/答案/allow 会产生
+重复工作或越权，不能以“CLI 更可靠”为理由重试。历史 record 若已经持久化
+`stream_json_cli`，重启后仍恢复该 owner；配置变化不能把它静默迁移到 Desktop。
+
+### Desktop Computer Use transaction
+
+Desktop route 不暴露 HTTP action，也不接受调用方自报 turn id。API hydration 先恢复
+canonical provider、logical session、native/desktop alias 和持久 route，再在进程内创建
+随机、短时、单次 operation lease。transaction 只允许 configured
+`desktop_bundle_id` + `desktop_team_id`，并要求当前 AX/metadata 对应同一 Claude
+session；approval/question 还必须匹配 pending `request_id`。
+
+每个 prompt input、`AskUserQuestion` answer、Claude tool allow/deny 都使用独立
+transaction：
+
+1. 在任何 mutation 前检查 capability、owner、锁态和 exact app identity；
+2. 必要时打开唯一 Locked Use window，并保持物理屏幕 shield；
+3. 读取 fresh screenshot + AX tree；
+4. 一次 mutation 原子消费该 observation；下一次 set-value/press/click/type 前重新读 AX；
+5. 对 prompt/答案确认 exact composer/request card，再写入并提交一次；
+6. 同步停止 admission、等待在途操作、撤 grant、重锁并 read back，最后才返回。
+
+Claude 的 `/send_prompt` 还要求客户端提供稳定 `operation_id`。PWA 必须先把
+`operation_id` 与请求 digest 写入持久存储并读回；server 在任何 Desktop/CLI side
+effect 前写入不可变 attempt ledger。进程或页面重启后，同一 operation 只允许恢复结果，
+不能再次输入或发送；无法确认的结果保持 `delivery_unknown`。
+
+因此 Claude 计算和 observer polling 期间屏幕保持锁定；窗口只存在于一次明确的人类动作
+或 prompt delivery 中。close/relock 失败不是 warning，必须传播为 terminal error/quarantine，
+不能在后台留下窗口继续执行。
+
+### Questions 与工具权限
+
+Claude 自己不能批准自己的 tool call。无副作用 observer hook/transcript 把 exact
+session + request id 的 `AskUserQuestion` / permission request 发布给 PWA；只有远端人类
+调用 `/question_answer` 或 `/approval` 才能打开 transaction。
+
+`allow` 只表示 Claude UI 中最小范围的一次性工具权限（例如 “Allow Once”）。AX 必须
+精确匹配 request/tool/card，并确认 control enabled；若 UI 只提供 “Always”、session-wide、
+修改默认策略或其他扩大权限的选项，则 fail closed。`deny` 同样只作用于匹配 request。
+
+这里的“授权”不包含 macOS 登录密码、Touch ID、TCC/Accessibility/Screen Recording、
+账号登录、SSO、MFA、恢复码或其他系统/身份认证。AgentHalo 不读取、存储或输入这些内容，
+也不会借 Claude permission action 代替人工完成它们。
+
+### Discovery、read side 与轮询
 
 Claude discovery 同时读取：
 
-- `~/.claude/projects` 的 CLI transcript；
-- `~/Library/Application Support/Claude/claude-code-sessions` 的 Desktop metadata。
+- `~/.claude/projects` 的 transcript；
+- `~/Library/Application Support/Claude/claude-code-sessions` 的 Desktop metadata；
+- `interaction_dir` 的 side-effect-free observer hook event；
+- `turnstate_dir` 的外部 owner/running state。
 
-两侧按 `cliSessionId` / transcript UUID 合并。Desktop title、cwd、时间等用于丰富
-同一行，`origin` 记录 `cli`、`desktop` 或 `both`。
+它们按 `cliSessionId` / transcript UUID 合并。Desktop title、cwd、时间、local session
+alias 等丰富同一行，`origin` 记录 `cli`、`desktop` 或 `both`，但 `origin` 不替代
+`claude_control_route`。`/providers`、`/status`、`/output`、`/native_sessions`、preview
+和 WebSocket 轮询只能读取这些来源，绝不能激活 Claude、打开 Locked Use window 或产生
+AX mutation。
 
-当用户激活 Desktop-origin transcript 时，provider 不向 Desktop IPC 发送 prompt。
-它先用 Desktop session alias 和已打开 transcript 精确定位内部 Claude CLI 进程，
-仅终止该 session 的进程族并确认退出，再启动自己的 `claude --resume` child。
-无法检查 owner、无法确认退出或其他 owner 仍处于 running 时，操作失败；不能创建
-第二个 transcript writer。
+transcript 中遗留但无法与 active Desktop request 或 live CLI callback 精确匹配的问题可以
+展示，但必须标记不可操作。不能把答案发给一个新 owner 冒充旧 callback。
 
-### Read、state 与审批
+### CLI fallback
 
-- 历史/重启恢复：以 Claude transcript 为 durable read side。
-- 当前输出：优先使用 managed stream buffer；进程结束后仍可由 transcript 预览。
-- runtime state：managed stream 是主来源，turn-state hook 是外部 owner/running
-  检测和接管保护；Desktop metadata 本身不代表 live owner。
-- live permission/question：保存在 session + request id 作用域内，可以从 PWA 回答。
-- transcript 中遗留但原 stdio callback 已消失的问题可以展示，但必须标记为不可操作，
-  不能把答案发给一个新 owner 冒充旧 callback。
+选定 `stream_json_cli` 的 session 保留原 structured contract：新 transcript 使用
+`--session-id`，恢复使用 `--resume`，prompt 写完整 SDK `user` NDJSON frame，stdout
+`stream-json` 进入 WebSocket/session buffer，interrupt/approval/question 使用
+request-scoped `control_request` / `control_response`。CLI 不使用 bypass flags，也不是
+Desktop transaction 的 recovery path。
+
+以上是实现与部署必须满足的 owner/安全契约，不等于目标机验收结论。`m4pro` 仍需完成
+真实锁屏下 prompt、AskUserQuestion、一次性 allow/deny、terminal close/relock，以及
+post-mutation 不触发 CLI duplicate delivery 的最终 E2E；在取得证据前不能标记通过。
 
 ## Generic PTY provider
 
-`"type":"pty"` 是没有 structured API 时的 fallback，不替代 Claude stream-json 或
-Codex app-server/Desktop IPC：
+`"type":"pty"` 是没有 structured API 时的 fallback，不替代 Claude Desktop
+Computer Use / structured CLI fallback 或 Codex app-server/Desktop IPC：
 
 - 一个 logical session 只拥有一个固定 `command` + `args` child 和一个 PTY；
   provider 使用 `exec.Command`，不执行 shell expansion。
@@ -263,7 +343,7 @@ rollout 发现 metadata，不能把其他 binary 当成 native thread 的竞争 
 
 - 每个 managed daemon UDS WebSocket connection 都有单调递增的 connection
   generation。EOF、非法 JSON 或 socket loss 会立即唤醒所有 pending RPC，并只清理
-  同一代 client；旧 read loop/exit callback 不能污染新连接。关闭 remote-agent
+  同一代 client；旧 read loop/exit callback 不能污染新连接。关闭 AgentHalo
   connection 不会停止 shared daemon。
 - 连接前校验 managed executable、socket owner/mode/parent，保留 discovery inode
   snapshot，并在 dial 前后执行 `SameFile`；连接完成后再校验 peer UID。协议直接使用
@@ -313,7 +393,7 @@ Desktop IPC compatibility。
 4. owner 缺失、attach 超时或 IPC 结果不确定时返回错误，不能 fallback 到另一个
    app-server owner。这样调用方能明确知道 prompt 没有被安全确认投递。
 
-remote-agent 新建的 headless session 以及发送前已明确持久化为
+AgentHalo 新建的 headless session 以及发送前已明确持久化为
 `shared_daemon` 的 native session 走同一个 managed app-server daemon
 `thread/resume` / `turn/start` / `turn/steer` / `turn/interrupt`。两条 route 是在发送前
 确定的 session ownership 模型，不是一次请求中的主备切换；写出后的不确定结果绝不
@@ -345,8 +425,10 @@ thread idle 不得清空其他 thread 的 pending queue。
    session 取数，不读取另一个 tab 的 provider-global last state。
 4. native preview 可以只读且暂不持久化；第一次 mutating send 前必须建立 logical
    record 和 logical/native binding。
-5. Claude resume 前只有一个 transcript writer；Codex Desktop-native 发送只有一个
-   owner client。无法证明安全交接时宁可失败，也不创建第二 owner。
+5. Claude 的 `claude_control_route` 是 session-sticky owner；Desktop-origin session
+   不得迁移到 CLI，Desktop mutation 可能发生后不得跨 route 重发。Codex
+   Desktop-native 发送同样只能有一个 owner client。无法证明安全边界时宁可失败，
+   也不创建第二 owner。
 6. request id 是审批和问题的必要组成部分；“当前 provider 的最新审批”只可作为
    兼容 fallback，不能成为新调用方式。
 7. provider 的 durable read side 与 live control side 可以不同，但必须通过同一个
@@ -355,6 +437,11 @@ thread idle 不得清空其他 thread 的 pending queue。
    不得冒充 structured approval、owner routing 或 durable transcript。
 9. subagent session 只从普通列表隐藏，不删除、不改变 owner，也不阻断精确 id
    的内部/直接访问。
+10. Claude observer hook/transcript polling 是 side-effect-free read side；只有 prompt
+    或远端人类的 exact request action 可以打开短时 Desktop window。
+11. 每次 Claude Desktop mutation 需要 fresh AX observation，并在 transaction 末尾
+    同步 close/relock。一次性 Claude tool allow/deny 不能扩展成 Always/session-wide，
+    也不能用于 macOS password/TCC/SSO/MFA。
 
 ## 代码导航
 
@@ -366,7 +453,8 @@ thread idle 不得清空其他 thread 的 pending queue。
 | pending approval 聚合 | `internal/api/approvals.go` |
 | typed actions、generic PTY | `internal/provider/actions.go`、`internal/provider/pty.go` |
 | subagent session visibility | `internal/provider/codex_visibility.go`、`internal/api/session_visibility.go` |
-| Claude discovery、handoff、控制 | `internal/provider/claude.go`、`internal/provider/claude_process.go`、`internal/provider/claude_stream.go` |
+| Claude discovery、sticky route、Desktop/CLI 控制 | `internal/provider/claude.go`、`internal/provider/claude_computeruse.go`、`internal/provider/claude_process.go`、`internal/provider/claude_stream.go` |
+| provider→desktop 短时 automation transaction | `internal/api/computeruse_automation.go`、`internal/api/computeruse_tool.go` |
 | Codex discovery、route、app-server | `internal/provider/codex.go`、`internal/provider/codex_app_server.go` |
 | Codex Desktop owner/follower | `internal/provider/codex_desktop_ipc.go`、`internal/provider/codex_desktop_bridge.go` |
 | transcript/rollout normalization | `internal/provider/native.go` |

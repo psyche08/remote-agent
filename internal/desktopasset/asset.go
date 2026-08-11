@@ -6,8 +6,9 @@
 // automatically; shipping the helper separately would mean a second artifact,
 // a second verification path, and devices whose two halves are on different
 // versions. A code signature lives inside the Mach-O, so an embedded binary
-// written back out is still the signed binary that was notarized — which is
-// what lets the helper keep its TCC grants across updates.
+// written back out keeps the signature and byte-for-byte notarization ticket
+// recorded when publish-release.sh also submits that helper as a top-level
+// notary payload entry. This is what lets it keep TCC grants across updates.
 //
 // The asset is absent in ordinary development builds. That is deliberate: the
 // package compiles either way, and a device with no embedded helper reports
@@ -31,7 +32,7 @@ import (
 //go:embed assets
 var assets embed.FS
 
-const assetName = "assets/remote-agent-desktop"
+const assetName = "assets/agenthalo-desktop"
 
 // ErrNotEmbedded means this build carries no helper.
 var ErrNotEmbedded = errors.New("this build does not embed the desktop helper")
@@ -65,8 +66,8 @@ func SHA256() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// Materialize writes the helper to path, replacing an existing one only when
-// the contents differ.
+// Materialize writes the helper to path, replacing an existing path unless it
+// is already a regular, 0755 file with identical contents.
 //
 // Rewriting an identical binary is not free: the path is what launchd starts
 // and what TCC's grants are recorded against, so replacing it needlessly
@@ -81,16 +82,30 @@ func Materialize(path string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if existing, err := os.ReadFile(path); err == nil && len(existing) == len(data) {
-		if sha256.Sum256(existing) == sha256.Sum256(data) {
+	return materialize(path, data)
+}
+
+func materialize(path string, data []byte) (bool, error) {
+	info, err := os.Lstat(path)
+	switch {
+	case err == nil && info.Mode().IsRegular() && info.Mode().Perm() == 0o755 &&
+		info.Mode()&(fs.ModeSetuid|fs.ModeSetgid|fs.ModeSticky) == 0:
+		existing, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return false, readErr
+		}
+		if len(existing) == len(data) && sha256.Sum256(existing) == sha256.Sum256(data) {
 			return false, nil
 		}
+	case err != nil && !errors.Is(err, os.ErrNotExist):
+		return false, err
 	}
+
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return false, err
 	}
-	tmp, err := os.CreateTemp(dir, ".remote-agent-desktop-*")
+	tmp, err := os.CreateTemp(dir, ".agenthalo-desktop-*")
 	if err != nil {
 		return false, err
 	}

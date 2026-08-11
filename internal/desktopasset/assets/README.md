@@ -1,4 +1,4 @@
-The signed `remote-agent-desktop` binary is placed here by
+The signed `agenthalo-desktop` binary is placed here by
 `deploy/publish-release.sh` immediately before the release build, so the agent
 carries it and can write it out on the device.
 

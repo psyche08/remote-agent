@@ -1,6 +1,6 @@
 // swift-tools-version:5.9
 //
-// RemoteAgentDesktop — the macOS-native half of computer use and Locked Use.
+// AgentHaloDesktop — the macOS-native half of computer use and Locked Use.
 //
 // This exists as its own component, rather than as scripts the Go service
 // shells out to, for reasons that are specific rather than stylistic:
@@ -21,17 +21,22 @@
 import PackageDescription
 
 let package = Package(
-    name: "RemoteAgentDesktop",
+    name: "AgentHaloDesktop",
     platforms: [.macOS(.v12)],
     targets: [
-        .target(name: "RemoteAgentDesktopCore"),
+        .target(
+            name: "AgentHaloDesktopCore",
+            path: "Sources/AgentHaloDesktopCore"
+        ),
         .executableTarget(
-            name: "remote-agent-desktop",
-            dependencies: ["RemoteAgentDesktopCore"]
+            name: "agenthalo-desktop",
+            dependencies: ["AgentHaloDesktopCore"],
+            path: "Sources/agenthalo-desktop"
         ),
         .testTarget(
-            name: "RemoteAgentDesktopCoreTests",
-            dependencies: ["RemoteAgentDesktopCore"]
+            name: "AgentHaloDesktopCoreTests",
+            dependencies: ["AgentHaloDesktopCore"],
+            path: "Tests/AgentHaloDesktopCoreTests"
         ),
     ]
 )

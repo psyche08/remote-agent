@@ -27,7 +27,7 @@ func TestMaterializeWritesAnExecutableAndSkipsRewrites(t *testing.T) {
 	if !Embedded() {
 		t.Skip("this build embeds no helper")
 	}
-	path := filepath.Join(t.TempDir(), "remote-agent-desktop")
+	path := filepath.Join(t.TempDir(), "agenthalo-desktop")
 
 	replaced, err := Materialize(path)
 	if err != nil || !replaced {
@@ -72,7 +72,7 @@ func TestMaterializeReplacesAStaleHelper(t *testing.T) {
 	if !Embedded() {
 		t.Skip("this build embeds no helper")
 	}
-	path := filepath.Join(t.TempDir(), "remote-agent-desktop")
+	path := filepath.Join(t.TempDir(), "agenthalo-desktop")
 	if err := os.WriteFile(path, []byte("an older helper"), 0o755); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -85,5 +85,85 @@ func TestMaterializeReplacesAStaleHelper(t *testing.T) {
 	want, _ := SHA256()
 	if hex.EncodeToString(sum[:]) != want {
 		t.Fatal("a stale helper survived materialization")
+	}
+}
+
+func TestMaterializeRepairsAnIdenticalNonExecutableFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agenthalo-desktop")
+	data := []byte("signed helper bytes")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	replaced, err := materialize(path, data)
+	if err != nil || !replaced {
+		t.Fatalf("materialize: replaced=%v err=%v", replaced, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o755 {
+		t.Fatalf("materialized mode = %v, want regular 0755", info.Mode())
+	}
+	written, err := os.ReadFile(path)
+	if err != nil || string(written) != string(data) {
+		t.Fatalf("materialized contents = %q err=%v, want %q", written, err, data)
+	}
+}
+
+func TestMaterializeReplacesAnIdenticalSymlink(t *testing.T) {
+	dir := t.TempDir()
+	data := []byte("signed helper bytes")
+	target := filepath.Join(dir, "target")
+	path := filepath.Join(dir, "agenthalo-desktop")
+	if err := os.WriteFile(target, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+
+	replaced, err := materialize(path, data)
+	if err != nil || !replaced {
+		t.Fatalf("materialize: replaced=%v err=%v", replaced, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o755 {
+		t.Fatalf("materialized mode = %v, want regular 0755", info.Mode())
+	}
+	written, err := os.ReadFile(path)
+	if err != nil || string(written) != string(data) {
+		t.Fatalf("materialized contents = %q err=%v, want %q", written, err, data)
+	}
+}
+
+func TestMaterializeSkipsOnlyAValidCurrentFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agenthalo-desktop")
+	data := []byte("signed helper bytes")
+	if err := os.WriteFile(path, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	replaced, err := materialize(path, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replaced {
+		t.Fatal("a regular 0755 helper with identical bytes was rewritten")
+	}
+	after, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("materialize replaced the inode it reported unchanged")
 	}
 }

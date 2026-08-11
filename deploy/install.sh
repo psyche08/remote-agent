@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Idempotent installer for the remote-agent AI desktop agent on one Mac.
+# Idempotent installer for AgentHalo on one Mac.
 #
 # It registers the agent with the private-services supervisor via a DROP-IN file
-# (services.d/remote-agent.yaml) — it NEVER edits or replaces the shared
+# (services.d/agenthalo.yaml) — it NEVER edits or replaces the shared
 # services.yaml. Re-running is safe.
 #
 # Auth model (Plan A, the only model): the agent listens on a 0700 Unix domain
@@ -13,17 +13,25 @@
 #   1. build Go backend binary
 #   2. config.json from config.example.json     (only if missing — never clobbers)
 #   3. the Unix-socket dir                      (run dir for the UDS)
-#   4. the supervisor drop-in                   (services.d/remote-agent.yaml)
-#   5. reload-config + restart remote-agent    (never the container agent)
+#   4. the supervisor drop-in                   (services.d/agenthalo.yaml)
+#   5. reload-config + start agenthalo         (never the container agent)
 #
 # Usage:
 #   ./install.sh DEVICE_ID [options]
+#
+# macOS signing (required):
+#   AGENTHALO_EXPECTED_TEAM_ID=ABCDE12345 \
+#   AGENTHALO_SIGN_IDENTITY="Developer ID Application: ..." \
+#     ./install.sh DEVICE_ID [options]
+#
+# With AGENTHALO_SKIP_BUILD=1, bin/agenthalo must already have the exact
+# dev.linsheng.agenthalo identifier, the expected Team ID and hardened runtime.
 #     --devices a,b,c        fleet device ids for the unified console (default: DEVICE_ID)
-#     --uds PATH             socket path (default: /opt/private-tunnel/state/remote-agent/sockets/backend.sock)
+#     --uds PATH             socket path (default: /opt/private-tunnel/state/agenthalo/sockets/backend.sock)
 #     --agent-config PATH    retired; ingress is owned by private-edge profiles
 #     --etc DIR              supervisor config dir (default: /opt/private-tunnel/etc)
-#     --update-relay-url URL persist RC_UPDATE_RELAY_URL for manifest polling
-#     --update-cert-dir DIR  persist RC_UPDATE_CERT_DIR for updater mTLS certs
+#     --update-relay-url URL persist AGENTHALO_UPDATE_RELAY_URL for manifest polling
+#     --update-cert-dir DIR  persist AGENTHALO_UPDATE_CERT_DIR for updater mTLS certs
 #     --log-user USER        private-tunnel user id for log upload cert discovery
 #     --log-cert-dir DIR     client certificate dir for log upload
 set -euo pipefail
@@ -64,31 +72,32 @@ yaml_quote() {
 DEVICE_ID="${1:?usage: install.sh DEVICE_ID [--devices a,b] [--uds path] [--agent-config path]}"
 shift || true
 
-REPO_REMOTE_AGENT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # .../remote-agent
-REPO_PARENT="$(dirname "$REPO_REMOTE_AGENT")"
-ETC_DIR="${RA_ETC_DIR:-${RC_ETC_DIR:-/opt/private-tunnel/etc}}"
-BIN_DIR="${RA_BIN_DIR:-${RC_BIN_DIR:-/opt/private-tunnel/bin}}"
-LIBEXEC_DIR="${RA_LIBEXEC_DIR:-/opt/private-tunnel/libexec/remote-agent}"
-RUNTIME_BIN="$LIBEXEC_DIR/remote-agent"
-STATE_DIR="${RA_STATE_DIR:-/opt/private-tunnel/state/remote-agent}"
-LEGACY_STATE_DIR="${RA_LEGACY_STATE_DIR:-/opt/private-tunnel/state/remote-coding}"
+REPO_AGENTHALO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # source checkout
+ETC_DIR="${AGENTHALO_ETC_DIR:-/opt/private-tunnel/etc}"
+LIBEXEC_DIR="${AGENTHALO_LIBEXEC_DIR:-/opt/private-tunnel/libexec/agenthalo}"
+RUNTIME_BIN="$LIBEXEC_DIR/agenthalo"
+STATE_DIR="${AGENTHALO_STATE_DIR:-/opt/private-tunnel/state/agenthalo}"
 UDS="$STATE_DIR/sockets/backend.sock"
-LEGACY_UDS="$LEGACY_STATE_DIR/sockets/backend.sock"
 DEVICES="$DEVICE_ID"
 PORT=8765
 LOG_UPLOAD=1
-LOG_USER="${RC_LOG_UPLOAD_USER:-}"
-LOG_CERT_DIR="${RC_LOG_UPLOAD_CERT_DIR:-}"
-LOG_RELAY_URL="${RC_LOG_UPLOAD_RELAY_URL:-}"
-UPDATE_RELAY_URL="${RC_UPDATE_RELAY_URL:-}"
-UPDATE_CERT_DIR="${RC_UPDATE_CERT_DIR:-}"
-LOG_NAMESPACE="${RC_LOG_UPLOAD_NAMESPACE:-remocoding}"
-LOG_INTERVAL="${RC_LOG_UPLOAD_INTERVAL:-60s}"
-LOG_MAX_CHUNK="${RC_LOG_UPLOAD_MAX_CHUNK:-1048576}"
+LOG_USER="${AGENTHALO_LOG_UPLOAD_USER:-}"
+LOG_CERT_DIR="${AGENTHALO_LOG_UPLOAD_CERT_DIR:-}"
+LOG_RELAY_URL="${AGENTHALO_LOG_UPLOAD_RELAY_URL:-}"
+UPDATE_RELAY_URL="${AGENTHALO_UPDATE_RELAY_URL:-}"
+UPDATE_CERT_DIR="${AGENTHALO_UPDATE_CERT_DIR:-}"
+LOG_NAMESPACE="${AGENTHALO_LOG_UPLOAD_NAMESPACE:-agenthalo}"
+LOG_INTERVAL="${AGENTHALO_LOG_UPLOAD_INTERVAL:-60s}"
+LOG_MAX_CHUNK="${AGENTHALO_LOG_UPLOAD_MAX_CHUNK:-1048576}"
 # launchd may run with a minimal PATH; keep versioned Homebrew fallbacks.
 PY="$(find_tool python3 /opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3)"
 GO="$(find_tool go /opt/homebrew/bin/go /opt/homebrew/opt/go/bin/go /opt/homebrew/opt/go@1.25/bin/go /opt/homebrew/opt/go@1.24/bin/go /usr/local/bin/go)"
-SUPERVISOR="${RA_SUPERVISOR:-${RC_SUPERVISOR:-/opt/private-tunnel/bin/private-services}}"
+SUPERVISOR="${AGENTHALO_SUPERVISOR:-/opt/private-tunnel/bin/private-services}"
+PLATFORM="${AGENTHALO_PLATFORM:-$(uname -s)}"
+CODESIGN="${AGENTHALO_CODESIGN:-codesign}"
+SIGN_IDENTITY="${AGENTHALO_SIGN_IDENTITY:-}"
+EXPECTED_TEAM_ID="${AGENTHALO_EXPECTED_TEAM_ID:-}"
+EXPECTED_IDENTIFIER="dev.linsheng.agenthalo"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -111,154 +120,130 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$LOG_UPLOAD" = "1" ] && [ -z "$LOG_RELAY_URL" ]; then
-  echo "log upload requires --log-relay-url URL, RC_LOG_UPLOAD_RELAY_URL, or --no-log-upload" >&2
+  echo "log upload requires --log-relay-url URL, AGENTHALO_LOG_UPLOAD_RELAY_URL, or --no-log-upload" >&2
   exit 2
 fi
 
-echo "==> remote-agent install: device=$DEVICE_ID repo=$REPO_REMOTE_AGENT"
-if [ ! -x "$GO" ]; then
+echo "==> AgentHalo install: device=$DEVICE_ID repo=$REPO_AGENTHALO"
+if [ "${AGENTHALO_SKIP_BUILD:-0}" != "1" ] && [ ! -x "$GO" ]; then
   echo "go not found; install Go or set PATH before running install.sh" >&2
   exit 127
 fi
 
-VERSION_BASE="$(tr -d '[:space:]' <"$REPO_REMOTE_AGENT/VERSION")"
-VERSION_STATE="${RA_VERSION_STATE:-$STATE_DIR/deployment-version}"
+VERSION_BASE="$(tr -d '[:space:]' <"$REPO_AGENTHALO/VERSION")"
+VERSION_STATE="${AGENTHALO_VERSION_STATE:-$STATE_DIR/deployment-version}"
 VERSION_CURRENT="$VERSION_BASE"
 if [ -r "$VERSION_STATE" ]; then VERSION_CURRENT="$(tr -d '[:space:]' <"$VERSION_STATE")"; fi
-case "$VERSION_BASE:$VERSION_CURRENT:${RA_VERSION_INCREMENT:-1}" in
-  *[!0-9:]*|:*|*:) echo "invalid remote-agent deployment version" >&2; exit 1 ;;
+case "$VERSION_BASE:$VERSION_CURRENT:${AGENTHALO_VERSION_INCREMENT:-1}" in
+  *[!0-9:]*|:*|*:) echo "invalid AgentHalo deployment version" >&2; exit 1 ;;
 esac
-VERSION_INCREMENT="${RA_VERSION_INCREMENT:-1}"
-[ "$VERSION_INCREMENT" -gt 0 ] || { echo "RA_VERSION_INCREMENT must be positive" >&2; exit 1; }
+VERSION_INCREMENT="${AGENTHALO_VERSION_INCREMENT:-1}"
+[ "$VERSION_INCREMENT" -gt 0 ] || { echo "AGENTHALO_VERSION_INCREMENT must be positive" >&2; exit 1; }
 MODULE_VERSION=$((VERSION_CURRENT + VERSION_INCREMENT))
-echo "==> remote-agent deployment version: $VERSION_CURRENT -> $MODULE_VERSION"
+echo "==> AgentHalo deployment version: $VERSION_CURRENT -> $MODULE_VERSION"
 if [ ! -x "$PY" ]; then
   echo "python3 not found; install Python 3 or set PATH before running install.sh" >&2
   exit 127
 fi
 
-# 1) Go backend -------------------------------------------------------------
-if [ "${RA_SKIP_BUILD:-0}" = "1" ]; then
-  [ -x "$REPO_REMOTE_AGENT/bin/remote-agent" ] || { echo "RA_SKIP_BUILD requires bin/remote-agent" >&2; exit 1; }
-  echo "==> using prebuilt $REPO_REMOTE_AGENT/bin/remote-agent"
-else
-  echo "==> building Go backend"
-  BUILD_COMMIT="$(git -C "$REPO_REMOTE_AGENT" rev-parse --short HEAD 2>/dev/null || echo dev)"
-  BUILD_AT="$(TZ=Asia/Shanghai date +%Y-%m-%dT%H:%M:%S+08:00)"
-  BUILDINFO_PKG="github.com/psyche08/remote-agent/internal/buildinfo"
-  ( cd "$REPO_REMOTE_AGENT" && GOCACHE="${GOCACHE:-/private/tmp/remote-agent-gocache}" "$GO" build -trimpath \
-    -ldflags "-X ${BUILDINFO_PKG}.Version=remote-agent.${MODULE_VERSION} -X ${BUILDINFO_PKG}.Commit=${BUILD_COMMIT} -X ${BUILDINFO_PKG}.BuiltAt=${BUILD_AT}" \
-    -o bin/remote-agent ./cmd/remote-agent )
-  echo "==> built $REPO_REMOTE_AGENT/bin/remote-agent"
-fi
+verify_agenthalo_signature() {
+  local path="$1" metadata identifier team
+  "$CODESIGN" --verify --strict --verbose=2 "$path" >/dev/null
+  metadata="$("$CODESIGN" -d --verbose=4 "$path" 2>&1)"
+  identifier="$(printf '%s\n' "$metadata" | sed -n 's/^Identifier=//p' | head -1)"
+  team="$(printf '%s\n' "$metadata" | sed -n 's/^TeamIdentifier=//p' | head -1)"
+  [ "$identifier" = "$EXPECTED_IDENTIFIER" ] || {
+    echo "AgentHalo signing identifier mismatch for $path: got ${identifier:-missing}, want $EXPECTED_IDENTIFIER" >&2
+    return 1
+  }
+  [ "$team" = "$EXPECTED_TEAM_ID" ] || {
+    echo "AgentHalo signing team mismatch for $path: got ${team:-missing}, want $EXPECTED_TEAM_ID" >&2
+    return 1
+  }
+  printf '%s\n' "$metadata" | grep -q '^CodeDirectory .*flags=.*(runtime)' || {
+    echo "AgentHalo binary is not signed with the hardened runtime: $path" >&2
+    return 1
+  }
+}
 
-# Install an immutable runtime copy. Active supervisor drop-ins must never
-# reference a Git checkout or a temporary deployment worktree.
-ensure_runtime_dir "$LIBEXEC_DIR"
-install -m 0755 "$REPO_REMOTE_AGENT/bin/remote-agent" "$RUNTIME_BIN.new"
-mv -f "$RUNTIME_BIN.new" "$RUNTIME_BIN"
-echo "==> installed runtime binary $RUNTIME_BIN"
-
-# The native Swift workers are looked up relative to the service's cwd, which is
-# $LIBEXEC_DIR. Install them alongside the binary so the OCR worker resolves at
-# runtime instead of silently reporting "not available".
-if [ -d "$REPO_REMOTE_AGENT/scripts" ]; then
-  ensure_runtime_dir "$LIBEXEC_DIR/scripts"
-  for f in "$REPO_REMOTE_AGENT/scripts/"*.swift; do
-    [ -f "$f" ] || continue
-    install -m 0755 "$f" "$LIBEXEC_DIR/scripts/$(basename "$f")"
-  done
-  echo "==> installed native workers into $LIBEXEC_DIR/scripts"
-fi
-
-# The computer-use desktop helper is a separate resident process, not a worker
-# script: it owns the display shield as windows it holds, so it has to live in
-# the user's GUI session. It travels inside the agent binary and is written out
-# here, before the LaunchAgent is registered — launchd will not bootstrap a job
-# whose program does not exist yet.
-#
-# Installing the helper does not enable anything. Computer use still requires
-# config.json, and Locked Use additionally requires the separately installed
-# authorization plug-in (see docs/computer-use-locked-user.md).
-if [ "$(uname -s)" = "Darwin" ] && "$RUNTIME_BIN" desktop install >/dev/null 2>&1; then
-  DESKTOP_HELPER="$("$RUNTIME_BIN" desktop install 2>/dev/null)"
-  echo "==> installed desktop helper $DESKTOP_HELPER"
-  if [ -x "$REPO_REMOTE_AGENT/mac/launchagent/install.sh" ] && [ "$(id -u)" != "0" ]; then
-    bash "$REPO_REMOTE_AGENT/mac/launchagent/install.sh" \
-      --config "$CFG" --helper "$DESKTOP_HELPER" || \
-      echo "==> NOTE: could not register the desktop LaunchAgent; run mac/launchagent/install.sh by hand"
-  else
-    echo "==> NOTE: run mac/launchagent/install.sh --config $CFG as the logged-in user"
-    echo "    to start the desktop helper; a LaunchAgent belongs to a user session."
+if [ "$PLATFORM" = "Darwin" ]; then
+  command -v "$CODESIGN" >/dev/null 2>&1 || {
+    echo "codesign is required for an AgentHalo macOS install" >&2
+    exit 1
+  }
+  [ -n "$EXPECTED_TEAM_ID" ] || {
+    echo "AGENTHALO_EXPECTED_TEAM_ID is required for an AgentHalo macOS install" >&2
+    exit 1
+  }
+  if [ "${AGENTHALO_SKIP_BUILD:-0}" != "1" ]; then
+    case "$SIGN_IDENTITY" in
+      ""|-) echo "AGENTHALO_SIGN_IDENTITY must be a non-ad-hoc signing identity for a local macOS build" >&2; exit 1 ;;
+    esac
   fi
-else
-  echo "==> no embedded desktop helper in this build; computer use will report unavailable"
 fi
 
-# Reject an ambiguous state layout before stopping the currently healthy
-# service. This keeps a preflight failure from causing an outage.
-if [ -e "$STATE_DIR" ] && [ -d "$LEGACY_STATE_DIR" ] && [ ! -L "$LEGACY_STATE_DIR" ]; then
-  echo "both new and legacy state directories exist; refusing an ambiguous merge" >&2
-  exit 1
-fi
+# Validate and prepare config before stopping services or replacing installed
+# binaries. A bad explicit source must not interrupt a healthy AgentHalo.
+CFG="${AGENTHALO_CONFIG:-$ETC_DIR/agenthalo/config.json}"
+SOURCE_CFG="${AGENTHALO_CONFIG_SOURCE:-}"
+validate_agenthalo_config() {
+  "$PY" - "$1" <<'PYEOF'
+import json, sys
 
-# 2) Stop the old identity before moving its live state/socket. The legacy
-# state path becomes a compatibility symlink so an older private-edge gateway
-# keeps working until its profile is redeployed.
-"$SUPERVISOR" stop remote-coding-log-upload >/dev/null 2>&1 || true
-"$SUPERVISOR" stop remote-coding >/dev/null 2>&1 || true
-"$SUPERVISOR" stop remote-agent-log-upload >/dev/null 2>&1 || true
-"$SUPERVISOR" stop remote-agent >/dev/null 2>&1 || true
+path = sys.argv[1]
+with open(path) as f:
+    config = json.load(f)
 
-if [ ! -e "$STATE_DIR" ] && [ -d "$LEGACY_STATE_DIR" ] && [ ! -L "$LEGACY_STATE_DIR" ]; then
-  mv "$LEGACY_STATE_DIR" "$STATE_DIR"
-  echo "==> migrated state $LEGACY_STATE_DIR -> $STATE_DIR"
-fi
-mkdir -p "$STATE_DIR/sockets" "$STATE_DIR/data" "$STATE_DIR/screenshots"
-chmod 700 "$STATE_DIR" "$STATE_DIR/sockets" 2>/dev/null || true
-if [ ! -e "$LEGACY_STATE_DIR" ]; then
-  ln -s "$STATE_DIR" "$LEGACY_STATE_DIR"
-  echo "==> installed compatibility state symlink $LEGACY_STATE_DIR -> $STATE_DIR"
-fi
-# One-time migration from a historical repository-local data directory.
-if [ -d "$REPO_REMOTE_AGENT/data" ] && [ -z "$(ls -A "$STATE_DIR/data" 2>/dev/null)" ]; then
-  for f in sessions.json tasks.json; do
-    [ -f "$REPO_REMOTE_AGENT/data/$f" ] && cp -n "$REPO_REMOTE_AGENT/data/$f" "$STATE_DIR/data/$f" || true
-  done
-  echo "==> migrated existing data/*.json -> $STATE_DIR/data"
-fi
+old_tokens = ("remote-agent", "remote-coding", "remotecoding", "com.psyche08.remote-agent")
+violations = []
 
-# Remove artifacts from the retired Desktop wrapper path. Active Claude
-# control is the standalone stream-json child owned by this service. Keep
-# both historical names in cleanup so upgrades are idempotent.
-"$SUPERVISOR" stop remote-coding-claude-wrapper-watch >/dev/null 2>&1 || true
-"$SUPERVISOR" stop remote-agent-claude-wrapper-watch >/dev/null 2>&1 || true
-rm -f \
-  "$STATE_DIR/data/claude-wrapper-watch.enabled" \
-  "$ETC_DIR/services.d/remote-coding-claude-wrapper-watch.yaml" \
-  "$ETC_DIR/services.d/remote-agent-claude-wrapper-watch.yaml" \
-  "$BIN_DIR/claude-wrapper" \
-  "$BIN_DIR/install-claude-wrapper" \
-  "$BIN_DIR/watch-claude-wrapper"
+def check(location, value):
+    if not isinstance(value, str):
+        return
+    lowered = value.lower()
+    for token in old_tokens:
+        if token in lowered:
+            violations.append(f"{location}: old product token {token!r}")
+            return
 
-# 3) config.json (preserve values, migrate only old identity defaults) -------
-CFG="${RA_CONFIG:-$ETC_DIR/remote-agent/config.json}"
-SOURCE_CFG="${RA_CONFIG_SOURCE:-$REPO_REMOTE_AGENT/config.json}"
-LEGACY_CFG="${RA_LEGACY_CONFIG:-$REPO_PARENT/remote-coding/config.json}"
+check("$.uds", config.get("uds"))
+check("$.state_dir", config.get("state_dir"))
+computer_use = config.get("computer_use") or {}
+if isinstance(computer_use, dict):
+    check("$.computer_use.helper_socket", computer_use.get("helper_socket"))
+    locked_use = computer_use.get("locked_use") or {}
+    if isinstance(locked_use, dict):
+        check("$.computer_use.locked_use.grant_dir", locked_use.get("grant_dir"))
+        if "signing_key_path" in locked_use:
+            violations.append("$.computer_use.locked_use.signing_key_path: removed plaintext signing-key field")
+providers = config.get("providers") or {}
+if isinstance(providers, dict):
+    for provider_id, provider in providers.items():
+        if isinstance(provider, dict):
+            check(f"$.providers.{provider_id}.turnstate_dir", provider.get("turnstate_dir"))
+            check(f"$.providers.{provider_id}.interaction_dir", provider.get("interaction_dir"))
+
+if violations:
+    print("refusing non-AgentHalo config:\n  " + "\n  ".join(violations), file=sys.stderr)
+    raise SystemExit(1)
+PYEOF
+}
 mkdir -p "$(dirname "$CFG")"
-if [ ! -f "$CFG" ] && [ -f "$SOURCE_CFG" ]; then
+if [ ! -f "$CFG" ] && [ -n "$SOURCE_CFG" ]; then
+  [ -f "$SOURCE_CFG" ] || {
+    echo "AGENTHALO_CONFIG_SOURCE does not exist: $SOURCE_CFG" >&2
+    exit 1
+  }
+  validate_agenthalo_config "$SOURCE_CFG"
   cp -p "$SOURCE_CFG" "$CFG"
-  echo "==> installed config $SOURCE_CFG -> $CFG"
-elif [ ! -f "$CFG" ] && [ -f "$LEGACY_CFG" ]; then
-  cp -p "$LEGACY_CFG" "$CFG"
-  echo "==> migrated config $LEGACY_CFG -> $CFG"
+  echo "==> installed explicit AgentHalo config $SOURCE_CFG -> $CFG"
 fi
 if [ -f "$CFG" ]; then
   echo "==> config.json exists — preserving user settings"
 else
   echo "==> writing config.json (device_id=$DEVICE_ID, uds=$UDS)"
   DEVICE_ID="$DEVICE_ID" DEVICES="$DEVICES" UDS="$UDS" STATE_DIR="$STATE_DIR" PORT="$PORT" \
-  "$PY" - "$CFG" "$REPO_REMOTE_AGENT/config.example.json" <<'PYEOF'
+  "$PY" - "$CFG" "$REPO_AGENTHALO/config.example.json" <<'PYEOF'
 import json, os, sys
 out, example = sys.argv[1], sys.argv[2]
 d = json.load(open(example))
@@ -270,45 +255,104 @@ d["state_dir"] = os.environ["STATE_DIR"]
 json.dump(d, open(out, "w"), ensure_ascii=False, indent=2)
 PYEOF
 fi
+validate_agenthalo_config "$CFG"
+# The configuration can later hold push or provider credentials.  A fresh
+# AgentHalo install must not leave it readable by other local accounts.
+chmod 0600 "$CFG"
 
-CFG="$CFG" UDS="$UDS" LEGACY_UDS="$LEGACY_UDS" STATE_DIR="$STATE_DIR" LEGACY_STATE_DIR="$LEGACY_STATE_DIR" \
-  "$PY" - <<'PYEOF'
-import json, os
+# 1) Go backend -------------------------------------------------------------
+if [ "${AGENTHALO_SKIP_BUILD:-0}" = "1" ]; then
+  [ -x "$REPO_AGENTHALO/bin/agenthalo" ] || { echo "AGENTHALO_SKIP_BUILD requires bin/agenthalo" >&2; exit 1; }
+  echo "==> using prebuilt $REPO_AGENTHALO/bin/agenthalo"
+else
+  echo "==> building Go backend"
+  BUILD_COMMIT="$(git -C "$REPO_AGENTHALO" rev-parse --short HEAD 2>/dev/null || echo dev)"
+  BUILD_AT="$(TZ=Asia/Shanghai date +%Y-%m-%dT%H:%M:%S+08:00)"
+  BUILDINFO_PKG="github.com/psyche08/remote-agent/internal/buildinfo"
+  ( cd "$REPO_AGENTHALO" && GOCACHE="${GOCACHE:-/private/tmp/agenthalo-gocache}" "$GO" build -trimpath \
+    -ldflags "-X ${BUILDINFO_PKG}.Version=AgentHalo.${MODULE_VERSION} -X ${BUILDINFO_PKG}.Commit=${BUILD_COMMIT} -X ${BUILDINFO_PKG}.BuiltAt=${BUILD_AT}" \
+    -o bin/agenthalo ./cmd/agenthalo )
+  echo "==> built $REPO_AGENTHALO/bin/agenthalo"
+  if [ "$PLATFORM" = "Darwin" ]; then
+    "$CODESIGN" --force --identifier "$EXPECTED_IDENTIFIER" --options runtime --timestamp \
+      --sign "$SIGN_IDENTITY" "$REPO_AGENTHALO/bin/agenthalo"
+  fi
+fi
+if [ "$PLATFORM" = "Darwin" ]; then
+  verify_agenthalo_signature "$REPO_AGENTHALO/bin/agenthalo"
+  echo "==> verified AgentHalo signature identifier=$EXPECTED_IDENTIFIER team=$EXPECTED_TEAM_ID"
+fi
 
-path = os.environ["CFG"]
-with open(path) as f:
-    data = json.load(f)
-if data.get("uds") in (None, "", os.environ["LEGACY_UDS"]):
-    data["uds"] = os.environ["UDS"]
-if data.get("state_dir") in (None, "", os.environ["LEGACY_STATE_DIR"]):
-    data["state_dir"] = os.environ["STATE_DIR"]
-claude = data.get("providers", {}).get("claude", {})
-if claude.get("turnstate_dir") in (None, "", "~/.claude/remote-coding-turnstate"):
-    claude["turnstate_dir"] = "~/.claude/remote-agent-turnstate"
-with open(path, "w") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
-    f.write("\n")
-PYEOF
+# Install an immutable runtime copy. Active supervisor drop-ins must never
+# reference a Git checkout or a temporary deployment worktree.
+ensure_runtime_dir "$LIBEXEC_DIR"
+install -m 0755 "$REPO_AGENTHALO/bin/agenthalo" "$RUNTIME_BIN.new"
+mv -f "$RUNTIME_BIN.new" "$RUNTIME_BIN"
+echo "==> installed runtime binary $RUNTIME_BIN"
+
+# The native Swift workers are looked up relative to the service's cwd, which is
+# $LIBEXEC_DIR. Install them alongside the binary so the OCR worker resolves at
+# runtime instead of silently reporting "not available".
+if [ -d "$REPO_AGENTHALO/scripts" ]; then
+  ensure_runtime_dir "$LIBEXEC_DIR/scripts"
+  for f in "$REPO_AGENTHALO/scripts/"*.swift; do
+    [ -f "$f" ] || continue
+    install -m 0755 "$f" "$LIBEXEC_DIR/scripts/$(basename "$f")"
+  done
+  echo "==> installed native workers into $LIBEXEC_DIR/scripts"
+fi
+
+# 2) Create the fresh AgentHalo state tree. Removing any previous product is an
+# explicit operator step; this installer never imports or aliases old state.
+"$SUPERVISOR" stop agenthalo-log-upload >/dev/null 2>&1 || true
+"$SUPERVISOR" stop agenthalo >/dev/null 2>&1 || true
+mkdir -p "$STATE_DIR/sockets" "$STATE_DIR/data" "$STATE_DIR/screenshots"
+chmod 700 "$STATE_DIR" "$STATE_DIR/sockets" 2>/dev/null || true
+
+# 3) config.json was validated before any installed runtime was changed. ------
+
+# The computer-use desktop helper is a separate resident process, not a worker
+# script: it owns the display shield as windows it holds, so it has to live in
+# the user's GUI session. It travels inside the agent binary and is written out
+# here, after config.json exists and before the LaunchAgent is registered — the
+# registration validates both paths.
+#
+# Installing the helper does not enable anything. Computer use still requires
+# config.json, and Locked Use additionally requires the separately installed
+# authorization plug-in (see docs/computer-use-locked-user.md).
+if [ "$(uname -s)" = "Darwin" ]; then
+  if DESKTOP_HELPER="$("$RUNTIME_BIN" desktop install 2>/dev/null)"; then
+    echo "==> installed desktop helper $DESKTOP_HELPER"
+    if [ -x "$REPO_AGENTHALO/mac/launchagent/install.sh" ] && [ "$(id -u)" != "0" ]; then
+      DESKTOP_TARGET="gui/$(id -u)/dev.linsheng.agenthalo.desktop"
+      if launchctl print "$DESKTOP_TARGET" >/dev/null 2>&1; then
+        # Do not let the installer bootout a live helper: bootout does not
+        # prove that its shield/relock cleanup completed. The agent startup
+        # path performs the atomic prepare_restart handshake before kickstart.
+        echo "==> AgentHalo desktop LaunchAgent already loaded; deferring its safe restart to AgentHalo startup"
+      else
+        if ! bash "$REPO_AGENTHALO/mac/launchagent/install.sh" \
+          --config "$CFG" --helper "$DESKTOP_HELPER"; then
+          echo "AgentHalo desktop LaunchAgent failed its startup readiness check" >&2
+          exit 1
+        fi
+      fi
+    else
+      echo "==> NOTE: run mac/launchagent/install.sh --config $CFG as the logged-in user"
+      echo "    to start the desktop helper; a LaunchAgent belongs to a user session."
+    fi
+  else
+    echo "==> no embedded desktop helper in this build; computer use will report unavailable"
+  fi
+fi
 
 # 4) socket dir --------------------------------------------------------------
 mkdir -p "$(dirname "$UDS")"
 
 # 5) supervisor drop-in (NEVER touches services.yaml) ------------------------
-mkdir -p "$BIN_DIR" "$ETC_DIR/services.d"
-rm -f \
-  "$BIN_DIR/remote-coding-watchdog" \
-  "$BIN_DIR/remote-agent-watchdog" \
-  "$ETC_DIR/services.d/remote-coding-watchdog.yaml" \
-  "$ETC_DIR/services.d/remote-agent-watchdog.yaml"
-echo "==> removed legacy external remote-agent watchdog; internal watchdog runs in the agent"
-
-DROPIN="$ETC_DIR/services.d/remote-agent.yaml"
-LEGACY_DROPIN="$ETC_DIR/services.d/remote-coding.yaml"
-LEGACY_DROPIN_BACKUP="$LEGACY_DROPIN.remote-agent-migration"
-if [ -f "$LEGACY_DROPIN" ] && [ ! -f "$LEGACY_DROPIN_BACKUP" ]; then
-  cp -p "$LEGACY_DROPIN" "$LEGACY_DROPIN_BACKUP"
-fi
-LOG_SOURCE="$HOME/Library/Logs/private-services/remote-agent.log"
+mkdir -p "$ETC_DIR/services.d"
+DROPIN="$ETC_DIR/services.d/agenthalo.yaml"
+LOG_SOURCE="$HOME/Library/Logs/private-services/agenthalo.log"
 LOG_STATE="$STATE_DIR/data/log-upload-state.json"
 infer_log_user() {
   local f base rest
@@ -340,11 +384,11 @@ if [ -z "$LOG_CERT_DIR" ]; then
   fi
 fi
 {
-  echo "# Managed by remote-agent/deploy/install.sh — registers the AI desktop"
+  echo "# Managed by AgentHalo deploy/install.sh — registers the AI desktop"
   echo "# agent with the private-services supervisor via a drop-in, so the shared"
   echo "# services.yaml is never edited. Re-run install.sh to regenerate."
   echo "services:"
-  echo "  remote-agent:"
+  echo "  agenthalo:"
   echo "    cmd:"
   echo "      - $RUNTIME_BIN"
   echo "      - --config"
@@ -353,18 +397,18 @@ fi
   if [ -n "$UPDATE_RELAY_URL" ] || [ -n "$UPDATE_CERT_DIR" ]; then
     echo "    env:"
     if [ -n "$UPDATE_RELAY_URL" ]; then
-      printf "      RC_UPDATE_RELAY_URL: "
+      printf "      AGENTHALO_UPDATE_RELAY_URL: "
       yaml_quote "$UPDATE_RELAY_URL"
       printf "\n"
     fi
     if [ -n "$UPDATE_CERT_DIR" ]; then
-      printf "      RC_UPDATE_CERT_DIR: "
+      printf "      AGENTHALO_UPDATE_CERT_DIR: "
       yaml_quote "$UPDATE_CERT_DIR"
       printf "\n"
     fi
   fi
   if [ "$LOG_UPLOAD" = "1" ]; then
-    echo "  remote-agent-log-upload:"
+    echo "  agenthalo-log-upload:"
     echo "    cmd:"
     echo "      - $RUNTIME_BIN"
     echo "      - logs"
@@ -393,33 +437,33 @@ fi
   fi
 } > "$DROPIN"
 echo "==> wrote drop-in $DROPIN"
-rm -f "$LEGACY_DROPIN"
-echo "==> retired legacy drop-in $LEGACY_DROPIN"
 
-# 5b) turn-state hook —— 让 claude 接管能判断会话 turn 是否结束(幂等) --------
-RA_TURNSTATE_DIR="${RA_TURNSTATE_DIR:-${RC_TURNSTATE_DIR:-$HOME/.claude/remote-agent-turnstate}}"
-mkdir -p "$RA_TURNSTATE_DIR"
-if [ "${RA_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
-  ( cd "$LIBEXEC_DIR" && "$RUNTIME_BIN" hook install-turnstate --binary "$RUNTIME_BIN" --turnstate-dir "$RA_TURNSTATE_DIR" ) \
-    && echo "==> installed turn-state hooks (RA_TURNSTATE_DIR=$RA_TURNSTATE_DIR)"
+# 5b) Claude lifecycle + native interaction observer hooks (idempotent) -----
+AGENTHALO_TURNSTATE_DIR="${AGENTHALO_TURNSTATE_DIR:-$HOME/.claude/agenthalo-turnstate}"
+AGENTHALO_INTERACTION_DIR="${AGENTHALO_INTERACTION_DIR:-$HOME/.claude/agenthalo-interactions}"
+install -d -m 0700 "$AGENTHALO_TURNSTATE_DIR" "$AGENTHALO_INTERACTION_DIR"
+if [ "${AGENTHALO_SKIP_HOOK_INSTALL:-0}" != "1" ]; then
+  ( cd "$LIBEXEC_DIR" && "$RUNTIME_BIN" hook install-turnstate --binary "$RUNTIME_BIN" \
+      --turnstate-dir "$AGENTHALO_TURNSTATE_DIR" --interaction-dir "$AGENTHALO_INTERACTION_DIR" ) \
+    && echo "==> installed Claude hooks (turnstate=$AGENTHALO_TURNSTATE_DIR interactions=$AGENTHALO_INTERACTION_DIR)"
 fi
 
-# 6) reload supervisor + restart remote-agent (never the container agent) ----
+# 6) reload supervisor + start agenthalo (never the container agent) ----------
 if [ -x "$SUPERVISOR" ]; then
   start_ok=1
   "$SUPERVISOR" reload-config >/dev/null 2>&1 || start_ok=0
   # reload-config auto-starts newly added always-on services. `start` is
   # idempotent for that case and also starts an unchanged stopped service;
   # `restart` here would kill the just-spawned process and introduce a
-  # backoff/health-check race during identity migration.
-  "$SUPERVISOR" start remote-agent >/dev/null 2>&1 || start_ok=0
-  if [ "$LOG_UPLOAD" = "1" ]; then
-    "$SUPERVISOR" start remote-agent-log-upload >/dev/null 2>&1 || start_ok=0
-  fi
-  echo "==> supervisor reloaded + remote-agent (re)started"
+	# backoff/health-check race during deployment.
+	"$SUPERVISOR" start agenthalo >/dev/null 2>&1 || start_ok=0
+	if [ "$LOG_UPLOAD" = "1" ]; then
+	  "$SUPERVISOR" start agenthalo-log-upload >/dev/null 2>&1 || start_ok=0
+	fi
+	echo "==> supervisor reloaded + AgentHalo services started"
   if [ "$start_ok" != "1" ]; then
     ready=0
-  elif [ "${RA_SKIP_HEALTH_CHECK:-0}" != "1" ] && command -v curl >/dev/null 2>&1; then
+  elif [ "${AGENTHALO_SKIP_HEALTH_CHECK:-0}" != "1" ] && command -v curl >/dev/null 2>&1; then
     ready=0
     for _ in 1 2 3 4 5 6 7 8 9 10; do
       if curl --silent --fail --unix-socket "$UDS" http://localhost/healthz >/dev/null; then
@@ -432,22 +476,18 @@ if [ -x "$SUPERVISOR" ]; then
     ready=1
   fi
   if [ "$ready" != "1" ]; then
-    echo "remote-agent health check failed: $UDS; restoring legacy service" >&2
-    rm -f "$DROPIN"
-    if [ -f "$LEGACY_DROPIN_BACKUP" ]; then
-      cp -p "$LEGACY_DROPIN_BACKUP" "$LEGACY_DROPIN"
-      "$SUPERVISOR" reload-config >/dev/null 2>&1 || true
-      "$SUPERVISOR" restart remote-coding >/dev/null 2>&1 || "$SUPERVISOR" start remote-coding >/dev/null 2>&1 || true
-    fi
-    exit 1
+	  echo "AgentHalo health check failed: $UDS; removing the failed fresh-install drop-in" >&2
+	  rm -f "$DROPIN"
+	  "$SUPERVISOR" reload-config >/dev/null 2>&1 || true
+	  exit 1
   fi
 else
-  echo "==> NOTE: supervisor not found at $SUPERVISOR; start remote-agent manually"
+  echo "==> NOTE: supervisor not found at $SUPERVISOR; start $RUNTIME_BIN manually"
 fi
 
 mkdir -p "$(dirname "$VERSION_STATE")"
 printf '%s\n' "$MODULE_VERSION" >"$VERSION_STATE.tmp"
 mv "$VERSION_STATE.tmp" "$VERSION_STATE"
 
-echo "==> done. version=remote-agent.$MODULE_VERSION UI: https://<user>-relay.<domain>/s/remotecoding/d/$DEVICE_ID/"
+echo "==> done. version=AgentHalo.$MODULE_VERSION UI: https://<user>-relay.<domain>/s/agenthalo/d/$DEVICE_ID/"
 exit 0

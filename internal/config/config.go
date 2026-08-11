@@ -31,14 +31,25 @@ type ComputerUseConfig struct {
 	// Enabled turns on the computer-use action surface (screenshot/click/type/
 	// key/move/scroll). When false, /computer_use/action returns not_enabled.
 	Enabled bool `json:"enabled"`
+	// DebugHTTPActions permits the public HTTP window-open/action/AX routes
+	// while Locked Use is configured. It is deliberately off by default: the
+	// normal locked-screen boundary is the in-process model tool broker, which
+	// binds calls to an authoritative provider turn without trusting HTTP input.
+	// Window close and runtime deactivation remain available regardless because
+	// they can only remove authority and relock the device.
+	DebugHTTPActions bool `json:"debug_http_actions"`
+	// HelperRefreshFailed is process-local startup state, never device config.
+	// It keeps legacy on-disk capture closed when an old helper could not be
+	// safely reconciled/restarted, including during a true -> false deployment.
+	HelperRefreshFailed bool `json:"-"`
 	// LockedUse participates in the macOS unlock flow so an authorized turn can
 	// drive the desktop after the screen locks. It requires Enabled and the
 	// separately installed Apple Authorization Plug-in.
 	LockedUse LockedUseConfig `json:"locked_use"`
-	// HelperSocket is where remote-agent-desktop listens. The helper owns the
+	// HelperSocket is where agenthalo-desktop listens. The helper owns the
 	// desktop surface and the whole Locked Use state machine; this process only
 	// forwards to it. Defaults to
-	// ~/Library/Application Support/remote-agent/desktop.sock.
+	// ~/Library/Application Support/AgentHalo/desktop.sock.
 	//
 	// Note that the helper reads this same config file for its own settings.
 	// Nothing about the feature is configured over the socket: Locked Use lets
@@ -57,11 +68,6 @@ type LockedUseConfig struct {
 	// GrantDir is where the controller writes signed unlock grants for the
 	// Authorization Plug-in to read. Defaults to <state_dir>/data/locked-use.
 	GrantDir string `json:"grant_dir"`
-	// SigningKeyPath is the ECDSA P-256 private key the controller signs grants
-	// with, stored as base64 PKCS#8. Defaults to
-	// <state_dir>/data/locked-use/signing.key (0600). The plugin is provisioned
-	// with only the matching public key.
-	SigningKeyPath string `json:"signing_key_path"`
 	// GrantTTLSeconds bounds how long a single signed grant is valid. A grant
 	// is minted just before an unlock attempt and consumed by it, so this is
 	// deliberately tiny: a grant that lingers on disk is ambient authorization
@@ -78,8 +84,11 @@ type LockedUseConfig struct {
 	// into a window where a present human types unnoticed.
 	// Clamped to [100, 5000]; default 250.
 	InputRelockGraceMs int `json:"input_relock_grace_ms"`
-	// RequireDisplayShield, when true (the default), refuses to open a window
-	// unless the privacy shield covering the screen engages first.
+	// RequireDisplayShield refuses to open a window unless the privacy shield
+	// covering the screen engages first. Locked Use always normalizes this to
+	// true: the same shield lifecycle also owns the physical-input guard, so an
+	// opt-out would disable two hard boundaries rather than only visual privacy.
+	// A false value is retained only while Locked Use itself is disabled.
 	RequireDisplayShield *bool `json:"require_display_shield"`
 }
 
@@ -157,11 +166,11 @@ const (
 	MaxGrantTTLSeconds = 15
 )
 
-// DefaultHelperSocket is where remote-agent-desktop listens unless config says
+// DefaultHelperSocket is where agenthalo-desktop listens unless config says
 // otherwise. It is under the user's own Application Support directory because
 // the helper runs in the user's GUI session — the only place a process can hold
 // the display shield and post synthetic input.
-const DefaultHelperSocket = "~/Library/Application Support/remote-agent/desktop.sock"
+const DefaultHelperSocket = "~/Library/Application Support/AgentHalo/desktop.sock"
 
 func applyComputerUseDefaults(cu *ComputerUseConfig) {
 	if cu.HelperSocket == "" {
@@ -178,6 +187,12 @@ func applyComputerUseDefaults(cu *ComputerUseConfig) {
 	// Locked Use extends computer use; it can never be the only thing enabled.
 	if !cu.Enabled {
 		lu.Enabled = false
+	}
+	if lu.Enabled {
+		// Shield engagement and physical-input isolation share one lifecycle in
+		// the helper. Locked Use cannot safely opt out of either half.
+		shield := true
+		lu.RequireDisplayShield = &shield
 	}
 	// A grant TTL at or above the window ceiling would let one minted grant
 	// outlive the window it was issued for.

@@ -12,14 +12,14 @@ import (
 )
 
 func (s *Server) watchdogLoop() {
-	if os.Getenv("RC_INTERNAL_WATCHDOG") == "0" {
+	if os.Getenv("AGENTHALO_INTERNAL_WATCHDOG") == "0" {
 		return
 	}
-	interval := durationEnv("RC_WATCHDOG_INTERVAL", 30*time.Second)
-	timeout := durationEnv("RC_WATCHDOG_TIMEOUT", 5*time.Second)
-	grace := durationEnv("RC_WATCHDOG_GRACE", 15*time.Second)
-	maxFailures := intEnv("RC_WATCHDOG_MAX_FAILURES", 2)
-	exitCode := intEnv("RC_WATCHDOG_EXIT_CODE", 70)
+	interval := durationEnv("AGENTHALO_WATCHDOG_INTERVAL", 30*time.Second)
+	timeout := durationEnv("AGENTHALO_WATCHDOG_TIMEOUT", 5*time.Second)
+	grace := durationEnv("AGENTHALO_WATCHDOG_GRACE", 15*time.Second)
+	maxFailures := intEnv("AGENTHALO_WATCHDOG_MAX_FAILURES", 2)
+	exitCode := intEnv("AGENTHALO_WATCHDOG_EXIT_CODE", 70)
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
@@ -43,14 +43,14 @@ func (s *Server) watchdogLoop() {
 		case <-timer.C:
 			if err := s.selfHealthCheck(timeout); err != nil {
 				failures++
-				fmt.Fprintf(os.Stderr, "remote-agent internal watchdog: health failed failures=%d err=%v\n", failures, err)
+				fmt.Fprintf(os.Stderr, "AgentHalo internal watchdog: health failed failures=%d err=%v\n", failures, err)
 				if failures >= maxFailures {
-					fmt.Fprintf(os.Stderr, "remote-agent internal watchdog: exiting for supervisor restart code=%d\n", exitCode)
+					fmt.Fprintf(os.Stderr, "AgentHalo internal watchdog: exiting for supervisor restart code=%d\n", exitCode)
 					os.Exit(exitCode)
 				}
 			} else if failures != 0 {
 				failures = 0
-				fmt.Fprintln(os.Stderr, "remote-agent internal watchdog: recovered")
+				fmt.Fprintln(os.Stderr, "AgentHalo internal watchdog: recovered")
 			}
 			timer.Reset(interval)
 		}
@@ -80,7 +80,7 @@ func (s *Server) selfHealthCheck(timeout time.Duration) error {
 	if err != nil {
 		return err
 	}
-	req.Header.Set("X-Remote-Agent-Client-Kind", "watchdog")
+	req.Header.Set("X-AgentHalo-Client-Kind", "watchdog")
 	resp, err := client.Do(req)
 	if err != nil {
 		return err

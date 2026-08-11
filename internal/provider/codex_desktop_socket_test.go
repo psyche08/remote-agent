@@ -1,12 +1,44 @@
 package provider
 
 import (
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestCodexDesktopIPCUsesAgentHaloClientInfoWithCompatibleClientType(t *testing.T) {
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+	defer serverConn.Close()
+	done := make(chan error, 1)
+	go func() {
+		frame, err := readDesktopFrame(serverConn)
+		if err != nil {
+			done <- err
+			return
+		}
+		params := mapAny(frame["params"])
+		info := mapAny(params["clientInfo"])
+		if params["clientType"] != "agenthalo" || info["name"] != "AgentHalo" || info["title"] != "AgentHalo" {
+			done <- fmt.Errorf("Desktop initialize identity=%#v", params)
+			return
+		}
+		done <- writeDesktopFrame(serverConn, map[string]any{
+			"type": "response", "requestId": frame["requestId"], "resultType": "success",
+			"method": "initialize", "result": map[string]any{"clientId": "agenthalo-test"},
+		})
+	}()
+	client := NewCodexDesktopIPCClient("", time.Second, "local")
+	if err := client.initialize(clientConn, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
 
 func TestCodexDesktopSocketCandidatesPreferModernRouter(t *testing.T) {
 	codexHome := t.TempDir()
@@ -78,8 +110,8 @@ func TestDialCodexDesktopSocketReportsMissingRouter(t *testing.T) {
 }
 
 func TestLiveCodexDesktopSocketHandshake(t *testing.T) {
-	if os.Getenv("RC_TEST_CODEX_DESKTOP_IPC") != "1" {
-		t.Skip("set RC_TEST_CODEX_DESKTOP_IPC=1 for a local Desktop router check")
+	if os.Getenv("AGENTHALO_TEST_CODEX_DESKTOP_IPC") != "1" {
+		t.Skip("set AGENTHALO_TEST_CODEX_DESKTOP_IPC=1 for a local Desktop router check")
 	}
 	client := NewCodexDesktopIPCClient("", 3*time.Second, "local")
 	conn, err := client.connect(3 * time.Second)
@@ -92,7 +124,7 @@ func TestLiveCodexDesktopSocketHandshake(t *testing.T) {
 	}
 	_ = conn.Close()
 
-	target := os.Getenv("RC_TEST_CODEX_DESKTOP_THREAD")
+	target := os.Getenv("AGENTHALO_TEST_CODEX_DESKTOP_THREAD")
 	if target == "" {
 		return
 	}

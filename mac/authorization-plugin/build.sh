@@ -7,18 +7,19 @@
 #
 # Signing is not optional. macOS loads authorization plug-ins from a
 # root-owned directory, and an unsigned bundle there is exactly the kind of
-# thing this feature must not normalize. Set RA_PLUGIN_SIGN_IDENTITY to a
+# thing this feature must not normalize. Set AGENTHALO_PLUGIN_SIGN_IDENTITY to a
 # Developer ID Application identity.
 #
 # Usage:
-#   RA_PLUGIN_SIGN_IDENTITY="Developer ID Application: ..." ./build.sh
+#   AGENTHALO_PLUGIN_SIGN_IDENTITY="Developer ID Application: ..." ./build.sh
 #   ./build.sh --adhoc      # local development only; see the warning below
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BUILD_DIR="${RA_PLUGIN_BUILD_DIR:-$HERE/build}"
-BUNDLE_NAME="RemoteAgentLockedUse.bundle"
+BUILD_DIR="${AGENTHALO_PLUGIN_BUILD_DIR:-$HERE/build}"
+BUNDLE_NAME="AgentHaloLockedUse.bundle"
 BUNDLE="$BUILD_DIR/$BUNDLE_NAME"
+SIGNING_IDENTIFIER="dev.linsheng.agenthalo.locked-use.plugin"
 ADHOC=0
 
 for arg in "$@"; do
@@ -45,8 +46,8 @@ clang -bundle \
   -arch arm64 -arch x86_64 \
   -framework Foundation \
   -framework Security \
-  -o "$BUNDLE/Contents/MacOS/RemoteAgentLockedUse" \
-  "$HERE/RemoteAgentLockedUse.m"
+  -o "$BUNDLE/Contents/MacOS/AgentHaloLockedUse" \
+  "$HERE/AgentHaloLockedUse.m"
 
 echo "==> signing"
 if [ "$ADHOC" = "1" ]; then
@@ -54,14 +55,15 @@ if [ "$ADHOC" = "1" ]; then
   # It provides no authorship guarantee: anything that can write the plug-in
   # directory could replace this bundle with another ad-hoc one.
   echo "    WARNING: ad-hoc signature — development only, do not deploy"
-  codesign --force --sign - --timestamp=none "$BUNDLE"
+  codesign --force --identifier "$SIGNING_IDENTIFIER" --sign - --timestamp=none "$BUNDLE"
 else
-  IDENTITY="${RA_PLUGIN_SIGN_IDENTITY:-}"
+  IDENTITY="${AGENTHALO_PLUGIN_SIGN_IDENTITY:-}"
   if [ -z "$IDENTITY" ]; then
-    echo "RA_PLUGIN_SIGN_IDENTITY is required (or pass --adhoc for local dev)" >&2
+    echo "AGENTHALO_PLUGIN_SIGN_IDENTITY is required (or pass --adhoc for local dev)" >&2
     exit 2
   fi
-  codesign --force --options runtime --timestamp --sign "$IDENTITY" "$BUNDLE"
+  codesign --force --identifier "$SIGNING_IDENTIFIER" --options runtime --timestamp \
+    --sign "$IDENTITY" "$BUNDLE"
 fi
 
 codesign --verify --strict --verbose=2 "$BUNDLE"

@@ -1,4 +1,4 @@
-# Private-tunnel integration for the AI Desktop Remote Agent.
+# Private-tunnel integration for AgentHalo.
 #
 # The agent listens on a local Unix domain socket by default (never a public
 # port). To reach it from an iPhone, use a private-tunnel-compatible reverse
@@ -14,7 +14,7 @@
 users:
   example-user:                    # your private-tunnel user
     services:
-      remotecoding:                # service name must match [a-z0-9]+ (no hyphen)
+      agenthalo:                   # service name must match [a-z0-9]+ (no hyphen)
         port: 8765                 # relay route id; agent maps it to unix_targets
         default_device: mac-studio-01   # == this Mac's device id / agent cert device
         push:
@@ -22,7 +22,7 @@ users:
 
 # ---------------------------------------------------------------------------
 # 2) The edge/container profile maps route port 8765 through its private host
-#    gateway to the host remote-agent UDS adapter.
+#    gateway to the host AgentHalo UDS adapter.
 # ---------------------------------------------------------------------------
 # allowed_ports: [8765]
 # tcp_targets:
@@ -34,9 +34,9 @@ users:
 # ---------------------------------------------------------------------------
 # Reach it from the phone (mTLS client cert installed in the browser):
 #   single-device (default_device set):
-#     https://example-user-relay.example.com/s/remotecoding/
+#     https://example-user-relay.example.com/s/agenthalo/
 #   explicit device form (many Macs under one service):
-#     https://example-user-relay.example.com/s/remotecoding/d/<device>/
+#     https://example-user-relay.example.com/s/agenthalo/d/<device>/
 #
 # Security layering: mTLS (network identity, private CA) + local Unix socket
 # filesystem permissions. The Go agent does not require an app-layer bearer token.

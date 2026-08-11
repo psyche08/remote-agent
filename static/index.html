@@ -8,7 +8,7 @@
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black" />
   <link rel="apple-touch-icon" href="icon-192.png" />
-  <title>Remote Agent</title>
+  <title>AgentHalo</title>
   <style>
     :root {
       --bg:#0d0d0f; --panel:#161619; --panel2:#1c1c21; --inset:#0a0a0c;
@@ -486,7 +486,7 @@
     <!-- SIDEBAR -->
     <aside id="sidebar">
       <div class="side-head">
-        <div class="brand"><span class="mk">◆</span> Remote Agent</div>
+        <div class="brand"><span class="mk">◆</span> AgentHalo</div>
         <button class="icon" id="push-btn" title="开启审批通知" onclick="togglePush()">🔕</button>
         <button class="icon" title="Settings" onclick="toggleSheet('settings',true)">⚙</button>
       </div>
@@ -736,7 +736,7 @@
   </script>
   <script>
     const $ = (id) => document.getElementById(id);
-    const APP_STATIC_VERSION = "__REMOTE_AGENT_STATIC_VERSION__";
+    const APP_STATIC_VERSION = "__AGENTHALO_STATIC_VERSION__";
     let NATIVE = [];
     let LIVE_SESSIONS = [];   // currently-driven sessions (device-wide, from /live_sessions)
     let SESSION_REFRESH_META = { source: "", refreshed_at: "", refreshing: false, refresh_error: "", device_time: null };
@@ -750,7 +750,7 @@
     let BACKEND_VERSION = null;
     let AGENT_UPDATE_STATE = null;
     // ---- multi-device routing ----
-    // SERVICE_ROOT = the relay service path (e.g. "/s/remotecoding/"); a peer
+    // SERVICE_ROOT = the relay service path (e.g. "/s/agenthalo/"); a peer
     // device is reached at <root>d/<id>/. Locally it's just the page directory.
     const SERVICE_ROOT = (() => {
       const m = location.pathname.match(/^(.*\/s\/[^/]+\/)/);
@@ -773,9 +773,9 @@
     function stateBootstrapHeaders() {
       return {
         "Content-Type": "application/json",
-        "X-Remote-Agent-Web-Version": staticVersion(),
-        "X-Remote-Agent-Client-Kind": "web-bootstrap",
-        "X-Remote-Agent-Client-Visibility": document.visibilityState || "",
+        "X-AgentHalo-Web-Version": staticVersion(),
+        "X-AgentHalo-Client-Kind": "web-bootstrap",
+        "X-AgentHalo-Client-Visibility": document.visibilityState || "",
       };
     }
     function cleanStateID(v) {
@@ -791,7 +791,7 @@
       return m ? cleanStateID(m[1]) : "";
     }
     function makeStateScope(user) {
-      return "remote-agent:v2:" + cleanStateID(user || "ephemeral") + ":" + serviceIDForState();
+      return "agenthalo:v2:" + cleanStateID(user || "ephemeral") + ":" + serviceIDForState();
     }
     function stateKey(key) {
       return STATE_SCOPE + ":" + key;
@@ -812,7 +812,7 @@
       STATE_MEMORY.set(key, v);
     }
     function stateSessionKey(key) {
-      return (STATE_SCOPE || "remote-agent:v2:ephemeral:" + serviceIDForState()) + ":" + key;
+      return (STATE_SCOPE || "agenthalo:v2:ephemeral:" + serviceIDForState()) + ":" + key;
     }
     function applyStateScope(user, persistent) {
       STATE_USER = cleanStateID(user || "");
@@ -820,9 +820,9 @@
       STATE_PERSISTENT = !!(persistent && STATE_USER);
       STATE_READY = true;
       WEB_CLIENT_ID_CACHE = "";
-      CUR_DEVICE = stateGet("rc_device") || "";
-      CUR_PROVIDER = stateGet("rc_provider") || "";
-      RAW_MD = stateGet("rc_raw_md") === "1";
+      CUR_DEVICE = stateGet("agenthalo_device") || "";
+      CUR_PROVIDER = stateGet("agenthalo_provider") || "";
+      RAW_MD = stateGet("agenthalo_raw_md") === "1";
       if (_urlDev) CUR_DEVICE = _urlDev[1];   // device pinned in the URL wins
     }
     async function initStateScope() {
@@ -851,7 +851,7 @@
     function setBrowseProvider(providerId) {
       if (!providerId) return;
       CUR_PROVIDER = providerId;
-      stateSet("rc_provider", providerId);
+      stateSet("agenthalo_provider", providerId);
       const sel = $("provider-select");
       if (sel) sel.value = providerId;
       const chips = $("provider-chips");
@@ -868,9 +868,9 @@
     }
     function rememberShellDevice(id, providerId, activateSession) {
       if (!id) return;
-      try { localStorage.setItem("remote-agent-shell-device", id); } catch (e) {}
+      try { localStorage.setItem("agenthalo-shell-device", id); } catch (e) {}
       if (window.parent !== window) {
-        window.parent.postMessage({ type: "remote-agent-device-selected", device: id, provider: providerId || "",
+        window.parent.postMessage({ type: "agenthalo-device-selected", device: id, provider: providerId || "",
           activate_session: !!activateSession }, location.origin);
       }
     }
@@ -879,7 +879,7 @@
       // not the active tab — open a session from the list to get a tab on it.
       if (!id || id === CUR_DEVICE) return;
       clearActiveTabForBrowseSwitch();
-      CUR_DEVICE = id; stateSet("rc_device", id);
+      CUR_DEVICE = id; stateSet("agenthalo_device", id);
       rememberShellDevice(id, CUR_PROVIDER);
       renderDevices();
       refreshProviders();   // provider refresh owns the matching session-list refresh
@@ -907,7 +907,7 @@
           const connected = (Array.isArray(list) ? list : []).filter(d => d && d.device);
           // /_pt/devices is user-wide and can include machines (for example
           // SSH-only relays) that do not expose this service. Only show
-          // devices whose remote-agent health endpoint is actually routed.
+          // devices whose AgentHalo health endpoint is actually routed.
           const healthy = (await Promise.all(connected.map(async entry => {
             const controller = new AbortController();
             const timer = setTimeout(() => controller.abort(), 4000);
@@ -934,7 +934,7 @@
             // device when available and otherwise the most recently connected.
             if (initial || CUR_DEVICE_MISSES >= 2) {
               const urlDevice = _urlDev && _urlDev[1];
-              const pinned = stateGet("rc_device");
+              const pinned = stateGet("agenthalo_device");
               nextDevice = (DEVICES.includes(urlDevice) ? urlDevice : "")
                 || (DEVICES.includes(pinned) ? pinned : "")
                 || mostRecentlyConnected(healthy) || CUR_DEVICE;
@@ -946,7 +946,7 @@
           if (selectionChanged) {
             if (!initial) clearActiveTabForBrowseSwitch();
             CUR_DEVICE = nextDevice;
-            stateSet("rc_device", nextDevice);
+            stateSet("agenthalo_device", nextDevice);
             rememberShellDevice(nextDevice, CUR_PROVIDER);
           }
           if (listChanged || selectionChanged) renderDevices();
@@ -984,7 +984,7 @@
     let WEB_CLIENT_ID_CACHE = "";
     function webClientID() {
       if (WEB_CLIENT_ID_CACHE) return WEB_CLIENT_ID_CACHE;
-      const key = "rc-web-client-id";
+      const key = "agenthalo-web-client-id";
       try {
         let id = stateGet(key);
         if (!id) {
@@ -1003,10 +1003,10 @@
     function headers(extra = {}) {
       return {
         "Content-Type": "application/json",
-        "X-Remote-Agent-Web-Version": staticVersion(),
-        "X-Remote-Agent-Client-Id": webClientID(),
-        "X-Remote-Agent-Client-Kind": "web",
-        "X-Remote-Agent-Client-Visibility": document.visibilityState || "",
+        "X-AgentHalo-Web-Version": staticVersion(),
+        "X-AgentHalo-Client-Id": webClientID(),
+        "X-AgentHalo-Client-Kind": "web",
+        "X-AgentHalo-Client-Visibility": document.visibilityState || "",
         ...extra,
       };
     }
@@ -1255,7 +1255,7 @@
     /* ---- providers ---- */
     function hiddenProviderIDs() {
       try {
-        const rows = JSON.parse(stateGet("rc_hidden_providers") || "[]");
+        const rows = JSON.parse(stateGet("agenthalo_hidden_providers") || "[]");
         return new Set(Array.isArray(rows) ? rows.map(String) : []);
       } catch (e) { return new Set(); }
     }
@@ -1281,7 +1281,7 @@
       const hidden = hiddenProviderIDs();
       if (visible) hidden.delete(id); else hidden.add(id);
       if (PROVIDERS_META.every(p => hidden.has(p.provider_id))) { alert("至少保留一个 provider"); renderProviderVisibility(); return; }
-      stateSet("rc_hidden_providers", JSON.stringify([...hidden].sort()));
+      stateSet("agenthalo_hidden_providers", JSON.stringify([...hidden].sort()));
       refreshProviders();
     }
     async function refreshProviders(options = {}) {
@@ -1758,7 +1758,7 @@
     let RAW_MD = false;
     function renderText(t) { return RAW_MD ? `<pre class="raw">${esc(t)}</pre>` : `<div class="md">${renderMd(t)}</div>`; }
     function toggleRawMd() {
-      RAW_MD = !RAW_MD; stateSet("rc_raw_md", RAW_MD ? "1" : "0");
+      RAW_MD = !RAW_MD; stateSet("agenthalo_raw_md", RAW_MD ? "1" : "0");
       if (LIVE && window.__chat) showChat(window.__chat.messages, window.__chat.title, window.__chat.total, window.__chat.offset, LIVE, { stick: nearBottom() });
     }
     function mdInline(s) {  // s is already HTML-escaped
@@ -1973,7 +1973,7 @@
     async function buildMermaidHost(source) {
       const lib = await loadMermaid();
       initializeMermaid(lib);
-      const id = "remote-agent-mermaid-" + (++MERMAID_SEQUENCE);
+      const id = "agenthalo-mermaid-" + (++MERMAID_SEQUENCE);
       const rendered = await lib.render(id, source);
       const safe = sanitizeMermaidSVG(rendered && rendered.svg);
       const host = document.createElement("div");
@@ -2107,11 +2107,12 @@
     function tabKey(t) { return (t.device || "") + "|" + (t.provider || "") + "|" + (t.tid || t.sessionId || ""); }
     function persistTabs() {
       try {
-        stateSet("rc_tabs", JSON.stringify(TABS.map(t => ({
+        stateSet("agenthalo_tabs", JSON.stringify(TABS.map(t => ({
           provider: t.provider, device: t.device, tid: t.tid,
           sessionId: t.sessionId, resumeId: t.resumeId, title: t.title, cwd: t.cwd || "",
-          queued: t.queued || "" }))));
-        stateSet("rc_tab_active", LIVE ? LIVE.key : "");
+          queued: t.queued || "", promptOperationID: t.promptOperationID || "",
+          promptOperationDigest: t.promptOperationDigest || "" }))));
+        stateSet("agenthalo_tab_active", LIVE ? LIVE.key : "");
       } catch (e) {}
     }
     function renderTabs() {
@@ -2143,7 +2144,7 @@
       if (!t) return;
       if (t === LIVE) {
         CUR_DEVICE = t.device || CUR_DEVICE;
-        stateSet("rc_device", CUR_DEVICE);
+        stateSet("agenthalo_device", CUR_DEVICE);
         setBrowseProvider(t.provider || CUR_PROVIDER);
         persistTabs();
         rememberShellDevice(CUR_DEVICE, t.provider || CUR_PROVIDER, true);
@@ -2160,7 +2161,7 @@
       CURRENT_APPROVAL = null; window.__taskId = null; $("approval").innerHTML = "";
       LIVE = t; t.hasActivity = false;
       CUR_DEVICE = t.device || CUR_DEVICE;          // follow the tab's device (browse + active align)
-      stateSet("rc_device", CUR_DEVICE);
+      stateSet("agenthalo_device", CUR_DEVICE);
       setBrowseProvider(t.provider || $("provider-select").value);
       setActive(t.sessionId || "", t.title);
       // Persist the active tab/provider before asking the relay shell to move
@@ -2330,7 +2331,7 @@
     }
     function restoreTabs() {
       let saved = [], activeKey = "";
-      try { saved = JSON.parse(stateGet("rc_tabs") || "[]"); activeKey = stateGet("rc_tab_active") || ""; } catch (e) {}
+        try { saved = JSON.parse(stateGet("agenthalo_tabs") || "[]"); activeKey = stateGet("agenthalo_tab_active") || ""; } catch (e) {}
       if (!Array.isArray(saved) || !saved.length) return false;
       TABS = saved.map(s => Object.assign({ key: tabKey(s), unchanged: 0, hasActivity: false, chat: null,
         _needsSessionValidation: !!s.sessionId }, s));
@@ -3491,6 +3492,7 @@
       $("chat").style.display = "none"; $("output-pre").style.display = "";
       $("output-src").style.display = src ? "" : "none"; $("output-src").textContent = src || ""; $("output-pre").textContent = text || ""; $("output").scrollTop = 0; updateJumpBottom(); }
     function providerIsCodex(provider) { return String(provider || "").startsWith("codex"); }
+    function providerIsClaude(provider) { return String(provider || "").startsWith("claude"); }
     function activateLabel(tab) { return providerIsCodex(tab && tab.provider) ? "Send" : "恢复"; }
     function activatingLabel(tab) { return providerIsCodex(tab && tab.provider) ? "发送中…" : "恢复中…"; }
     function taskFailureText(task) {
@@ -3498,6 +3500,15 @@
       if (task.error) return task.error;
       const result = task.result || {};
       return result.error || result.detail || result.message || "send failed";
+    }
+    function clearConfirmedPromptOperation(tab, task) {
+      if (!tab || !task || tab.promptOperationID !== task.task_id) return false;
+      const status = String(task.status || "");
+      if (status !== "running" && status !== "completed") return false;
+      tab.promptOperationID = "";
+      tab.promptOperationDigest = "";
+      persistTabs();
+      return true;
     }
     async function waitTaskDelivery(tab, taskId, timeoutMs = 20000) {
       const deadline = Date.now() + timeoutMs;
@@ -3573,6 +3584,55 @@
       }
       return !!(caps && caps[capability]);
     }
+    function persistedPromptOperationMatches(tab, operationID, digest) {
+      if (!tab || !STATE_READY || !STATE_PERSISTENT || !STATE_SCOPE) return false;
+      try {
+        const saved = JSON.parse(window.localStorage.getItem(stateKey("agenthalo_tabs")) || "[]");
+        if (!Array.isArray(saved)) return false;
+        const key = tabKey(tab);
+        const matches = saved.filter(row => row && tabKey(row) === key);
+        return matches.length === 1 &&
+          matches[0].promptOperationID === operationID &&
+          matches[0].promptOperationDigest === digest;
+      } catch (e) {
+        return false;
+      }
+    }
+    async function promptOperationFor(tab, providerID, sessionID, text, attachmentIDs) {
+      const durableRequired = providerIsClaude(providerID);
+      if (durableRequired && (!tab || !STATE_READY || !STATE_PERSISTENT)) {
+        throw new Error("Claude 发送要求可读回的持久化幂等记录；当前浏览器存储不可用，已拒绝发送");
+      }
+      if (!window.crypto || !window.crypto.randomUUID || !window.crypto.subtle || !window.TextEncoder) {
+        throw new Error("浏览器缺少安全的 prompt 幂等能力，已拒绝发送");
+      }
+      const canonical = JSON.stringify([providerID || "", sessionID || "", text || "", attachmentIDs || []]);
+      const digestBytes = await window.crypto.subtle.digest("SHA-256", new TextEncoder().encode(canonical));
+      const digest = Array.from(new Uint8Array(digestBytes), b => b.toString(16).padStart(2, "0")).join("");
+      if (tab && tab.promptOperationID && tab.promptOperationDigest === digest) {
+        if (durableRequired && !persistedPromptOperationMatches(tab, tab.promptOperationID, digest)) {
+          // Storage may recover after a transient quota/privacy-mode failure.
+          // Re-persist the same identity; never mint a replacement operation.
+          persistTabs();
+          if (!persistedPromptOperationMatches(tab, tab.promptOperationID, digest)) {
+            throw new Error("Claude prompt 幂等记录未能从持久存储读回，已拒绝发送");
+          }
+        }
+        return tab.promptOperationID;
+      }
+      const operationID = "prompt-" + window.crypto.randomUUID();
+      if (tab) {
+        tab.promptOperationID = operationID;
+        tab.promptOperationDigest = digest;
+        persistTabs();
+      }
+      if (durableRequired && !persistedPromptOperationMatches(tab, operationID, digest)) {
+        // Keep the in-memory identity so a same-page retry can verify the exact
+        // same operation if storage becomes readable; never mint a second ID.
+        throw new Error("Claude prompt 幂等记录未能从持久存储读回，已拒绝发送");
+      }
+      return operationID;
+    }
     // core send (used by manual Send and by queue-flush). Claude previews are
     // resumed explicitly; Codex previews let the provider establish Desktop
     // ownership lazily as part of the delivery attempt.
@@ -3617,8 +3677,10 @@
         }
         if (!sid && !tab) sid = $("session-select").value;                 // fallback: the active session
         if (!sid) { if (active || !tab) $("send-out").textContent = "点一个会话，或 + New 新建一个"; return false; }
+        const operationID = await promptOperationFor(tab, prov, sid, text, attachmentIDs);
         const res = await request("/send_prompt", { method: "POST",
-          body: JSON.stringify({ provider_id: prov, session_id: sid, prompt: text, attachments: attachmentIDs }) });
+          body: JSON.stringify({ provider_id: prov, session_id: sid, prompt: text,
+            attachments: attachmentIDs, operation_id: operationID }) });
         let r = {};
         try { r = await res.json(); } catch (e) {}
         if (!res.ok) {
@@ -3662,7 +3724,12 @@
             return false;
           }
           if (task && (task.status === "running" || task.status === "completed")) {
-            if (tab) { tab._deliveryTaskID = null; tab._delivering = false; tab._attaching = false; tab._running = task.status === "running"; if (active) renderComposer(); }
+            if (tab) {
+              tab._deliveryTaskID = null; tab._delivering = false; tab._attaching = false;
+              tab._running = task.status === "running";
+              clearConfirmedPromptOperation(tab, task);
+              if (active) renderComposer();
+            }
             clearSentUploads(tab, attachmentIDs);
             if (active || !tab) {
               $("send-out").textContent = "sent — 输出在下方流式显示";
@@ -3679,6 +3746,9 @@
         if (active || !tab) {
           $("send-out").textContent = "sent — 输出在下方流式显示";
           refreshStatus();
+        }
+        if (tab) {
+          clearConfirmedPromptOperation(tab, { task_id: operationID, status: "completed" });
         }
         clearSentUploads(tab, attachmentIDs);
         return !!r.ok;
@@ -3876,19 +3946,21 @@
 	async function answerQuestion() {
 	  const ar = CURRENT_APPROVAL || {}, qs = ar.questions || [];
 	  const answers = {};
+	  const answerItems = [];
 	  for (let qi = 0; qi < qs.length; qi++) {
 		const q = qs[qi], selected = Array.from(document.querySelectorAll(`input[name="claude-q-${qi}"]:checked`));
-		const values = selected.map(el => ((q.options || [])[Number(el.value)] || {}).label || "").filter(Boolean);
-		const other = ($(`claude-q-other-${qi}`) || {}).value || "";
-		if (other.trim()) q.multiSelect ? values.push(other.trim()) : values.splice(0, values.length, other.trim());
-		if (!values.length) { alert(q.question || "请选择答案"); return; }
-		answers[q.question] = values.join(", ");
+		let values = selected.map(el => ((q.options || [])[Number(el.value)] || {}).label || "").filter(Boolean);
+		const other = (($(`claude-q-other-${qi}`) || {}).value || "").trim();
+		if (other && !q.multiSelect) values = [];
+		if (!values.length && !other) { alert(q.question || "请选择答案"); return; }
+		answers[q.question] = values.concat(other ? [other] : []).join(", ");
+		answerItems.push({ question: q.question, selected: values, other });
 	  }
 	  const sid = (LIVE && (LIVE.sessionId || LIVE.resumeId || LIVE.tid)) || $("session-select").value;
 	  const prov = (LIVE && LIVE.provider) || $("provider-select").value || CUR_PROVIDER;
 	  try {
 		const res = await fetchForTab(LIVE, "/question_answer", { method: "POST", body: JSON.stringify({
-		  provider_id: prov, session_id: sid, request_id: ar.request_id, answers
+		  provider_id: prov, session_id: sid, request_id: ar.request_id, answers, answer_items: answerItems
 		}) });
 		const body = await res.json();
 		$("send-out").textContent = body.ok
@@ -3976,6 +4048,7 @@
             : "已接收，等待 agent 确认…";
         } else if (status === "running" || status === "completed") {
           tab._deliveryTaskID = null; tab._delivering = false; tab._attaching = false; tab._running = status === "running";
+          clearConfirmedPromptOperation(tab, task);
           $("send-out").textContent = "sent — 输出在下方流式显示";
         } else if (status === "error") {
           tab._deliveryTaskID = null; tab._delivering = false; tab._attaching = false;
@@ -4047,6 +4120,9 @@
         if (!tab || !sid || !prov) { window.__taskId = null; return; }
         const q = `?provider_id=${encodeURIComponent(prov)}&session_id=${encodeURIComponent(sid)}`;
         const d = await (await apiForTab(tab, "/tasks" + q)).json();
+        const pendingPromptTask = tab.promptOperationID && (d.tasks || []).find(task =>
+          task.task_id === tab.promptOperationID && (task.status === "running" || task.status === "completed"));
+        if (pendingPromptTask) clearConfirmedPromptOperation(tab, pendingPromptTask);
         const a = ["queued","sent","attaching","running","waiting_approval","waiting_input"];
         const f = d.tasks.slice().reverse().find(t => a.includes(t.status) &&
           t.session_id === sid && t.provider_id === prov);

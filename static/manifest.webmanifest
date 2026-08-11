@@ -1,10 +1,10 @@
 {
-  "name": "Remote Agent",
-  "short_name": "RemoteAgent",
-  "description": "Claude / Codex 远程控制",
+  "name": "AgentHalo",
+  "short_name": "AgentHalo",
+  "description": "AgentHalo — Claude / Codex 远程控制",
   "display": "standalone",
-  "scope": "/s/remotecoding/",
-  "start_url": "/s/remotecoding/",
+  "scope": "/s/agenthalo/",
+  "start_url": "/s/agenthalo/",
   "background_color": "#0d0d0f",
   "theme_color": "#0d0d0f",
   "icons": [

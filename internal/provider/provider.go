@@ -1,17 +1,107 @@
 package provider
 
 import (
+	"context"
+	"errors"
 	"sort"
 
 	"github.com/psyche08/remote-agent/internal/config"
 )
 
+var ErrComputerUseAutomationCleanup = errors.New("computer-use automation cleanup was not confirmed")
+
+// ComputerUseToolRequest is a model-originated computer-use call after the
+// provider has bound it to an authoritative runtime turn. ProviderID,
+// SessionID, ThreadID, and TurnID are derived from the provider protocol; a
+// tool argument can never override them.
+type ComputerUseToolRequest struct {
+	ProviderID string
+	SessionID  string
+	ThreadID   string
+	TurnID     string
+	CallID     string
+	Tool       string
+
+	App      string
+	BundleID string
+	Path     []int
+	Value    *string
+
+	X      *int
+	Y      *int
+	Button string
+	Count  int
+	Text   string
+	Keys   []string
+	DeltaX int
+	DeltaY int
+}
+
+// ComputerUseToolResult is provider-neutral model content. ImageURL, when
+// present, is a validated data:image URL rather than a helper filesystem path.
+type ComputerUseToolResult struct {
+	Text     string
+	ImageURL string
+}
+
+type ComputerUseToolHandler func(context.Context, ComputerUseToolRequest) (ComputerUseToolResult, error)
+
+// ComputerUseToolHost is implemented by providers that can expose computer
+// use as a first-class model tool. The handler is installed by the API server
+// and executes in-process; it must never be routed back through public HTTP.
+type ComputerUseToolHost interface {
+	SetComputerUseToolHandler(ComputerUseToolHandler)
+}
+
+// ComputerUseAutomationCallback is one bounded, trusted provider UI
+// transaction. The server injects a tool handler whose provider, logical
+// session, and short-lived operation turn are already fixed outside every tool
+// request. The callback may perform multiple inspect/mutate steps, but must not
+// retain the handler after it returns.
+type ComputerUseAutomationCallback func(context.Context, ComputerUseToolHandler) error
+
+// ComputerUseAutomationHandler runs a trusted provider's UI transaction for
+// one stored logical session. This is deliberately separate from
+// ComputerUseToolHost: model-originated tools must continue proving their
+// native generation/thread/turn envelope, while this seam is authority granted
+// by the server only for the lifetime of the callback.
+type ComputerUseAutomationHandler func(context.Context, string, ComputerUseAutomationCallback) error
+
+// ComputerUseAutomationHost is implemented by providers whose trusted adapter
+// drives their own UI. The handler is installed in-process by the API server;
+// it must never be exposed through HTTP or accept a provider identity from the
+// provider callback.
+type ComputerUseAutomationHost interface {
+	SetComputerUseAutomationHandler(ComputerUseAutomationHandler)
+}
+
+// ClaudeControlRouteCommitHandler is the synchronous durability barrier before
+// Claude Desktop or CLI performs its first external side effect. The server
+// fixes provider identity, accepts only an exact stored logical session, and
+// persists the selected route as committed before returning success.
+type ClaudeControlRouteCommitHandler func(context.Context, string, string) error
+
+// ClaudeControlRouteCommitHost is intentionally separate from computer-use
+// tools: route ownership is durable session metadata, not a model capability
+// and not authority to mutate the desktop.
+type ClaudeControlRouteCommitHost interface {
+	SetClaudeControlRouteCommitHandler(ClaudeControlRouteCommitHandler)
+}
+
+// ClaudeControlStartOptionsHost restores the complete create-time contract for
+// a logical Claude session. It is intentionally separate from route binding so
+// restarts cannot drop mode/model/effort while retaining only cwd.
+type ClaudeControlStartOptionsHost interface {
+	BindClaudeControlStartOptions(string, StartOptions)
+}
+
 type SendResult struct {
-	OK           bool    `json:"ok"`
-	State        string  `json:"state"`
-	Message      string  `json:"message"`
-	Error        *string `json:"error"`
-	NativeTaskID string  `json:"native_task_id,omitempty"`
+	OK              bool    `json:"ok"`
+	State           string  `json:"state"`
+	Message         string  `json:"message"`
+	Error           *string `json:"error"`
+	NativeTaskID    string  `json:"native_task_id,omitempty"`
+	NativeSessionID string  `json:"native_session_id,omitempty"`
 }
 
 // Attachment is an uploaded file that has already been validated and stored
@@ -27,6 +117,35 @@ type Attachment struct {
 
 type AttachmentSender interface {
 	SendPromptWithAttachments(sessionID string, prompt string, attachments []Attachment) SendResult
+}
+
+// PromptOperationSender receives the API task id as a stable, restart-safe
+// operation identity. Providers that can deliver through more than one native
+// route use it to durably reject a duplicate prompt after an uncertain return.
+type PromptOperationSender interface {
+	SendPromptOperation(sessionID string, prompt string, operationID string) SendResult
+}
+
+type PromptOperationAttachmentSender interface {
+	SendPromptOperationWithAttachments(
+		sessionID string, prompt string, attachments []Attachment, operationID string,
+	) SendResult
+}
+
+// QuestionAnswer preserves option identity without flattening a multi-select
+// into a comma-delimited string (option labels are allowed to contain commas).
+// Other is separate so a provider can address the native free-text control
+// rather than guessing whether an unmatched label was an option or free text.
+type QuestionAnswer struct {
+	Selected []string `json:"selected,omitempty"`
+	Other    string   `json:"other,omitempty"`
+}
+
+// StructuredQuestionAnswerer is optional. The API prefers it when the PWA
+// submits answer_items and falls back to the legacy string map only for a
+// provider that has not implemented exact multi-select semantics.
+type StructuredQuestionAnswerer interface {
+	AnswerQuestionStructured(sessionID string, requestID string, answers map[string]QuestionAnswer) map[string]any
 }
 
 type SessionAsset struct {
@@ -163,7 +282,7 @@ func BuildRegistry(cfg *config.Config) Registry {
 	if pc.AppName == "" || pc.AppName == "Claude Desktop" || pc.AppName == "Claude CLI" || pc.AppName == "Claude CLI (tmux)" || pc.AppName == "Claude Code CLI" {
 		pc.AppName = "Claude"
 	}
-	reg["claude"] = NewClaudeCLI("claude", pc)
+	reg["claude"] = NewClaude("claude", pc)
 	if _, ok := reg["codex"]; !ok {
 		reg["codex"] = NewCodex("codex", config.ProviderConfig{AppName: "Codex", Command: "codex", Cwd: "~/Developer"})
 	}

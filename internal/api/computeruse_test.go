@@ -3,6 +3,7 @@ package api
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -23,7 +24,7 @@ import (
 // refusal's code becomes the right status, and that an absent helper is
 // reported as a fault rather than as a switched-off feature.
 
-// fakeHelper is a scripted stand-in for remote-agent-desktop.
+// fakeHelper is a scripted stand-in for agenthalo-desktop.
 type fakeHelper struct {
 	path     string
 	listener net.Listener
@@ -54,6 +55,38 @@ func startFakeHelper(t *testing.T, reply func(map[string]any) map[string]any) *f
 	return h
 }
 
+func startWindowTrackingHelper(t *testing.T) *fakeHelper {
+	t.Helper()
+	owner := ""
+	return startFakeHelper(t, func(req map[string]any) map[string]any {
+		switch req["op"] {
+		case "window_open":
+			owner, _ = req["turn_id"].(string)
+			return map[string]any{
+				"ok": true, "window_open": true,
+				"window_turn_id": owner, "window_closing": false,
+			}
+		case "window_close":
+			if req["turn_id"] == owner {
+				owner = ""
+			}
+			return map[string]any{
+				"ok": true, "window_open": owner != "",
+				"window_turn_id": owner, "window_closing": false,
+			}
+		case "window_state":
+			return map[string]any{
+				"ok": true, "window_open": owner != "",
+				"window_turn_id": owner, "window_closing": false,
+			}
+		case "action":
+			return map[string]any{"ok": true, "action": req["action"]}
+		default:
+			return map[string]any{"ok": true}
+		}
+	})
+}
+
 func (h *fakeHelper) serve() {
 	for {
 		conn, err := h.listener.Accept()
@@ -82,6 +115,16 @@ func (h *fakeHelper) serve() {
 						out = res
 					}
 				}
+				// Most boundary tests do not care about window ownership. Model the
+				// real helper's complete closed-state response unless a test
+				// explicitly scripts a different owner.
+				if req["op"] == "window_state" {
+					if _, ok := out["window_open"]; !ok {
+						out["window_open"] = false
+						out["window_turn_id"] = ""
+						out["window_closing"] = false
+					}
+				}
 				body, _ := json.Marshal(out)
 				if _, err := conn.Write(append(body, '\n')); err != nil {
 					return
@@ -102,6 +145,10 @@ func computerUseServer(t *testing.T, mutate func(*config.Config)) *Server {
 	cfg := &config.Config{
 		DeviceID:        "device-a",
 		DefaultProvider: "claude",
+		// Most tests in this file exercise the legacy HTTP boundary itself. Opt
+		// that test fixture into the explicit debug route; production defaults
+		// stay off and are covered by the model-tool-required test below.
+		ComputerUse: config.ComputerUseConfig{DebugHTTPActions: true},
 		Providers: map[string]config.ProviderConfig{
 			"claude": {AppName: "Claude Code CLI", Command: "claude"},
 		},
@@ -134,6 +181,36 @@ func doJSON(t *testing.T, srv *Server, method, path, body string) (int, map[stri
 	return rr.Code, out
 }
 
+const (
+	computerUseTestProvider = "codex"
+	computerUseTestSession  = "computer-use-session"
+)
+
+func computerUseBody(t *testing.T, raw string) string {
+	t.Helper()
+	var body map[string]any
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := body["provider_id"]; !ok {
+		body["provider_id"] = computerUseTestProvider
+	}
+	if _, ok := body["session_id"]; !ok {
+		body["session_id"] = computerUseTestSession
+	}
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
+}
+
+func startComputerUseTurn(srv *Server, providerID, sessionID, turnID string) {
+	srv.publishProviderStream(providerID, sessionID, map[string]any{
+		"type": "turn", "status": "started", "turn_id": turnID,
+	})
+}
+
 // With computer use unconfigured the routes must exist and answer plainly,
 // rather than 404ing or implying the feature is present.
 func TestComputerUseDisabledByDefault(t *testing.T) {
@@ -155,11 +232,49 @@ func TestComputerUseDisabledByDefault(t *testing.T) {
 		{"/computer_use/locked_use", `{"active":true}`},
 		{"/computer_use/window", `{"turn_id":"t1","action":"open"}`},
 		{"/computer_use/action", `{"action":"screen.capture"}`},
+		{"/computer_use/ax", `{"turn_id":"t1","op":"ax_read","app":"CatDesk"}`},
 	} {
 		code, out := doJSON(t, srv, http.MethodPost, route.path, route.body)
 		if code != http.StatusConflict {
 			t.Errorf("%s status=%d body=%#v, want 409", route.path, code, out)
 		}
+	}
+}
+
+func TestLockedUseHTTPMutationsRequireModelToolByDefault(t *testing.T) {
+	helper := startWindowTrackingHelper(t)
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.LockedUse.Enabled = true
+		cfg.ComputerUse.DebugHTTPActions = false
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "turn-1")
+
+	for _, route := range []struct{ path, body string }{
+		{"/computer_use/window", computerUseBody(t, `{"turn_id":"turn-1","action":"open"}`)},
+		{"/computer_use/action", computerUseBody(t, `{"turn_id":"turn-1","action":"pointer.move","x":1,"y":2}`)},
+		{"/computer_use/ax", computerUseBody(t, `{"turn_id":"turn-1","op":"ax_read","app":"CatDesk"}`)},
+	} {
+		code, body := doJSON(t, srv, http.MethodPost, route.path, route.body)
+		if code != http.StatusForbidden || body["code"] != "model_tool_required" {
+			t.Errorf("%s status=%d body=%#v, want 403/model_tool_required", route.path, code, body)
+		}
+	}
+	if seen := helper.seen(); len(seen) != 0 {
+		t.Fatalf("model-tool-only HTTP request reached helper: %#v", seen)
+	}
+
+	// Closing and runtime deactivation can only remove authority, so they stay
+	// available even when mutation routes are model-tool-only.
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/window",
+		computerUseBody(t, `{"turn_id":"turn-1","action":"close"}`))
+	if code != http.StatusOK || body["ok"] != true {
+		t.Fatalf("HTTP close status=%d body=%#v", code, body)
+	}
+	code, body = doJSON(t, srv, http.MethodPost, "/computer_use/locked_use", `{"active":false}`)
+	if code != http.StatusOK || body["ok"] != true {
+		t.Fatalf("runtime deactivate status=%d body=%#v", code, body)
 	}
 }
 
@@ -180,6 +295,7 @@ func TestLockedUseRequiresItsOwnOptIn(t *testing.T) {
 	if srv.computerUseCtl == nil {
 		t.Fatal("no controller built for an enabled device")
 	}
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "t1")
 
 	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/locked_use", `{"active":true}`)
 	if code != http.StatusConflict {
@@ -189,7 +305,8 @@ func TestLockedUseRequiresItsOwnOptIn(t *testing.T) {
 		t.Fatalf("status field = %v, want not_enabled", body["status"])
 	}
 
-	code, body = doJSON(t, srv, http.MethodPost, "/computer_use/window", `{"turn_id":"t1","action":"open"}`)
+	code, body = doJSON(t, srv, http.MethodPost, "/computer_use/window",
+		computerUseBody(t, `{"turn_id":"t1","action":"open"}`))
 	if code != http.StatusConflict {
 		t.Fatalf("window status=%d body=%#v, want 409", code, body)
 	}
@@ -263,21 +380,28 @@ func TestComputerUseStatusExposesNoSecrets(t *testing.T) {
 // malformed action stays a 400 and does not become a generic 5xx.
 func TestRefusedActionKeepsItsStatusCode(t *testing.T) {
 	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
+		if req["op"] == "window_state" {
+			return nil
+		}
 		return refuse("bad_request", "unknown computer-use action")
 	})
 	srv := computerUseServer(t, func(cfg *config.Config) {
 		cfg.ComputerUse.Enabled = true
 		cfg.ComputerUse.HelperSocket = helper.path
 	})
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "t1")
 	for _, body := range []string{
-		`{"action":"shell.exec"}`,
-		`{"action":"pointer.click"}`,
-		`{"action":"keyboard.key","keys":[]}`,
-		`{"action":""}`,
+		`{"turn_id":"t1","action":"shell.exec"}`,
+		`{"turn_id":"t1","action":"pointer.click"}`,
+		`{"turn_id":"t1","action":"keyboard.key","keys":[]}`,
+		`{"turn_id":"t1","action":""}`,
 	} {
-		code, out := doJSON(t, srv, http.MethodPost, "/computer_use/action", body)
+		code, out := doJSON(t, srv, http.MethodPost, "/computer_use/action", computerUseBody(t, body))
 		if code != http.StatusBadRequest {
 			t.Errorf("action %s status=%d body=%#v, want 400", body, code, out)
+		}
+		if out["code"] != "bad_request" {
+			t.Errorf("action %s code=%v, want bad_request", body, out["code"])
 		}
 	}
 }
@@ -293,9 +417,10 @@ func TestActionFieldsAreForwardedFaithfully(t *testing.T) {
 		cfg.ComputerUse.Enabled = true
 		cfg.ComputerUse.HelperSocket = helper.path
 	})
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "t1")
 
 	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/action",
-		`{"action":"pointer.click","x":0,"y":0,"button":"right","count":2}`)
+		computerUseBody(t, `{"turn_id":"t1","action":"pointer.click","x":0,"y":0,"button":"right","count":2}`))
 	if code != http.StatusOK {
 		t.Fatalf("status=%d body=%#v", code, body)
 	}
@@ -309,8 +434,10 @@ func TestActionFieldsAreForwardedFaithfully(t *testing.T) {
 	}
 	last := seen[len(seen)-1]
 	for key, want := range map[string]any{
-		"op": "action", "action": "pointer.click",
-		"x": float64(0), "y": float64(0), "button": "right", "count": float64(2),
+		"op":      "action",
+		"turn_id": computerUseOwnerID(computerUseTestProvider, computerUseTestSession, "t1"),
+		"action":  "pointer.click",
+		"x":       float64(0), "y": float64(0), "button": "right", "count": float64(2),
 	} {
 		if got, ok := last[key]; !ok || got != want {
 			t.Errorf("forwarded %s = %#v (present=%v), want %#v", key, got, ok, want)
@@ -325,9 +452,10 @@ func TestUnreachableHelperIsReportedAsAFault(t *testing.T) {
 		cfg.ComputerUse.Enabled = true
 		cfg.ComputerUse.HelperSocket = "/tmp/ra-absent-helper.sock"
 	})
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "t1")
 
 	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/action",
-		`{"action":"pointer.move","x":1,"y":1}`)
+		computerUseBody(t, `{"turn_id":"t1","action":"pointer.move","x":1,"y":1}`))
 	if code != http.StatusServiceUnavailable {
 		t.Fatalf("status=%d body=%#v, want 503", code, body)
 	}
@@ -353,7 +481,7 @@ func TestComputerUseWindowRejectsBadInput(t *testing.T) {
 		`{"turn_id":"../etc","action":"open"}`,
 		`{"turn_id":"t1","action":"sudo"}`,
 	} {
-		code, out := doJSON(t, srv, http.MethodPost, "/computer_use/window", body)
+		code, out := doJSON(t, srv, http.MethodPost, "/computer_use/window", computerUseBody(t, body))
 		if code != http.StatusBadRequest {
 			t.Errorf("window %s status=%d body=%#v, want 400", body, code, out)
 		}
@@ -371,7 +499,9 @@ func TestComputerUseRoutesRejectWrongMethods(t *testing.T) {
 	srv := computerUseServer(t, func(cfg *config.Config) {
 		cfg.ComputerUse.Enabled = true
 	})
-	for _, path := range []string{"/computer_use/locked_use", "/computer_use/window", "/computer_use/action"} {
+	for _, path := range []string{
+		"/computer_use/locked_use", "/computer_use/window", "/computer_use/action", "/computer_use/ax",
+	} {
 		code, _ := doJSON(t, srv, http.MethodGet, path, "")
 		if code != http.StatusMethodNotAllowed {
 			t.Errorf("GET %s status=%d, want 405", path, code)
@@ -382,9 +512,11 @@ func TestComputerUseRoutesRejectWrongMethods(t *testing.T) {
 	}
 }
 
-// The capture gate only restricts capture while a Locked Use window is open.
-// A device without the feature must keep its existing screenshot behavior.
-func TestCaptureGateAllowsWhenNoLockedUseWindow(t *testing.T) {
+// A device without Locked Use keeps its legacy screenshot behavior. Once
+// Locked Use is configured, legacy file capture is permanently model-only:
+// checking the current phase and then invoking screencapture would race a new
+// window opening between those two operations.
+func TestCaptureGateIsPermanentlyModelOnlyWhenLockedUseIsConfigured(t *testing.T) {
 	srv := computerUseServer(t, nil)
 	rr := httptest.NewRecorder()
 	if !srv.captureGate(rr) {
@@ -392,7 +524,8 @@ func TestCaptureGateAllowsWhenNoLockedUseWindow(t *testing.T) {
 	}
 
 	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
-		return map[string]any{"ok": true, "allowed": true, "reason": ""}
+		t.Fatalf("permanent Locked Use legacy gate queried helper state: %#v", req)
+		return nil
 	})
 	srv = computerUseServer(t, func(cfg *config.Config) {
 		cfg.ComputerUse.Enabled = true
@@ -400,15 +533,24 @@ func TestCaptureGateAllowsWhenNoLockedUseWindow(t *testing.T) {
 		cfg.ComputerUse.HelperSocket = helper.path
 	})
 	rr = httptest.NewRecorder()
-	if !srv.captureGate(rr) {
-		t.Fatal("capture gate refused with no window open")
+	if srv.captureGate(rr) || rr.Code != http.StatusForbidden {
+		t.Fatalf("Locked Use legacy capture gate status=%d, want 403", rr.Code)
+	}
+
+	// A failed true -> false helper reload has a disabled new config but may
+	// still have an old registered window. The process-local refresh marker
+	// retains the same capture boundary until a safe restart succeeds.
+	srv = computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.HelperRefreshFailed = true
+	})
+	rr = httptest.NewRecorder()
+	if srv.captureGate(rr) || rr.Code != http.StatusForbidden {
+		t.Fatalf("refresh-failed legacy capture gate status=%d, want 403", rr.Code)
 	}
 }
 
-// The helper owns the shield as windows in its own process, so a helper that
-// died took the shield with it and may have left the desktop unlocked and
-// uncovered. Capture is the gate whose failure writes what is on screen to a
-// file that is then served over the relay, so "cannot tell" must mean "no".
+// The permanent config gate also fails safely when the helper is unreachable;
+// a missing helper cannot turn legacy on-disk capture back on.
 func TestCaptureGateRefusesWhenLockedUseHelperIsUnreachable(t *testing.T) {
 	srv := computerUseServer(t, func(cfg *config.Config) {
 		cfg.ComputerUse.Enabled = true
@@ -432,9 +574,73 @@ func TestCaptureGateRefusesWhenLockedUseHelperIsUnreachable(t *testing.T) {
 	}
 }
 
-// The Accessibility route forwards element-tree operations that work while the
-// screen is locked. Like the action route, the vocabulary is enforced in the
-// helper; what this layer owns is the op allow-list and faithful forwarding.
+func TestLockedUseWindowRefusesLegacyCaptureOCRAndStoredScreenshot(t *testing.T) {
+	helper := startWindowTrackingHelper(t)
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.LockedUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "turn-legacy-gate")
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/window",
+		computerUseBody(t, `{"turn_id":"turn-legacy-gate","action":"open"}`))
+	if code != http.StatusOK || body["window_open"] != true {
+		t.Fatalf("open status=%d body=%#v", code, body)
+	}
+
+	handler := srv.Handler()
+	const parallelCaptures = 12
+	codes := make(chan int, parallelCaptures)
+	for range parallelCaptures {
+		go func() {
+			rr := httptest.NewRecorder()
+			handler.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/screenshot", nil))
+			codes <- rr.Code
+		}()
+	}
+	for range parallelCaptures {
+		if got := <-codes; got != http.StatusForbidden {
+			t.Errorf("concurrent legacy screenshot status=%d, want 403", got)
+		}
+	}
+	screenshotDir := filepath.Join(filepath.Dir(srv.store.DataDir()), "screenshots")
+	if entries, err := os.ReadDir(screenshotDir); err == nil {
+		if len(entries) != 0 {
+			t.Fatalf("legacy screenshot wrote files under Locked Use: %#v", entries)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("inspect screenshot directory: %v", err)
+	}
+
+	oldPath := filepath.Join(t.TempDir(), "old-screenshot.png")
+	if err := os.WriteFile(oldPath, []byte("must not be served or OCRed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv.lastScreenshot = oldPath
+	for _, route := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, "/ocr"},
+		{http.MethodGet, "/last_screenshot"},
+	} {
+		code, body = doJSON(t, srv, route.method, route.path, "")
+		if code != http.StatusForbidden || body["code"] != "model_tool_required" {
+			t.Errorf("%s status=%d body=%#v, want 403/model_tool_required", route.path, code, body)
+		}
+	}
+	data, err := os.ReadFile(oldPath)
+	if err != nil || string(data) != "must not be served or OCRed" {
+		t.Fatalf("legacy OCR mutated stored screenshot: data=%q err=%v", data, err)
+	}
+	if seen := helper.seen(); len(seen) != 1 || seen[0]["op"] != "window_open" {
+		t.Fatalf("legacy capture gates reached helper after open: %#v", seen)
+	}
+}
+
+// The Accessibility route forwards element-tree operations admitted by the
+// helper after its Locked Use transition. Like the action route, the vocabulary
+// is enforced there; this layer owns the op allow-list and faithful forwarding.
 func TestComputerUseAXForwardsAndGatesOps(t *testing.T) {
 	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
 		return map[string]any{"ok": true, "elements": []any{
@@ -445,10 +651,11 @@ func TestComputerUseAXForwardsAndGatesOps(t *testing.T) {
 		cfg.ComputerUse.Enabled = true
 		cfg.ComputerUse.HelperSocket = helper.path
 	})
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "t1")
 
 	// A good read forwards and returns the elements.
 	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/ax",
-		`{"op":"ax_read","app":"CatDesk"}`)
+		computerUseBody(t, `{"turn_id":"t1","op":"ax_read","app":"CatDesk"}`))
 	if code != http.StatusOK {
 		t.Fatalf("ax_read status=%d body=%#v", code, body)
 	}
@@ -458,7 +665,8 @@ func TestComputerUseAXForwardsAndGatesOps(t *testing.T) {
 
 	// The op allow-list is this layer's own check and must be refused before
 	// reaching the helper.
-	code, _ = doJSON(t, srv, http.MethodPost, "/computer_use/ax", `{"op":"ax_teleport"}`)
+	code, _ = doJSON(t, srv, http.MethodPost, "/computer_use/ax",
+		computerUseBody(t, `{"turn_id":"t1","op":"ax_teleport"}`))
 	if code != http.StatusBadRequest {
 		t.Errorf("unknown ax op status=%d, want 400", code)
 	}
@@ -470,7 +678,7 @@ func TestComputerUseAXForwardsAndGatesOps(t *testing.T) {
 
 	// Set-value fields forward faithfully, including a unicode value.
 	code, _ = doJSON(t, srv, http.MethodPost, "/computer_use/ax",
-		`{"op":"ax_setvalue","app":"CatDesk","path":[1,4],"value":"你好"}`)
+		computerUseBody(t, `{"turn_id":"t1","op":"ax_setvalue","app":"CatDesk","path":[1,4],"value":"你好"}`))
 	if code != http.StatusOK {
 		t.Fatalf("ax_setvalue status=%d", code)
 	}
@@ -481,5 +689,393 @@ func TestComputerUseAXForwardsAndGatesOps(t *testing.T) {
 	}
 	if p, ok := last["path"].([]any); !ok || len(p) != 2 {
 		t.Errorf("ax_setvalue path forwarded wrong: %#v", last["path"])
+	}
+}
+
+func TestComputerUseRequiresAndEnforcesTurnOwnership(t *testing.T) {
+	ownerID := computerUseOwnerID(computerUseTestProvider, computerUseTestSession, "owner-turn")
+	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
+		if req["op"] == "window_state" {
+			return map[string]any{
+				"ok": true, "window_open": true,
+				"window_turn_id": ownerID, "window_closing": false,
+			}
+		}
+		return map[string]any{"ok": true, "action": req["action"]}
+	})
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.LockedUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "owner-turn")
+	startComputerUseTurn(srv, computerUseTestProvider, "other-session", "other-turn")
+
+	for _, route := range []struct{ path, body string }{
+		{"/computer_use/action", `{"provider_id":"codex","session_id":"computer-use-session","action":"pointer.move","x":1,"y":2}`},
+		{"/computer_use/ax", `{"provider_id":"codex","session_id":"computer-use-session","op":"ax_read","app":"CatDesk"}`},
+		{"/computer_use/action", `{"session_id":"computer-use-session","turn_id":"owner-turn","action":"pointer.move","x":1,"y":2}`},
+		{"/computer_use/ax", `{"provider_id":"codex","turn_id":"owner-turn","op":"ax_read","app":"CatDesk"}`},
+	} {
+		code, body := doJSON(t, srv, http.MethodPost, route.path, route.body)
+		if code != http.StatusBadRequest || body["code"] != "bad_request" {
+			t.Errorf("missing turn %s status=%d body=%#v", route.path, code, body)
+		}
+	}
+
+	for _, route := range []struct{ path, body string }{
+		{"/computer_use/action", `{"provider_id":"codex","session_id":"other-session","turn_id":"other-turn","action":"pointer.move","x":1,"y":2}`},
+		{"/computer_use/ax", `{"provider_id":"codex","session_id":"other-session","turn_id":"other-turn","op":"ax_read","app":"CatDesk"}`},
+	} {
+		code, body := doJSON(t, srv, http.MethodPost, route.path, route.body)
+		if code != http.StatusConflict || body["code"] != "window_busy" {
+			t.Errorf("wrong owner %s status=%d body=%#v", route.path, code, body)
+		}
+		if detail, _ := body["detail"].(string); strings.Contains(detail, "owner-turn") {
+			t.Errorf("wrong-owner response exposed the owning turn: %#v", body)
+		}
+	}
+
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/action",
+		computerUseBody(t, `{"turn_id":"owner-turn","action":"pointer.move","x":1,"y":2}`))
+	if code != http.StatusOK || body["ok"] != true {
+		t.Fatalf("owner action status=%d body=%#v", code, body)
+	}
+}
+
+func TestComputerUseRejectsSelfAssertedOrWrongScopeTurn(t *testing.T) {
+	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
+		return map[string]any{"ok": true, "action": req["action"]}
+	})
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+
+	request := `{"provider_id":"codex","session_id":"session-a","turn_id":"turn-real","action":"pointer.move","x":1,"y":2}`
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/action", request)
+	if code != http.StatusConflict || body["code"] != "turn_not_active" {
+		t.Fatalf("self-asserted turn status=%d body=%#v", code, body)
+	}
+	if seen := helper.seen(); len(seen) != 0 {
+		t.Fatalf("self-asserted turn reached helper: %#v", seen)
+	}
+
+	startComputerUseTurn(srv, "codex", "session-a", "turn-real")
+	for _, wrong := range []string{
+		`{"provider_id":"codex","session_id":"session-b","turn_id":"turn-real","action":"pointer.move","x":1,"y":2}`,
+		`{"provider_id":"claude","session_id":"session-a","turn_id":"turn-real","action":"pointer.move","x":1,"y":2}`,
+		`{"provider_id":"codex","session_id":"session-a","turn_id":"turn-made-up","action":"pointer.move","x":1,"y":2}`,
+	} {
+		code, body = doJSON(t, srv, http.MethodPost, "/computer_use/action", wrong)
+		if code != http.StatusConflict || body["code"] != "turn_not_active" {
+			t.Errorf("wrong lease scope status=%d body=%#v", code, body)
+		}
+	}
+	if seen := helper.seen(); len(seen) != 0 {
+		t.Fatalf("wrong lease scope reached helper: %#v", seen)
+	}
+
+	code, body = doJSON(t, srv, http.MethodPost, "/computer_use/action", request)
+	if code != http.StatusOK || body["ok"] != true {
+		t.Fatalf("provider-established turn status=%d body=%#v", code, body)
+	}
+}
+
+func TestProviderTerminalFramesRevokeLeaseAndRelock(t *testing.T) {
+	cases := []struct {
+		name  string
+		frame map[string]any
+	}{
+		{"completed", map[string]any{"type": "turn", "status": "completed", "turn_id": "turn-1"}},
+		{"error", map[string]any{"type": "error", "turn_id": "turn-1"}},
+		{"interrupt", map[string]any{"type": "turn", "status": "interrupted", "turn_id": "turn-1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			helper := startWindowTrackingHelper(t)
+			srv := computerUseServer(t, func(cfg *config.Config) {
+				cfg.ComputerUse.Enabled = true
+				cfg.ComputerUse.LockedUse.Enabled = true
+				cfg.ComputerUse.HelperSocket = helper.path
+			})
+			startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "turn-1")
+
+			code, body := doJSON(t, srv, http.MethodPost, "/computer_use/window",
+				computerUseBody(t, `{"turn_id":"turn-1","action":"open"}`))
+			if code != http.StatusOK || body["window_open"] != true {
+				t.Fatalf("open status=%d body=%#v", code, body)
+			}
+			if err := srv.observeComputerUseProviderFrame(
+				computerUseTestProvider, computerUseTestSession, tc.frame,
+			); err != nil {
+				t.Fatalf("terminal cleanup: %v", err)
+			}
+
+			seen := helper.seen()
+			if len(seen) != 2 || seen[1]["op"] != "window_close" {
+				t.Fatalf("terminal requests=%#v, want open then close", seen)
+			}
+			wantOwner := computerUseOwnerID(computerUseTestProvider, computerUseTestSession, "turn-1")
+			if seen[1]["turn_id"] != wantOwner {
+				t.Fatalf("terminal close owner=%v, want %s", seen[1]["turn_id"], wantOwner)
+			}
+
+			code, body = doJSON(t, srv, http.MethodPost, "/computer_use/action",
+				computerUseBody(t, `{"turn_id":"turn-1","action":"pointer.move","x":1,"y":2}`))
+			if code != http.StatusConflict || body["code"] != "turn_not_active" {
+				t.Fatalf("completed turn status=%d body=%#v", code, body)
+			}
+			if got := len(helper.seen()); got != 2 {
+				t.Fatalf("completed turn reached helper; requests=%#v", helper.seen())
+			}
+
+			startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "turn-1")
+			code, body = doJSON(t, srv, http.MethodPost, "/computer_use/action",
+				computerUseBody(t, `{"turn_id":"turn-1","action":"pointer.move","x":1,"y":2}`))
+			if code != http.StatusConflict || body["code"] != "turn_not_active" {
+				t.Fatalf("replayed start resurrected terminal turn: status=%d body=%#v", code, body)
+			}
+		})
+	}
+}
+
+func TestStaleTerminalAndStartedFramesCannotReplaceANewerLease(t *testing.T) {
+	helper := startWindowTrackingHelper(t)
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "turn-old")
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "turn-new")
+	if err := srv.observeComputerUseProviderFrame(
+		computerUseTestProvider, computerUseTestSession,
+		map[string]any{"type": "turn", "status": "completed", "turn_id": "turn-old"},
+	); err != nil {
+		t.Fatalf("stale terminal cleanup: %v", err)
+	}
+	// A replayed start for the completed id is also stale. Neither frame may
+	// revoke or replace the real current lease.
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "turn-old")
+
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/action",
+		computerUseBody(t, `{"turn_id":"turn-new","action":"pointer.move","x":1,"y":2}`))
+	if code != http.StatusOK || body["ok"] != true {
+		t.Fatalf("stale frames replaced newer lease: status=%d body=%#v", code, body)
+	}
+	code, body = doJSON(t, srv, http.MethodPost, "/computer_use/action",
+		computerUseBody(t, `{"turn_id":"turn-old","action":"pointer.move","x":1,"y":2}`))
+	if code != http.StatusConflict || body["code"] != "turn_not_active" {
+		t.Fatalf("completed old lease revived: status=%d body=%#v", code, body)
+	}
+}
+
+func TestProviderStartWithoutTurnIDFailsClosed(t *testing.T) {
+	helper := startWindowTrackingHelper(t)
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.LockedUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+	startComputerUseTurn(srv, "claude", "claude-session", "real-turn")
+
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/window",
+		`{"provider_id":"claude","session_id":"claude-session","turn_id":"real-turn","action":"open"}`)
+	if code != http.StatusOK || body["window_open"] != true {
+		t.Fatalf("open status=%d body=%#v", code, body)
+	}
+	if err := srv.observeComputerUseProviderFrame("claude", "claude-session", map[string]any{
+		"type": "turn", "status": "started", "turn_id": nil,
+	}); err != nil {
+		t.Fatalf("missing-id cleanup: %v", err)
+	}
+
+	seen := helper.seen()
+	if len(seen) != 2 || seen[1]["op"] != "window_close" {
+		t.Fatalf("missing-id frame did not close the old lease: %#v", seen)
+	}
+	code, body = doJSON(t, srv, http.MethodPost, "/computer_use/action",
+		`{"provider_id":"claude","session_id":"claude-session","turn_id":"real-turn","action":"pointer.move","x":1,"y":2}`)
+	if code != http.StatusConflict || body["code"] != "turn_not_active" {
+		t.Fatalf("missing-id frame left authority active: status=%d body=%#v", code, body)
+	}
+}
+
+func TestProviderTerminalWaitsForRelockConfirmation(t *testing.T) {
+	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
+		switch req["op"] {
+		case "window_open":
+			return map[string]any{
+				"ok": true, "window_open": true,
+				"window_turn_id": req["turn_id"], "window_closing": false,
+			}
+		case "window_close":
+			return refuse("failed", "relock could not be confirmed")
+		default:
+			return nil
+		}
+	})
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.LockedUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "turn-1")
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/window",
+		computerUseBody(t, `{"turn_id":"turn-1","action":"open"}`))
+	if code != http.StatusOK {
+		t.Fatalf("open status=%d body=%#v", code, body)
+	}
+
+	err := srv.observeComputerUseProviderFrame(computerUseTestProvider, computerUseTestSession,
+		map[string]any{"type": "turn", "status": "completed", "turn_id": "turn-1"})
+	if err == nil || computerUseErrorCode(err) != "failed" {
+		t.Fatalf("terminal relock err=%v, want preserved helper failure", err)
+	}
+	code, body = doJSON(t, srv, http.MethodPost, "/computer_use/action",
+		computerUseBody(t, `{"turn_id":"turn-1","action":"pointer.move","x":1,"y":2}`))
+	if code != http.StatusConflict || body["code"] != "turn_not_active" {
+		t.Fatalf("failed relock left lease active: status=%d body=%#v", code, body)
+	}
+}
+
+func TestInterruptRevokesLeaseAndRelocksImmediately(t *testing.T) {
+	helper := startWindowTrackingHelper(t)
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.LockedUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+	srv.registry[computerUseTestProvider] = &fakePushProvider{id: computerUseTestProvider}
+	if err := srv.store.UpsertSession(state.Record{
+		"session_id": computerUseTestSession, "provider_id": computerUseTestProvider,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "turn-1")
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/window",
+		computerUseBody(t, `{"turn_id":"turn-1","action":"open"}`))
+	if code != http.StatusOK {
+		t.Fatalf("open status=%d body=%#v", code, body)
+	}
+
+	code, body = doJSON(t, srv, http.MethodPost, "/interrupt",
+		`{"provider_id":"codex","session_id":"computer-use-session"}`)
+	if code != http.StatusOK || body["ok"] != true {
+		t.Fatalf("interrupt status=%d body=%#v", code, body)
+	}
+	seen := helper.seen()
+	if len(seen) != 2 || seen[1]["op"] != "window_close" {
+		t.Fatalf("interrupt requests=%#v, want open then close", seen)
+	}
+}
+
+func TestComputerUseWindowBusyPreservesCodeButHidesOwner(t *testing.T) {
+	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
+		if req["op"] == "window_open" {
+			return refuse("window_busy", "another turn (secret-owner) owns the locked-use window")
+		}
+		return nil
+	})
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.LockedUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "other-turn")
+
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/window",
+		computerUseBody(t, `{"turn_id":"other-turn","action":"open"}`))
+	if code != http.StatusConflict || body["code"] != "window_busy" {
+		t.Fatalf("window busy status=%d body=%#v", code, body)
+	}
+	if detail, _ := body["detail"].(string); strings.Contains(detail, "secret-owner") {
+		t.Fatalf("window busy response exposed the owner: %#v", body)
+	}
+}
+
+func TestComputerUseWindowUsesOperationStateAndPropagatesCloseFailure(t *testing.T) {
+	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
+		switch req["op"] {
+		case "window_open":
+			return map[string]any{
+				"ok": true, "window_open": true,
+				"window_turn_id": req["turn_id"], "window_closing": false,
+			}
+		case "window_close":
+			return refuse("failed", "relock could not be confirmed")
+		default:
+			return nil
+		}
+	})
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.LockedUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "turn-1")
+
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/window",
+		computerUseBody(t, `{"turn_id":"turn-1","action":"open"}`))
+	if code != http.StatusOK || body["window_open"] != true ||
+		body["window_registered"] != true || body["window_phase"] != "open" ||
+		body["window_turn_id"] != "turn-1" {
+		t.Fatalf("open status=%d body=%#v", code, body)
+	}
+	seen := helper.seen()
+	if len(seen) != 1 || seen[0]["op"] != "window_open" {
+		t.Fatalf("open performed a second state query: %#v", seen)
+	}
+
+	code, body = doJSON(t, srv, http.MethodPost, "/computer_use/window",
+		computerUseBody(t, `{"turn_id":"turn-1","action":"close"}`))
+	if code != http.StatusInternalServerError || body["code"] != "failed" {
+		t.Fatalf("close status=%d body=%#v, want 500/failed", code, body)
+	}
+}
+
+func TestComputerUseCloseDoesNotClaimSuccessWhenHelperIsUnavailable(t *testing.T) {
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.LockedUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = "/tmp/ra-absent-helper.sock"
+	})
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/window",
+		computerUseBody(t, `{"turn_id":"turn-1","action":"close"}`))
+	if code != http.StatusServiceUnavailable || body["code"] != "helper_unavailable" {
+		t.Fatalf("close status=%d body=%#v, want 503/helper_unavailable", code, body)
+	}
+}
+
+func TestComputerUseAXRejectsUnsafePathsAndForwardsEmptyValue(t *testing.T) {
+	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
+		return map[string]any{"ok": true}
+	})
+	srv := computerUseServer(t, func(cfg *config.Config) {
+		cfg.ComputerUse.Enabled = true
+		cfg.ComputerUse.HelperSocket = helper.path
+	})
+
+	for _, body := range []string{
+		`{"turn_id":"t1","op":"ax_press","app":"CatDesk","path":[-1]}`,
+		`{"turn_id":"t1","op":"ax_press","app":"CatDesk","path":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}`,
+	} {
+		code, out := doJSON(t, srv, http.MethodPost, "/computer_use/ax", computerUseBody(t, body))
+		if code != http.StatusBadRequest || out["code"] != "bad_request" {
+			t.Errorf("unsafe path status=%d body=%#v", code, out)
+		}
+	}
+
+	startComputerUseTurn(srv, computerUseTestProvider, computerUseTestSession, "t1")
+	code, body := doJSON(t, srv, http.MethodPost, "/computer_use/ax",
+		computerUseBody(t, `{"turn_id":"t1","op":"ax_setvalue","app":"CatDesk","path":[0],"value":""}`))
+	if code != http.StatusOK {
+		t.Fatalf("empty setvalue status=%d body=%#v", code, body)
+	}
+	seen := helper.seen()
+	last := seen[len(seen)-1]
+	if value, present := last["value"]; !present || value != "" {
+		t.Fatalf("empty value not forwarded: %#v", last)
 	}
 }

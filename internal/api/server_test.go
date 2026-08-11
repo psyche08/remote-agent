@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"mime/multipart"
@@ -10,11 +11,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/psyche08/remote-agent/internal/computeruse"
 	"github.com/psyche08/remote-agent/internal/config"
 	"github.com/psyche08/remote-agent/internal/provider"
 	"github.com/psyche08/remote-agent/internal/state"
@@ -177,6 +180,222 @@ func (f *resumeCodexProvider) OpenResumeSession(sessionID string, resumeID strin
 	return resumeID, nil
 }
 
+type claudeRouteBinding struct {
+	sessionID    string
+	transcriptID string
+	route        string
+	cwd          string
+}
+
+type claudeCommitBinding struct {
+	sessionID string
+	committed bool
+}
+
+type claudeRouteProvider struct {
+	fakePushProvider
+	mu             sync.Mutex
+	defaultRoute   string
+	routes         map[string]string
+	committed      map[string]bool
+	bindings       []claudeRouteBinding
+	commitBindings []claudeCommitBinding
+	commitHandler  provider.ClaudeControlRouteCommitHandler
+	codexBindCalls int
+	nativeID       string
+	sendRoute      string
+	resumeRoute    string
+	sendNativeID   string
+	sendDone       chan struct{}
+	sendOperation  string
+	sendCalls      int
+	sendResult     *provider.SendResult
+	panicSend      bool
+	startOptions   map[string]provider.StartOptions
+}
+
+type closeTrackingAutomationHost struct {
+	fakeComputerUseAutomationHost
+	closeMu    sync.Mutex
+	closeCalls int
+}
+
+func (f *closeTrackingAutomationHost) CloseSession(string) map[string]any {
+	f.closeMu.Lock()
+	f.closeCalls++
+	f.closeMu.Unlock()
+	return map[string]any{"ok": true}
+}
+
+func (f *closeTrackingAutomationHost) closeCallCount() int {
+	f.closeMu.Lock()
+	defer f.closeMu.Unlock()
+	return f.closeCalls
+}
+
+func (f *claudeRouteProvider) ID() string { return "claude" }
+
+func (f *claudeRouteProvider) ClaudeControlRoute(sessionID string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if route := f.routes[sessionID]; route != "" {
+		return route
+	}
+	return f.defaultRoute
+}
+
+func (f *claudeRouteProvider) ClaudeControlRouteCommitted(sessionID string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.committed[sessionID]
+}
+
+func (f *claudeRouteProvider) SetClaudeControlRouteCommitHandler(
+	handler provider.ClaudeControlRouteCommitHandler,
+) {
+	f.mu.Lock()
+	f.commitHandler = handler
+	f.mu.Unlock()
+}
+
+func (f *claudeRouteProvider) BindClaudeControlCommitted(sessionID string, committed bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.committed == nil {
+		f.committed = map[string]bool{}
+	}
+	f.committed[sessionID] = f.committed[sessionID] || committed
+	f.commitBindings = append(f.commitBindings, claudeCommitBinding{sessionID: sessionID, committed: committed})
+}
+
+func (f *claudeRouteProvider) BindClaudeControlRoute(sessionID string, transcriptID string, route string, cwd string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.routes == nil {
+		f.routes = map[string]string{}
+	}
+	f.routes[sessionID] = route
+	f.bindings = append(f.bindings, claudeRouteBinding{
+		sessionID: sessionID, transcriptID: transcriptID, route: route, cwd: cwd,
+	})
+}
+
+func (f *claudeRouteProvider) BindClaudeControlStartOptions(sessionID string, opts provider.StartOptions) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.startOptions == nil {
+		f.startOptions = map[string]provider.StartOptions{}
+	}
+	f.startOptions[sessionID] = opts
+}
+
+// Implement the Codex compatibility interface as a regression trap: Claude
+// route hydration must never call it.
+func (f *claudeRouteProvider) BindSessionRoute(string, string, string, string) {
+	f.mu.Lock()
+	f.codexBindCalls++
+	f.mu.Unlock()
+}
+
+func (f *claudeRouteProvider) OpenOrCreateSession(sessionID string, _ provider.StartOptions) (string, error) {
+	f.mu.Lock()
+	if f.routes == nil {
+		f.routes = map[string]string{}
+	}
+	if f.routes[sessionID] == "" {
+		f.routes[sessionID] = f.defaultRoute
+	}
+	nativeID := f.nativeID
+	f.mu.Unlock()
+	return nativeID, nil
+}
+
+func (f *claudeRouteProvider) OpenResumeSession(sessionID string, resumeID string, _ string, _ bool) (string, error) {
+	f.mu.Lock()
+	if f.routes == nil {
+		f.routes = map[string]string{}
+	}
+	if f.resumeRoute != "" {
+		f.routes[sessionID] = f.resumeRoute
+	}
+	f.mu.Unlock()
+	return resumeID, nil
+}
+
+func (f *claudeRouteProvider) SendPrompt(sessionID string, _ string) provider.SendResult {
+	f.mu.Lock()
+	f.sendCalls++
+	if f.routes == nil {
+		f.routes = map[string]string{}
+	}
+	if f.sendRoute != "" {
+		f.routes[sessionID] = f.sendRoute
+		if f.sendRoute == "stream_json_cli" {
+			if f.committed == nil {
+				f.committed = map[string]bool{}
+			}
+			f.committed[sessionID] = true
+		}
+	}
+	done := f.sendDone
+	configuredResult := f.sendResult
+	sendNativeID := f.sendNativeID
+	panicSend := f.panicSend
+	f.mu.Unlock()
+	if done != nil {
+		select {
+		case done <- struct{}{}:
+		default:
+		}
+	}
+	if panicSend {
+		panic("test provider send panic")
+	}
+	if configuredResult != nil {
+		return *configuredResult
+	}
+	return provider.SendResult{
+		OK: true, State: "running", NativeTaskID: "claude-turn-1", NativeSessionID: sendNativeID,
+	}
+}
+
+func (f *claudeRouteProvider) SendPromptOperation(
+	sessionID string, prompt string, operationID string,
+) provider.SendResult {
+	f.mu.Lock()
+	f.sendOperation = operationID
+	f.mu.Unlock()
+	return f.SendPrompt(sessionID, prompt)
+}
+
+func (f *claudeRouteProvider) snapshot() ([]claudeRouteBinding, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]claudeRouteBinding(nil), f.bindings...), f.codexBindCalls
+}
+
+func (f *claudeRouteProvider) commitmentSnapshot() ([]claudeCommitBinding, map[string]bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	committed := make(map[string]bool, len(f.committed))
+	for sessionID, value := range f.committed {
+		committed[sessionID] = value
+	}
+	return append([]claudeCommitBinding(nil), f.commitBindings...), committed
+}
+
+func (f *claudeRouteProvider) durableCommitHandler() provider.ClaudeControlRouteCommitHandler {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.commitHandler
+}
+
+func (f *claudeRouteProvider) sendSnapshot() (int, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sendCalls, f.sendOperation
+}
+
 type desktopOnlyCodexProvider struct {
 	fakePushProvider
 	boundSession    string
@@ -302,7 +521,10 @@ func TestUploadIsSessionScopedAndDeliveredAsAttachment(t *testing.T) {
 		t.Fatalf("bad upload response: %#v", uploaded)
 	}
 
-	payload, _ := json.Marshal(map[string]any{"provider_id": "claude", "session_id": "logical-1", "prompt": "", "attachments": []string{uploaded.Attachment.ID}})
+	payload, _ := json.Marshal(map[string]any{
+		"provider_id": "claude", "session_id": "logical-1", "prompt": "",
+		"attachments": []string{uploaded.Attachment.ID}, "operation_id": "prompt-test-attachment-0001",
+	})
 	rr = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPost, "/send_prompt", bytes.NewReader(payload))
 	srv.Handler().ServeHTTP(rr, req)
@@ -588,7 +810,7 @@ func TestDesktopSendAttachesInBackgroundAndStreamsResult(t *testing.T) {
 			}()
 			srv := NewServer(cfg, provider.Registry{"codex": fp}, st)
 			// The PWA subscribes native Codex previews by transcript id, not by
-			// the logical remote-agent session id.
+			// the logical AgentHalo session id.
 			stream := srv.subscribeStream("codex", "thread-1")
 			defer srv.unsubscribeStream("codex", "thread-1", stream)
 
@@ -980,7 +1202,7 @@ func TestClientVersionsRecordsFetchHeaders(t *testing.T) {
 	req.Header.Set(clientIDHeader, "client-a")
 	req.Header.Set(clientKindHeader, "web")
 	req.Header.Set(clientVisibilityHeader, "visible")
-	req.Header.Set("User-Agent", "remote-agent-test")
+	req.Header.Set("User-Agent", "agenthalo-test")
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
@@ -1011,22 +1233,6 @@ func TestClientVersionsRecordsFetchHeaders(t *testing.T) {
 	}
 	if _, ok := row["stale"]; ok {
 		t.Fatalf("client web version must not be compared with agent version: %#v", row)
-	}
-}
-
-func TestClientVersionsAcceptsLegacyRemoteCodingHeaders(t *testing.T) {
-	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
-	config.ApplyDefaults(cfg)
-	srv := NewServer(cfg, provider.BuildRegistry(cfg), state.New(filepath.Join(t.TempDir(), "data")))
-	req := httptest.NewRequest(http.MethodGet, "/status", nil)
-	req.Header.Set(legacyWebVersionHeader, "legacy-web")
-	req.Header.Set(legacyIDHeader, "legacy-client")
-	req.Header.Set(legacyKindHeader, "legacy")
-	req.Header.Set(legacyVisibilityHeader, "visible")
-	srv.recordClientVersion(req)
-	row := srv.clients["id:legacy-client"]
-	if row == nil || row.WebVersion != "legacy-web" || row.Kind != "legacy" || row.Visibility != "visible" {
-		t.Fatalf("legacy headers not preserved during migration: %#v", row)
 	}
 }
 
@@ -1524,6 +1730,84 @@ func TestCreateAndCloseSession(t *testing.T) {
 	}
 }
 
+func TestCloseSessionSynchronouslyRelocksActiveAutomation(t *testing.T) {
+	helper := startComputerUseAutomationHelper(t)
+	host := &closeTrackingAutomationHost{fakeComputerUseAutomationHost: fakeComputerUseAutomationHost{
+		fakePushProvider: fakePushProvider{id: "claude"},
+	}}
+	cfg := &config.Config{
+		DeviceID: "device-a", DefaultProvider: "claude",
+		ComputerUse: config.ComputerUseConfig{
+			Enabled: true, HelperSocket: helper.path,
+			LockedUse: config.LockedUseConfig{Enabled: true},
+		},
+		Providers: map[string]config.ProviderConfig{"claude": {}},
+	}
+	config.ApplyDefaults(cfg)
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": "logical-close-automation", "provider_id": "claude",
+		"claude_control_route": "desktop_computer_use", claudeControlCommittedKey: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": host}, st)
+	if host.handler == nil {
+		t.Fatal("computer-use automation handler was not installed")
+	}
+	opened := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- host.handler(context.Background(), "logical-close-automation", func(
+			ctx context.Context, tool provider.ComputerUseToolHandler,
+		) error {
+			if _, err := tool(ctx, provider.ComputerUseToolRequest{
+				Tool: "get_app_state", BundleID: "com.anthropic.claudefordesktop",
+			}); err != nil {
+				return err
+			}
+			close(opened)
+			<-release
+			_, err := tool(ctx, provider.ComputerUseToolRequest{Tool: "get_app_state"})
+			return err
+		})
+	}()
+	select {
+	case <-opened:
+	case <-time.After(time.Second):
+		t.Fatal("automation did not open a Locked Use window")
+	}
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(
+		http.MethodPost, "/close_session",
+		strings.NewReader(`{"provider_id":"claude","session_id":"logical-close-automation"}`),
+	))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("close status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	seen := helper.seen()
+	if len(seen) == 0 || seen[len(seen)-1]["op"] != "window_close" {
+		t.Fatalf("close returned before relock confirmation: %#v", seen)
+	}
+	if host.closeCallCount() != 1 {
+		t.Fatalf("provider close calls=%d", host.closeCallCount())
+	}
+	if records, err := st.Sessions(); err != nil || len(records) != 0 {
+		t.Fatalf("closed records=%#v err=%v", records, err)
+	}
+	close(release)
+	select {
+	case err := <-done:
+		if !errors.Is(err, computeruse.ErrTurnNotActive) {
+			t.Fatalf("revoked callback err=%v, want ErrTurnNotActive", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("revoked automation callback did not finish")
+	}
+}
+
 func TestCreateCodexSessionPersistsConcreteOwnerRoute(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -1579,6 +1863,800 @@ func TestCreateCodexSessionPersistsConcreteOwnerRoute(t *testing.T) {
 				t.Fatalf("stored session=%#v", records[0])
 			}
 		})
+	}
+}
+
+func TestCreateClaudeSessionPersistsDefaultComputerUseRoute(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"},
+		defaultRoute:     "desktop_computer_use",
+		routes:           map[string]string{},
+		nativeID:         "claude-native-1",
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(
+		`{"provider_id":"claude","title":"Desktop first"}`,
+	))
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	session, _ := body["session"].(map[string]any)
+	logicalID := stringAny(session["session_id"])
+	if logicalID == "" || recordString(session, "claude_control_route") != "desktop_computer_use" ||
+		session[claudeControlCommittedKey] != true {
+		t.Fatalf("response session=%#v", session)
+	}
+	records, err := st.Sessions()
+	if err != nil || len(records) != 1 || recordString(records[0], "claude_control_route") != "desktop_computer_use" ||
+		records[0][claudeControlCommittedKey] != true {
+		t.Fatalf("records=%#v err=%v", records, err)
+	}
+	bindings, codexCalls := fp.snapshot()
+	if len(bindings) == 0 || bindings[len(bindings)-1] != (claudeRouteBinding{
+		sessionID: logicalID, transcriptID: "claude-native-1", route: "desktop_computer_use", cwd: "",
+	}) {
+		t.Fatalf("bindings=%#v", bindings)
+	}
+	if codexCalls != 0 {
+		t.Fatalf("Claude create used Codex BindSessionRoute %d times", codexCalls)
+	}
+}
+
+func TestCreateClaudeDesktopSessionPersistsTentativeCommitment(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"},
+		defaultRoute:     "desktop_computer_use",
+		routes:           map[string]string{},
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(
+		http.MethodPost, "/sessions", strings.NewReader(`{"provider_id":"claude","title":"Tentative Desktop"}`),
+	))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var body struct {
+		Session map[string]any `json:"session"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if recordString(body.Session, "claude_control_route") != "desktop_computer_use" ||
+		body.Session[claudeControlCommittedKey] != false || body.Session["transcript_id"] != nil {
+		t.Fatalf("tentative response=%#v", body.Session)
+	}
+	records, err := st.Sessions()
+	if err != nil || len(records) != 1 || records[0][claudeControlCommittedKey] != false {
+		t.Fatalf("tentative records=%#v err=%v", records, err)
+	}
+}
+
+func TestClaudeDurableRouteCommitIsExactAtomicAndRestartSafe(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": "logical-commit-1", "provider_id": "claude",
+		"claude_control_route": "desktop_computer_use", claudeControlCommittedKey: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertSession(state.Record{
+		"session_id": "logical-alias-1", "provider_id": "claude",
+		"native_session_id": "native-alias-1", "transcript_id": "native-alias-1",
+		"claude_control_route": "desktop_computer_use", claudeControlCommittedKey: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"}, defaultRoute: "desktop_computer_use",
+		routes: map[string]string{},
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+	commit := fp.durableCommitHandler()
+	if commit == nil {
+		t.Fatal("server did not install the Claude durable route committer")
+	}
+	if err := commit(context.Background(), "native-alias-1", "desktop_computer_use"); err == nil ||
+		!strings.Contains(err.Error(), "stored logical session") {
+		t.Fatalf("native alias commit err=%v", err)
+	}
+	if err := commit(context.Background(), "missing", "desktop_computer_use"); err == nil {
+		t.Fatal("missing logical session was committed")
+	}
+	if err := commit(context.Background(), "logical-commit-1", "invalid"); err == nil {
+		t.Fatal("invalid route was committed")
+	}
+
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for _, route := range []string{"desktop_computer_use", "stream_json_cli"} {
+		route := route
+		go func() {
+			<-start
+			results <- commit(context.Background(), "logical-commit-1", route)
+		}()
+	}
+	close(start)
+	successes := 0
+	for range 2 {
+		if err := <-results; err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("competing route commits succeeded=%d, want exactly one", successes)
+	}
+	rec, found, err := srv.findSessionForProviderAny("claude", "logical-commit-1")
+	if err != nil || !found || rec[claudeControlCommittedKey] != true {
+		t.Fatalf("durable committed record=%#v found=%v err=%v", rec, found, err)
+	}
+	committedRoute := recordString(rec, "claude_control_route")
+	if committedRoute != "desktop_computer_use" && committedRoute != "stream_json_cli" {
+		t.Fatalf("committed route=%q", committedRoute)
+	}
+
+	// A fresh provider process must receive the durable commitment before any
+	// resumed mutation can choose a competing owner.
+	restarted := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"}, defaultRoute: "desktop_computer_use",
+		routes: map[string]string{},
+	}
+	restartedServer := NewServer(cfg, provider.Registry{"claude": restarted}, st)
+	if err := restartedServer.hydrateControlSession(restarted, "claude", "logical-commit-1"); err != nil {
+		t.Fatal(err)
+	}
+	calls, committed := restarted.commitmentSnapshot()
+	if !committed["logical-commit-1"] || len(calls) == 0 || !calls[len(calls)-1].committed {
+		t.Fatalf("restart commitment calls=%#v state=%#v", calls, committed)
+	}
+}
+
+func TestClaudeCommitmentHydrationNormalizesLegacyAndKnownOwners(t *testing.T) {
+	tests := []struct {
+		name      string
+		record    state.Record
+		committed bool
+		wantRoute string
+	}{
+		{name: "legacy missing route adopts primary fail closed", committed: true, wantRoute: "desktop_computer_use", record: state.Record{}},
+		{name: "legacy missing is fail closed", committed: true, wantRoute: "desktop_computer_use", record: state.Record{
+			"claude_control_route": "desktop_computer_use",
+		}},
+		{name: "new tentative desktop remains tentative", committed: false, wantRoute: "desktop_computer_use", record: state.Record{
+			"claude_control_route": "desktop_computer_use", claudeControlCommittedKey: false,
+		}},
+		{name: "existing transcript is committed", committed: true, wantRoute: "desktop_computer_use", record: state.Record{
+			"claude_control_route": "desktop_computer_use", claudeControlCommittedKey: false,
+			"native_session_id": "native-known", "transcript_id": "native-known",
+		}},
+		{name: "CLI is committed", committed: true, wantRoute: "stream_json_cli", record: state.Record{
+			"claude_control_route": "stream_json_cli", claudeControlCommittedKey: false,
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := state.New(filepath.Join(t.TempDir(), "data"))
+			tc.record["session_id"] = "logical-hydrate"
+			tc.record["provider_id"] = "claude"
+			if err := st.UpsertSession(tc.record); err != nil {
+				t.Fatal(err)
+			}
+			cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+			config.ApplyDefaults(cfg)
+			fp := &claudeRouteProvider{
+				fakePushProvider: fakePushProvider{id: "claude"}, defaultRoute: "desktop_computer_use",
+				routes: map[string]string{},
+			}
+			srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+			if err := srv.hydrateControlSession(fp, "claude", "logical-hydrate"); err != nil {
+				t.Fatal(err)
+			}
+			rec, found, err := srv.findSessionForProviderAny("claude", "logical-hydrate")
+			if err != nil || !found || rec[claudeControlCommittedKey] != tc.committed ||
+				recordString(rec, "claude_control_route") != tc.wantRoute {
+				t.Fatalf("stored rec=%#v found=%v err=%v", rec, found, err)
+			}
+			calls, committed := fp.commitmentSnapshot()
+			if len(calls) == 0 || calls[len(calls)-1].committed != tc.committed ||
+				committed["logical-hydrate"] != tc.committed {
+				t.Fatalf("binding calls=%#v committed=%#v", calls, committed)
+			}
+			bindings, _ := fp.snapshot()
+			if len(bindings) == 0 || bindings[len(bindings)-1].route != tc.wantRoute {
+				t.Fatalf("route bindings=%#v want=%q", bindings, tc.wantRoute)
+			}
+		})
+	}
+}
+
+func TestClaudeCLIFallbackRouteIsPersistedAfterSend(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": "claude-logical-1", "provider_id": "claude", "cwd": "/repo",
+		"native_session_id": "claude-native-1", "transcript_id": "claude-native-1",
+		"claude_control_route": "desktop_computer_use",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"},
+		defaultRoute:     "desktop_computer_use",
+		routes:           map[string]string{},
+		sendRoute:        "stream_json_cli",
+		sendDone:         make(chan struct{}, 1),
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(
+		`{"provider_id":"claude","session_id":"claude-logical-1","prompt":"fallback before mutation","operation_id":"prompt-test-fallback-0001"}`,
+	))
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-fp.sendDone:
+	case <-time.After(time.Second):
+		t.Fatal("Claude send did not run")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		rec, found, err := srv.findSessionForProviderAny("claude", "claude-logical-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found && recordString(rec, "claude_control_route") == "stream_json_cli" &&
+			rec[claudeControlCommittedKey] == true {
+			fp.mu.Lock()
+			operationID := fp.sendOperation
+			fp.mu.Unlock()
+			if operationID == "" {
+				t.Fatal("API did not pass its stable task id to PromptOperationSender")
+			}
+			_, codexCalls := fp.snapshot()
+			if codexCalls != 0 {
+				t.Fatalf("Claude send used Codex BindSessionRoute %d times", codexCalls)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	rec, _, _ := srv.findSessionForProviderAny("claude", "claude-logical-1")
+	t.Fatalf("CLI fallback route was not stored: %#v", rec)
+}
+
+func TestClaudeSendPromptRequiresAndReusesStableOperationID(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": "claude-idempotent", "provider_id": "claude",
+		"claude_control_route": "stream_json_cli", claudeControlCommittedKey: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"}, defaultRoute: "stream_json_cli",
+		routes:    map[string]string{"claude-idempotent": "stream_json_cli"},
+		committed: map[string]bool{"claude-idempotent": true}, sendDone: make(chan struct{}, 1),
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+
+	missing := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(missing, httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(
+		`{"provider_id":"claude","session_id":"claude-idempotent","prompt":"once"}`,
+	)))
+	if missing.Code != http.StatusBadRequest || !strings.Contains(missing.Body.String(), "operation_id") {
+		t.Fatalf("missing status=%d body=%s", missing.Code, missing.Body.String())
+	}
+
+	body := `{"provider_id":"claude","session_id":"claude-idempotent","prompt":"once","operation_id":"prompt-http-idempotent-0001"}`
+	first := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(body)))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+	select {
+	case <-fp.sendDone:
+	case <-time.After(time.Second):
+		t.Fatal("first idempotent send did not reach the provider")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		tasks, err := st.Tasks()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tasks) == 1 && recordString(tasks[0], "status") == "running" {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	retry := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(retry, httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(body)))
+	if retry.Code != http.StatusOK || !strings.Contains(retry.Body.String(), `"idempotent":true`) {
+		t.Fatalf("retry status=%d body=%s", retry.Code, retry.Body.String())
+	}
+	select {
+	case <-fp.sendDone:
+		t.Fatal("idempotent HTTP retry invoked the provider twice")
+	case <-time.After(20 * time.Millisecond):
+	}
+	tasks, err := st.Tasks()
+	if err != nil || len(tasks) != 1 || recordString(tasks[0], "task_id") != "prompt-http-idempotent-0001" {
+		t.Fatalf("tasks=%#v err=%v", tasks, err)
+	}
+
+	conflict := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(conflict, httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(
+		`{"provider_id":"claude","session_id":"claude-idempotent","prompt":"different","operation_id":"prompt-http-idempotent-0001"}`,
+	)))
+	if conflict.Code != http.StatusConflict {
+		t.Fatalf("conflict status=%d body=%s", conflict.Code, conflict.Body.String())
+	}
+}
+
+func TestClaudeProviderPanicBecomesUncertainWithoutCrashingOrResending(t *testing.T) {
+	const (
+		sessionID   = "claude-panic"
+		operationID = "prompt-provider-panic-0001"
+	)
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": sessionID, "provider_id": "claude",
+		"claude_control_route": "stream_json_cli", claudeControlCommittedKey: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"}, defaultRoute: "stream_json_cli",
+		routes:    map[string]string{sessionID: "stream_json_cli"},
+		committed: map[string]bool{sessionID: true}, panicSend: true,
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+	body := `{"provider_id":"claude","session_id":"` + sessionID +
+		`","prompt":"panic once","operation_id":"` + operationID + `"}`
+
+	first := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(body)))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first status=%d body=%s", first.Code, first.Body.String())
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		tasks, err := st.Tasks()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tasks) == 1 && recordString(tasks[0], "status") == "needs_manual" &&
+			recordString(tasks[0], "delivery_outcome") == "unknown" &&
+			!srv.isSendInFlight("claude", sessionID) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if srv.isSendInFlight("claude", sessionID) {
+		t.Fatal("provider panic left the send slot occupied")
+	}
+	tasks, err := st.Tasks()
+	if err != nil || len(tasks) != 1 || recordString(tasks[0], "status") != "needs_manual" ||
+		recordString(tasks[0], "delivery_outcome") != "unknown" {
+		t.Fatalf("panic task=%#v err=%v", tasks, err)
+	}
+	health := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(health, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if health.Code != http.StatusOK {
+		t.Fatalf("server did not survive provider panic: status=%d body=%s", health.Code, health.Body.String())
+	}
+
+	retry := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(retry, httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(body)))
+	if retry.Code != http.StatusOK || !strings.Contains(retry.Body.String(), `"idempotent":true`) ||
+		!strings.Contains(retry.Body.String(), `"delivery_outcome":"unknown"`) {
+		t.Fatalf("retry status=%d body=%s", retry.Code, retry.Body.String())
+	}
+	if calls, _ := fp.sendSnapshot(); calls != 1 {
+		t.Fatalf("provider panic retry calls=%d, want exactly one", calls)
+	}
+}
+
+func TestClaudeDuplicatePromptRepairsDurableNativeBindingWithoutResend(t *testing.T) {
+	const (
+		sessionID   = "claude-repair-binding"
+		operationID = "prompt-repair-binding-0001"
+		prompt      = "already delivered"
+		nativeID    = "local_claude_recovered_1"
+	)
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": sessionID, "provider_id": "claude", "cwd": "/repo",
+		"state": "idle", "claude_control_route": "desktop_computer_use",
+		claudeControlCommittedKey: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	task := newTaskRecordWithID("device-a", sessionID, "claude", prompt, operationID)
+	task["operation_id"] = operationID
+	task["request_digest"] = promptRequestDigest("claude", sessionID, prompt, nil)
+	task["status"] = "running"
+	task["delivery_outcome"] = "confirmed"
+	task["native_session_id"] = nativeID
+	task["transcript_id"] = nativeID
+	task["claude_control_route"] = "desktop_computer_use"
+	task[claudeControlCommittedKey] = true
+	if err := st.AppendTask(task); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"}, defaultRoute: "desktop_computer_use",
+		routes: map[string]string{}, committed: map[string]bool{}, sendDone: make(chan struct{}, 1),
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+	body := `{"provider_id":"claude","session_id":"` + sessionID + `","prompt":"` + prompt + `","operation_id":"` + operationID + `"}`
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(body)))
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"idempotent":true`) {
+		t.Fatalf("duplicate status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if sends, _ := fp.sendSnapshot(); sends != 0 {
+		t.Fatalf("binding repair resent the prompt %d times", sends)
+	}
+	repaired, found, err := st.FindSession(sessionID)
+	if err != nil || !found || recordString(repaired, "native_session_id") != nativeID ||
+		recordString(repaired, "transcript_id") != nativeID ||
+		recordString(repaired, "claude_control_route") != "desktop_computer_use" ||
+		repaired[claudeControlCommittedKey] != true {
+		t.Fatalf("repaired session=%#v found=%v err=%v", repaired, found, err)
+	}
+	bindings, _ := fp.snapshot()
+	if len(bindings) == 0 || bindings[len(bindings)-1] != (claudeRouteBinding{
+		sessionID: sessionID, transcriptID: nativeID, route: "desktop_computer_use", cwd: "/repo",
+	}) {
+		t.Fatalf("provider did not receive repaired binding: %#v", bindings)
+	}
+}
+
+func TestClaudeRetryAfterDeliveredBeforeAPIWritePersistsNeedsManual(t *testing.T) {
+	const (
+		sessionID   = "claude-delivery-unknown"
+		operationID = "prompt-delivery-unknown-0001"
+		prompt      = "do this exactly once"
+	)
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": sessionID, "provider_id": "claude", "state": "idle",
+		"claude_control_route": "stream_json_cli", claudeControlCommittedKey: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// This is the deterministic restart image for a crash after the provider
+	// side effect and before the API prepared its task/session outcome journal.
+	task := newTaskRecordWithID("device-a", sessionID, "claude", prompt, operationID)
+	task["operation_id"] = operationID
+	task["request_digest"] = promptRequestDigest("claude", sessionID, prompt, nil)
+	task["status"] = "sent"
+	if err := st.AppendTask(task); err != nil {
+		t.Fatal(err)
+	}
+	unknownMessage := "Claude prompt operation was already attempted; delivery will not be retried"
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"}, defaultRoute: "stream_json_cli",
+		routes:    map[string]string{sessionID: "stream_json_cli"},
+		committed: map[string]bool{sessionID: true}, sendDone: make(chan struct{}, 1),
+		sendResult: &provider.SendResult{OK: false, State: "needs_manual", Error: &unknownMessage},
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+	body := `{"provider_id":"claude","session_id":"` + sessionID + `","prompt":"` + prompt + `","operation_id":"` + operationID + `"}`
+	first := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(first, httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(body)))
+	if first.Code != http.StatusOK {
+		t.Fatalf("retry status=%d body=%s", first.Code, first.Body.String())
+	}
+	select {
+	case <-fp.sendDone:
+	case <-time.After(time.Second):
+		t.Fatal("restart retry did not consult provider tombstone")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		tasks, err := st.Tasks()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tasks) == 1 && recordString(tasks[0], "status") == "needs_manual" {
+			if recordString(tasks[0], "delivery_outcome") != "unknown" ||
+				recordString(tasks[0], "error") != unknownMessage {
+				t.Fatalf("uncertain task=%#v", tasks[0])
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	tasks, err := st.Tasks()
+	if err != nil || len(tasks) != 1 || recordString(tasks[0], "status") != "needs_manual" {
+		t.Fatalf("provider tombstone was reported as a definite failure: tasks=%#v err=%v", tasks, err)
+	}
+	rec, found, err := st.FindSession(sessionID)
+	if err != nil || !found || recordString(rec, "state") != "needs_manual" ||
+		recordString(rec, "last_error") != unknownMessage {
+		t.Fatalf("uncertain session=%#v found=%v err=%v", rec, found, err)
+	}
+
+	duplicate := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(duplicate, httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(body)))
+	if duplicate.Code != http.StatusOK || !strings.Contains(duplicate.Body.String(), `"idempotent":true`) ||
+		!strings.Contains(duplicate.Body.String(), `"delivery_outcome":"unknown"`) {
+		t.Fatalf("unknown duplicate status=%d body=%s", duplicate.Code, duplicate.Body.String())
+	}
+	if sends, gotOperation := fp.sendSnapshot(); sends != 1 || gotOperation != operationID {
+		t.Fatalf("unknown retry sends=%d operation=%q", sends, gotOperation)
+	}
+}
+
+func TestClaudeStartOptionsHydrateAsCompleteContract(t *testing.T) {
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"}, defaultRoute: "desktop_computer_use",
+		routes: map[string]string{},
+	}
+	rec := state.Record{
+		"provider_id": "claude", "claude_control_route": "desktop_computer_use",
+		"cwd": "/repo", "model": "sonnet", "effort": "high", "mode": "auto",
+	}
+	bindSessionTranscript(fp, rec, "logical-options", "")
+	fp.mu.Lock()
+	opts := fp.startOptions["logical-options"]
+	fp.mu.Unlock()
+	want := (provider.StartOptions{Cwd: "/repo", Model: "sonnet", Effort: "high", Mode: "auto"})
+	if opts != want {
+		t.Fatalf("hydrated options=%#v want=%#v", opts, want)
+	}
+}
+
+func TestClaudeStartOptionsDefaultToAutoMode(t *testing.T) {
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"}, defaultRoute: "desktop_computer_use",
+		routes: map[string]string{},
+	}
+	opts, err := validateStartOptions(fp, createSessionIn{})
+	if err != nil || opts.Mode != "auto" {
+		t.Fatalf("default Claude options=%#v err=%v", opts, err)
+	}
+}
+
+func TestClaudeFirstUISendPersistsAndBindsNativeSession(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": "claude-new-ui-1", "provider_id": "claude", "cwd": "/repo",
+		"claude_control_route": "desktop_computer_use", claudeControlCommittedKey: false,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"},
+		defaultRoute:     "desktop_computer_use",
+		routes:           map[string]string{},
+		sendNativeID:     "local_claude_native_1",
+		sendDone:         make(chan struct{}, 1),
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/send_prompt", strings.NewReader(
+		`{"provider_id":"claude","session_id":"claude-new-ui-1","prompt":"create in Desktop","operation_id":"prompt-test-desktop-0001"}`,
+	))
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-fp.sendDone:
+	case <-time.After(time.Second):
+		t.Fatal("Claude UI send did not run")
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		rec, found, err := srv.findSessionForProviderAny("claude", "claude-new-ui-1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found && recordString(rec, "native_session_id") == "local_claude_native_1" &&
+			recordString(rec, "transcript_id") == "local_claude_native_1" &&
+			rec[claudeControlCommittedKey] == true {
+			tasks, err := st.Tasks()
+			if err != nil || len(tasks) != 1 || recordString(tasks[0], "status") != "running" ||
+				recordString(tasks[0], "delivery_outcome") != "confirmed" ||
+				recordString(tasks[0], "native_session_id") != "local_claude_native_1" ||
+				recordString(tasks[0], "transcript_id") != "local_claude_native_1" ||
+				recordString(tasks[0], "claude_control_route") != "desktop_computer_use" ||
+				tasks[0][claudeControlCommittedKey] != true {
+				t.Fatalf("task/session outcome was not atomically proof-carrying: tasks=%#v err=%v", tasks, err)
+			}
+			bindings, codexCalls := fp.snapshot()
+			if len(bindings) == 0 || bindings[len(bindings)-1] != (claudeRouteBinding{
+				sessionID: "claude-new-ui-1", transcriptID: "local_claude_native_1",
+				route: "desktop_computer_use", cwd: "/repo",
+			}) {
+				t.Fatalf("native session was not route-bound: %#v", bindings)
+			}
+			if codexCalls != 0 {
+				t.Fatalf("Claude lazy binding used Codex BindSessionRoute %d times", codexCalls)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	rec, _, _ := srv.findSessionForProviderAny("claude", "claude-new-ui-1")
+	t.Fatalf("first UI send native identity was not stored: %#v", rec)
+}
+
+func TestClaudeControlRouteHydratesAfterRestart(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": "claude-logical-1", "provider_id": "claude", "cwd": "/repo",
+		"native_session_id": "claude-native-1", "transcript_id": "claude-native-1",
+		"claude_control_route": "stream_json_cli",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	// A restarted provider begins with the Desktop-first default. Hydration must
+	// restore the persisted CLI owner before any mutating operation.
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"},
+		defaultRoute:     "desktop_computer_use",
+		routes:           map[string]string{},
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+	if err := srv.hydrateControlSession(fp, "claude", "claude-logical-1"); err != nil {
+		t.Fatal(err)
+	}
+	bindings, codexCalls := fp.snapshot()
+	if len(bindings) == 0 {
+		t.Fatal("persisted Claude route was not rebound")
+	}
+	for _, binding := range bindings {
+		if binding.route != "stream_json_cli" || binding.transcriptID != "claude-native-1" {
+			t.Fatalf("binding=%#v", binding)
+		}
+	}
+	if got := fp.ClaudeControlRoute("claude-logical-1"); got != "stream_json_cli" {
+		t.Fatalf("hydrated route=%q", got)
+	}
+	if codexCalls != 0 {
+		t.Fatalf("Claude hydration used Codex BindSessionRoute %d times", codexCalls)
+	}
+}
+
+func TestClaudeControlRouteHydratesWithoutNativeTranscript(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": "claude-unbound-1", "provider_id": "claude", "cwd": "/repo",
+		"claude_control_route": "stream_json_cli",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"},
+		defaultRoute:     "desktop_computer_use",
+		routes:           map[string]string{},
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+	if err := srv.hydrateControlSession(fp, "claude", "claude-unbound-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fp.ClaudeControlRoute("claude-unbound-1"); got != "stream_json_cli" {
+		t.Fatalf("route without transcript=%q, want persisted CLI owner", got)
+	}
+	bindings, codexCalls := fp.snapshot()
+	if len(bindings) == 0 || bindings[len(bindings)-1] != (claudeRouteBinding{
+		sessionID: "claude-unbound-1", transcriptID: "", route: "stream_json_cli", cwd: "/repo",
+	}) {
+		t.Fatalf("bindings=%#v", bindings)
+	}
+	if codexCalls != 0 {
+		t.Fatalf("Claude hydration used Codex BindSessionRoute %d times", codexCalls)
+	}
+}
+
+func TestLegacyClaudeRecordAdoptsAndPersistsProviderDefaultRoute(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": "claude-legacy-1", "provider_id": "claude", "cwd": "/repo",
+		"native_session_id": "claude-native-legacy", "transcript_id": "claude-native-legacy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude"},
+		defaultRoute:     "desktop_computer_use",
+		routes:           map[string]string{},
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+	if err := srv.hydrateControlSession(fp, "claude", "claude-legacy-1"); err != nil {
+		t.Fatal(err)
+	}
+	rec, found, err := srv.findSessionForProviderAny("claude", "claude-legacy-1")
+	if err != nil || !found || recordString(rec, "claude_control_route") != "desktop_computer_use" {
+		t.Fatalf("legacy record=%#v found=%v err=%v", rec, found, err)
+	}
+	bindings, codexCalls := fp.snapshot()
+	if len(bindings) == 0 || bindings[0].route != "desktop_computer_use" {
+		t.Fatalf("bindings=%#v", bindings)
+	}
+	if codexCalls != 0 {
+		t.Fatalf("legacy Claude hydration used Codex BindSessionRoute %d times", codexCalls)
+	}
+}
+
+func TestResumeNativeClaudePersistsFinalFallbackRoute(t *testing.T) {
+	const nativeID = "claude-cli-session-1"
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.UpsertSession(state.Record{
+		"session_id": "claude-logical-resume", "provider_id": "claude", "cwd": "/repo",
+		"native_session_id": nativeID, "transcript_id": nativeID,
+		"claude_control_route": "desktop_computer_use",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &claudeRouteProvider{
+		fakePushProvider: fakePushProvider{id: "claude", native: []map[string]any{{
+			"native_session_id": nativeID, "cli_session_id": nativeID, "title": "Resume", "cwd": "/repo",
+		}}},
+		defaultRoute: "desktop_computer_use",
+		routes:       map[string]string{},
+		resumeRoute:  "stream_json_cli",
+	}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/resume_native_session", strings.NewReader(
+		`{"provider_id":"claude","native_session_id":"`+nativeID+`"}`,
+	))
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	rec, found, err := srv.findSessionForProviderAny("claude", "claude-logical-resume")
+	if err != nil || !found || recordString(rec, "claude_control_route") != "stream_json_cli" ||
+		rec[claudeControlCommittedKey] != true {
+		t.Fatalf("resumed record=%#v found=%v err=%v body=%s", rec, found, err, rr.Body.String())
+	}
+	_, codexCalls := fp.snapshot()
+	if codexCalls != 0 {
+		t.Fatalf("Claude resume used Codex BindSessionRoute %d times", codexCalls)
 	}
 }
 
@@ -2124,6 +3202,7 @@ type fakeControlProvider struct {
 	requestID       string
 	decision        string
 	answers         map[string]string
+	structured      map[string]provider.QuestionAnswer
 	boundSession    string
 	boundTranscript string
 }
@@ -2140,6 +3219,13 @@ func (f *fakeControlProvider) RelayApprovalRequest(sessionID string, requestID s
 func (f *fakeControlProvider) AnswerQuestion(sessionID string, requestID string, answers map[string]string) map[string]any {
 	f.sessionID, f.requestID, f.answers = sessionID, requestID, answers
 	return map[string]any{"ok": true, "detail": "answered"}
+}
+
+func (f *fakeControlProvider) AnswerQuestionStructured(
+	sessionID string, requestID string, answers map[string]provider.QuestionAnswer,
+) map[string]any {
+	f.sessionID, f.requestID, f.structured = sessionID, requestID, answers
+	return map[string]any{"ok": true, "detail": "answered exactly"}
 }
 
 func (f *fakeControlProvider) SessionRunning(string) *bool {
@@ -2358,6 +3444,27 @@ func TestQuestionAnswerEndpoint(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK || fp.sessionID != "session-1" || fp.requestID != "question-1" || fp.answers["Which mode?"] != "Safe" {
 		t.Fatalf("status=%d body=%s provider=%#v", rr.Code, rr.Body.String(), fp)
+	}
+}
+
+func TestQuestionAnswerEndpointPreservesStructuredMultiSelect(t *testing.T) {
+	cfg := &config.Config{DeviceID: "device-a", DefaultProvider: "claude", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	fp := &fakeControlProvider{}
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, state.New(filepath.Join(t.TempDir(), "data")))
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/question_answer", strings.NewReader(`{
+		"provider_id":"claude","session_id":"session-1","request_id":"question-1",
+		"answers":{"Pick values":"A, B, value with, comma"},
+		"answer_items":[{"question":"Pick values","selected":["A","value with, comma"],"other":"B"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	srv.Handler().ServeHTTP(rr, req)
+	want := provider.QuestionAnswer{Selected: []string{"A", "value with, comma"}, Other: "B"}
+	if rr.Code != http.StatusOK || fp.sessionID != "session-1" || fp.requestID != "question-1" ||
+		!reflect.DeepEqual(fp.structured["Pick values"], want) {
+		t.Fatalf("status=%d body=%s structured=%#v", rr.Code, rr.Body.String(), fp.structured)
 	}
 }
 

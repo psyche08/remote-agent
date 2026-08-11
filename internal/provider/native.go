@@ -100,6 +100,8 @@ func claudeDesktopSessions(base string, limit int) []map[string]any {
 			"bridge_session_ids": rec["bridgeSessionIds"],
 			"title":              firstNonEmpty(stringAny(rec["title"]), "(untitled)"),
 			"cwd":                firstNonEmpty(stringAny(rec["cwd"]), stringAny(rec["originCwd"])),
+			"origin_cwd":         nullableString(rec["originCwd"]),
+			"permission_mode":    nullableString(rec["permissionMode"]),
 			"branch":             nullableString(rec["branch"]),
 			"worktree":           nullableString(rec["worktreeName"]),
 			"model":              nullableString(rec["model"]),

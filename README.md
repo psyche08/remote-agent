@@ -1,8 +1,28 @@
-# AI Desktop Remote Agent (MVP)
+# AgentHalo
 
-The repository and Go module are named `remote-agent`. The installed command,
-supervisor service, state paths, and browser storage keys remain
-`remote-agent` for backward compatibility with existing deployments.
+**AgentHalo** is the product name. Its primary macOS signing/bundle identifier is
+`dev.linsheng.agenthalo`.
+
+The Git remote and Go module still use `github.com/psyche08/remote-agent`
+until the repository itself is moved. That source import path is not an
+installed product identity. A fresh installation otherwise uses AgentHalo
+names only: `agenthalo` for the command/service/relay namespace,
+`/opt/private-tunnel/state/agenthalo` for state, and `AGENTHALO_*` for its
+operator environment.
+
+The macOS identities are derived from the base identifier:
+
+- agent: `dev.linsheng.agenthalo`
+- desktop helper and fresh LaunchAgent: `dev.linsheng.agenthalo.desktop`
+- Authorization Plug-in: `dev.linsheng.agenthalo.locked-use.plugin`
+- authorization child rule: `dev.linsheng.agenthalo.locked-use`
+
+This is a clean replacement, not an in-place identity migration. Before
+installing AgentHalo, use the uninstaller from the previously installed
+version and verify that its LaunchAgent, Authorization rule, plug-in bundle and
+state are gone. AgentHalo neither imports nor accepts the previous product's
+identity or state. See
+[`SETUP-locked-unlock.md`](mac/RemoteAgentDesktop/SETUP-locked-unlock.md).
 
 A small **macOS local agent** that lets you drive AI coding/chat agents on a Mac
 from a phone/browser — **without** RDP, VNC, Parsec or any remote-desktop/video
@@ -14,7 +34,7 @@ layer:
 
 | Family | Providers | How it drives the agent | How it reads output |
 |--------|-----------|-------------------------|---------------------|
-| **Claude** | `claude` | creates/resumes the real CLI as a managed `stream-json` child | live NDJSON events + merged Desktop/CLI transcript metadata |
+| **Claude** | `claude` | drives the exact Claude Desktop session through short in-process Computer Use / Locked Use transactions; a managed `stream-json` CLI is a pre-mutation fallback for a brand-new session only | side-effect-free observer hooks + merged Desktop/CLI transcript metadata; CLI NDJSON only on the sticky fallback route |
 | **Codex Desktop/app-server** | `codex` | maps each logical session to a Codex thread and binds mutable control to the official shared app-server daemon; Desktop owner/follower IPC is an explicit compatibility route | merged app-server/local discovery, app-server notifications, and rollout preview tailing |
 | **Generic terminal fallback** | configured `"type": "pty"` providers | starts one fixed executable + args in one PTY per logical session; no shell expansion | bounded, terminal-control-sanitized memory + WebSocket deltas |
 
@@ -22,22 +42,28 @@ layer:
 > account or one Codex account. The agent never switches or logs into accounts.
 
 Claude exposes one provider and one identity namespace. Desktop session metadata
-and CLI transcript metadata are merged by Claude transcript id, while all input,
-streaming, approval, question, and interrupt control uses the managed CLI
-`stream-json` process. The legacy `claude_cli` and `claude_desktop` ids resolve
-to `claude`; they are not separate owners.
+and CLI transcript metadata are merged by Claude transcript id. A fresh logical
+session defaults to the session-sticky `desktop_computer_use` route: prompt input,
+`AskUserQuestion` answers, and one-time tool allow/deny decisions are applied to
+the exact Claude Desktop session through bounded in-process Computer Use / Locked
+Use transactions. A managed CLI `stream-json` child is only a preselected
+`stream_json_cli` fallback when capability preflight for a brand-new session fails
+before any UI mutation. The legacy `claude_cli` and `claude_desktop` ids resolve
+to `claude`; they are not separate owners or retry routes.
 
-All provider paths are intended for real coding work: Claude uses its documented
-stdin/stdout `stream-json` protocol, and Codex uses app-server because it matches
-Codex Desktop / VS Code's thread-turn-item model and exposes native streaming,
-steer, and interrupt operations.
+All provider paths are intended for real coding work: Claude keeps Desktop as the
+primary owner and observes durable hook/transcript state without unlocking it;
+its documented stdin/stdout `stream-json` protocol remains the constrained
+fallback. Codex uses app-server because it matches Codex Desktop / VS Code's
+thread-turn-item model and exposes native streaming, steer, and interrupt
+operations.
 
 ```
-remote-agent/
+agenthalo/
 ├── go.mod
 ├── Makefile
 ├── README.md
-├── cmd/remote-agent/           # Go service entrypoint
+├── cmd/agenthalo/              # Go service entrypoint
 ├── internal/                    # Go API/config/state/provider implementation
 ├── config.example.json          # copy to config.json and edit
 ├── data/                         # local runtime state (ignored by Git)
@@ -58,10 +84,11 @@ remote-agent/
 
 ## Architecture: provider / adapter
 
-The production agent is the Go binary `bin/remote-agent`. Its registry exposes
-canonical `claude` and `codex` providers: Claude is a stream-json CLI provider
-with merged Desktop/CLI discovery, and Codex binds each logical session to
-either an app-server or Desktop-IPC delivery route.
+The production agent is the Go binary `bin/agenthalo`. Its registry exposes
+canonical `claude` and `codex` providers. Claude binds each logical session to a
+sticky Desktop-Computer-Use or CLI-fallback route and merges Desktop/CLI
+discovery. Codex binds each logical session to either an app-server or
+Desktop-IPC delivery route.
 
 The complete current model — provider contract, logical/native identity,
 discovery/runtime merge, delivery ownership, streaming and approvals — is in
@@ -104,36 +131,54 @@ Completion is best-effort, based on `ready_pattern` or output quiet time.
 Prefer native Claude/Codex providers whenever their structured protocol is
 available.
 
-### claude provider — stream-json
+### claude provider — Desktop Computer Use first
 
-* **One logical session → one official CLI child process**. New sessions use
-  `--session-id`; existing transcripts use `--resume`. The Desktop-managed
-  signed binary may be executed directly, but its bundle is never modified.
-* **Input**: one complete SDK `user` NDJSON frame is written to stdin. Multiline
-  and non-ASCII prompts remain structured JSON rather than terminal keystrokes.
-* **Output**: `--output-format stream-json` publishes assistant deltas,
-  thinking/tool items, tool results, hook events, and turn completion directly
-  to the existing WebSocket stream. The transcript remains the durable read
-  side after a service restart.
-* **Approval/questions**: request-scoped `control_request` frames are surfaced
-  to the PWA; allow/deny and `AskUserQuestion` answers return structured
-  `control_response` frames. No bypass flags or automatic approvals are used.
-* **Interrupt**: sends the SDK `control_request{subtype:"interrupt"}` instead
-  of simulating Escape. A second prompt is rejected while the session owns a
-  running turn.
-* **Merged discovery**: `~/.claude/projects` transcripts and Claude Desktop's
-  `claude-code-sessions` metadata are joined by `cliSessionId`. Desktop titles,
-  cwd, and timestamps enrich the same PWA row; selecting it resumes through the
-  CLI and never routes input to Desktop IPC.
-* **Single-owner Desktop handoff**: before resuming a Desktop-origin transcript,
-  the provider finds the internal Desktop CLI by an exact session alias or its
-  open transcript file, terminates only that CLI process family, and confirms
-  exit before starting standalone CLI. If ownership or exit cannot be safely
-  confirmed, resume fails instead of creating a competing writer.
-* **Pre-existing questions remain visible**: an unanswered transcript-only
-  `AskUserQuestion` is shown as non-actionable when its original stdio callback
-  is gone. The PWA does not pretend a new CLI owner can answer an old request;
-  live managed-CLI questions remain fully answerable.
+* **The delivery route belongs to the logical session.** A fresh session starts
+  with `desktop_computer_use`. Before the first desktop mutation, AgentHalo
+  verifies local Computer Use / Locked Use capability and the configured Claude
+  Desktop identity. Only a brand-new session whose capability preflight fails
+  at that point may be bound once to `stream_json_cli`; that choice remains
+  sticky for the session.
+* **Desktop input is a short transaction, not a permanently unlocked UI.** Each
+  prompt, `AskUserQuestion` answer, or Claude tool permission decision opens one
+  bounded in-process Computer Use transaction, targets the exact configured
+  bundle id + Team id + logical/native Claude session + request id, performs the
+  action, and synchronously closes/relocks before returning. Claude continues
+  running while the Mac is locked.
+* **Observe before every mutation.** Each set-value, press, click, or key action
+  consumes a fresh Accessibility observation. A later action must read the
+  current tree again; cached paths, labels, screenshots, and coordinates cannot
+  authorize a second mutation.
+* **No cross-route replay.** Once opening/activating Desktop or any later UI
+  mutation may have happened, a timeout or ambiguous result is
+  `delivery_unknown` and is never resent through CLI. An existing Desktop owner,
+  local physical input, owner/session/request mismatch, unavailable shielding,
+  or any other security refusal also fails closed without CLI fallback.
+* **Prompt delivery is restart-safe.** Claude `/send_prompt` requests carry a
+  stable `operation_id`. The PWA persists and reads it back before sending, and
+  the service records an immutable attempt before the first Desktop or CLI side
+  effect. Retrying that operation after a timeout or restart never sends it a
+  second time; an unresolved attempt is reported as `delivery_unknown`.
+* **Questions and approval remain human decisions.** Observer hooks/transcripts
+  expose a pending request without opening the screen. Only `/question_answer`
+  or `/approval`, carrying the exact session and request id, starts the UI
+  transaction. `allow` means the smallest one-time/“Allow Once” Claude tool
+  permission; if Desktop offers only “Always” or session-wide authorization,
+  AgentHalo refuses it. It never approves on the model's behalf.
+* **“Approval” is not operating-system authentication.** This route never
+  enters or stores a macOS password, approves TCC, completes Touch ID, changes
+  account/login state, or answers SSO/MFA. Those remain manual-only. `deny` is
+  allowed only for the matched Claude tool request.
+* **Side-effect-free read path.** `~/.claude/projects`, Claude Desktop's
+  `claude-code-sessions` metadata, and the configured observer hook directories
+  supply discovery, pending-request, output, and completion state. Polling
+  `/status`, `/output`, native sessions, or WebSocket state never unlocks the
+  machine. Desktop and CLI rows remain merged by `cliSessionId`.
+* **CLI fallback preserves the structured path.** A session selected for
+  `stream_json_cli` uses `--session-id`/`--resume`, SDK `user` NDJSON frames,
+  `--output-format stream-json`, request-scoped control responses, and
+  structured interrupt exactly as before. It is a fallback owner, not a retry
+  after Desktop delivery.
 * **Per-turn usage**: the transcript preview appends a local annotation after
   every completed turn with input/output/cache-create/cache-read tokens,
   wall-clock duration, and a standard API-price estimate in USD. Repeated
@@ -144,12 +189,12 @@ available.
 The registered `codex` provider is the Go `provider.Codex`.
 
 * **Shared daemon owns mutable native control by default**. A logical web
-  session maps to one native Codex thread id. Remote-agent resumes that exact
+  session maps to one native Codex thread id. AgentHalo resumes that exact
   thread and cwd on the official same-user daemon before starting a turn.
   Desktop owner/follower IPC is used only when
   `extra.native_delivery_route=desktop_ipc` is explicitly configured; in that
   compatibility mode attach also requests a complete pending-request snapshot.
-* **Delivery route belongs to the logical session**. New remote-agent-created
+* **Delivery route belongs to the logical session**. New AgentHalo-created
   threads are managed app-server sessions. Sending from a native Codex preview
   persists the explicit `codex_control_route=shared_daemon`, resumes the exact
   thread id/cwd on the official managed daemon, and starts the turn on that
@@ -178,7 +223,7 @@ The registered `codex` provider is the Go `provider.Codex`.
   and pending-request changes.
 * **Approvals bridge over Desktop IPC**. Approval requests for a Desktop-owned
   turn are sent by app-server to the turn's *owner* client, not to
-  remote-agent's shared-daemon connection. A persistent follower connection
+  AgentHalo's shared-daemon connection. A persistent follower connection
   mirrors each owner's `thread-stream-state-changed` broadcasts (snapshot +
   immer patches); the broadcast conversation state carries the raw pending
   server requests (`requests[]`, including the JSON-RPC request id) plus the
@@ -193,16 +238,16 @@ The registered `codex` provider is the Go `provider.Codex`.
   never surface fake web approvals. Approvals are tracked per thread +
   request id: one thread going idle no longer clears another thread's queue.
 * **Codex transport discovery**: when no transport is explicitly configured,
-  remote-agent prefers the official managed standalone install at
+  AgentHalo prefers the official managed standalone install at
   `~/.codex/packages/standalone/current/codex`; otherwise it falls back to a
   usable ChatGPT.app/Codex.app/PATH/common-prefix binary and its stdio
   app-server. Codex and ChatGPT own the shared `CODEX_HOME` authentication
-  state, so remote-agent does not require a second provider login. Install the
+  state, so AgentHalo does not require a second provider login. Install the
   managed standalone with OpenAI's
   `https://chatgpt.com/codex/install.sh`, then run
   `codex app-server daemon start`. Set
   Set `extra.app_server_transport=shared_daemon` to require that layout, and
-  `extra.shared_daemon_autostart=true` only on devices where remote-agent is
+  `extra.shared_daemon_autostart=true` only on devices where AgentHalo is
   explicitly allowed to start an already-installed daemon after reboot. This
   flag never installs Codex, bootstraps its updater, or enables OpenAI cloud
   remote control. An explicit transport never silently falls back.
@@ -210,7 +255,7 @@ The registered `codex` provider is the Go `provider.Codex`.
   connection a generation. EOF, malformed JSON, or socket loss immediately
   fails pending RPCs and retires only that generation's routes. An old exit
   callback cannot clear a newer connection, and the daemon itself outlives a
-  remote-agent reconnect.
+  AgentHalo reconnect.
 * **Authoritative completion**: approval/question response writes remain
   non-terminal until the matching typed `serverRequest/resolved` arrives.
   Likewise, `turn/interrupt` reports `cancellation_requested`; the session
@@ -227,41 +272,88 @@ The registered `codex` provider is the Go `provider.Codex`.
 
 ### Computer use & Locked Use
 
-Both are **opt-in per device and default off**, and both must be turned on in the
-device's own `config.json` — no API call can enable them.
+Fresh AgentHalo installs explicitly enable both features in the device's own
+`config.json`. An omitted `computer_use` block still fails closed, and no API
+call can install the plug-in or raise the local configuration ceiling.
 
-* **Computer use** exposes a closed action vocabulary (`screen.capture`,
-  `pointer.move/click/scroll`, `keyboard.type/key`). Unknown ids are refused;
-  nothing reaches a shell, and every coordinate, text length, and chord size is
-  bounded. The desktop itself is driven by `remote-agent-desktop`, a resident
-  helper in the user's GUI session that owns the display shield as windows it
-  holds — the agent only forwards to it over a unix socket, and cannot
-  configure it: Locked Use lets a machine unlock itself, so that capability is
-  granted on the device, never over a wire.
-* **Locked Use** lets an authorized turn keep driving the desktop after the
-  screen locks, through an **Apple Authorization Plug-in** that participates in
-  the macOS unlock flow. The plug-in **never touches the password** and is
-  **transparent by default**: with no valid grant it returns
-  `kAuthorizationResultAllow`, meaning only "this mechanism does not object",
-  and the password mechanism that follows challenges the user exactly as if the
-  plug-in were not installed. It never returns Deny, and never Undefined —
-  authd may treat Undefined as a mechanism failure and abort the whole
-  authorization, which on the unlock right would be a Mac nobody can open.
-* **Grants are seconds-long and single-use.** The agent holds an ECDSA P-256
-  private key and the plug-in only the public half — P-256 rather than Ed25519
-  because the plug-in verifies through Security.framework, whose Ed25519 SecKey
-  constants are SPI, and a mechanism that binds a private symbol can stop
-  loading inside the unlock right. A grant is minted immediately before
-  an unlock, consumed atomically (`O_CREAT|O_EXCL` nonce ledger) by that unlock,
-  and withdrawn right after — a grant resting on disk would be ambient authority
-  any local process could ride. The verifier enforces its own freshness ceiling
-  and rejects a grant that declares a longer life.
-* **Safeguards fail toward relocking.** A window requires an already-idle
-  machine and a confirmed display shield *before* unlocking; a fixed 40ms monitor
-  relocks on any local keystroke or pointer movement, a dropped shield, or the
-  hard window TTL. Relock is confirmed by readback before the shield comes down,
-  and startup scrubs any grant a crash left behind. Screen capture and OCR are
-  refused while a window is open without a confirmed shield.
+* **Computer use is a model tool, not a self-asserted turn id.** New Codex
+  threads receive `computer_use.get_app_state/press/set_value/click/type_text/
+  press_key/scroll` dynamic tools. Calls are bound to the current app-server
+  generation, active thread and authoritative turn; every mutation consumes one
+  fresh screenshot + Accessibility-tree observation, so the next mutation must
+  inspect again. Provider completion,
+  interruption, error or transport loss revokes the lease.
+* **Claude uses a separate trusted provider transaction.** It does not invent a
+  model turn or reuse the HTTP debug surface. The API binds the canonical
+  provider and persisted logical/native session, issues a short-lived internal
+  operation lease, and permits only the exact Claude Desktop bundle + Team +
+  session + pending request. Prompt input and a human's answer/one-time tool
+  decision close and relock synchronously; background observation never opens a
+  Locked Use window.
+* **The desktop boundary is signed twice.** A resident Swift LaunchAgent owns
+  Screen Recording, Accessibility, the display shield and input event tap. Its
+  `0600` UDS also checks the peer audit token and accepts only a Go agent with
+  the same Developer ID Team and exact signing identifier. Enabled Locked Use
+  disables naked HTTP open/action/AX by default; production calls use the
+  in-process model broker.
+* **Locked Use is an Apple Authorization Plug-in branch.** A valid signed grant
+  makes the AgentHalo branch return Allow; missing, invalid, expired or
+  replayed grants return Deny and evaluation continues to the normal
+  `use-login-window-ui` password branch. The implementation never stores,
+  reads or submits a macOS login password.
+* **Grants are seconds-long, device-bound, console-user-bound and single-use.**
+  Grant v2 signs the active console account's canonical UID and username; the
+  privileged plug-in requires both to match the username in that exact
+  authorization transaction. The helper keeps its ECDSA P-256 private key in
+  the current user's file-based login Keychain. Only the explicit provisioning
+  command may create it; the Keychain's default creator ACL binds the item to
+  the installed helper's code-signing designated requirement. Normal runtime
+  startup only reads the existing item with authentication UI disabled. A
+  missing or inaccessible item, including a manually or policy-locked login
+  Keychain during helper startup, fails closed without deleting or rotating the
+  key. The plug-in receives only the public half. The plug-in consumes
+  each nonce with `O_CREAT|O_EXCL` and publishes root-owned `pending`, `final`
+  and `complete` proofs: `pending` precedes Allow, `final` follows a successful
+  `SetResult(Allow)`, and only `MechanismDestroy` for that successful Allow may
+  publish the terminal `complete` proof. The exact lock-screen field must remain
+  the same element while the screen stays locked until `complete`; only then may
+  its lifecycle completion plus an unlocked state open the model window.
+  A coincidental human, Apple Watch or alternate authorization unlock before
+  that boundary fails closed instead of being claimed by the model turn.
+* **The physical screen stays black while the model sees the UI.** Shielding-
+  level, `sharingType=.readOnly` windows cover every display; the signed helper
+  explicitly excludes its own shield from the model capture while ordinary
+  screen captures retain the black cover;
+  frames are returned as bounded in-memory PNG bytes, never replaceable temp
+  paths. Model click/scroll coordinates use the composite PNG's top-left origin;
+  Swift maps them into Core Graphics global coordinates, including negative-
+  origin and vertically arranged displays, and refuses points in display gaps.
+  A session event tap drops unmarked physical keyboard/pointer input but
+  permits helper-marked synthetic events. The same physical event sets a sticky
+  latch and triggers relock on the fixed ~40 ms monitor.
+* **Cleanup is a state machine, not best effort.** Opening/open/closing ownership
+  is atomic; close waits for in-flight authorization and desktop operations.
+  Grant withdrawal, relock and lock-state readback precede shield release.
+  Uncertain late authorization enters quarantine, keeps the shield alive and
+  retries until the locked boundary is proved. If nonce proof exists but the
+  ordered loginwindow UI lifecycle cannot be proved, status reports
+  `requires_manual_recovery=true`; that ambiguity is not repaired by a later
+  unlocked sample, and the shield remains until controlled reboot/recovery.
+
+Apple's public Authorization Plug-in API does not promise that
+`MechanismDestroy` occurs after loginwindow has applied its visible unlock side
+effect. The target-Mac release gate must therefore verify the observed
+`complete -> unlock` ordering and exercise a concurrent alternate unlock; unit
+tests cannot turn that operating-system timing assumption into an API guarantee.
+Before `complete`, an alternate unlock is detected and quarantined by the
+implementation. After `complete`, however, the public APIs expose neither a
+transaction ID for the visible lock transition nor a causal completion callback:
+an Apple Watch or another authorization path can produce the same
+`field disappeared + unlocked` observations. Until target-Mac testing proves
+that the original transaction cannot subsequently apply, deployments must keep
+alternate unlock unavailable during unattended use or add an independent
+guardian/client-side completion primitive. This boundary is not claimed as a
+production guarantee by the current code.
 
 The Swift worker and the authorization plug-in only build and run on macOS, so
 CI cannot check them. Run `bash mac/preflight.sh` on the target Mac first — it
@@ -269,10 +361,15 @@ is read-only by default and also catches drift in the constants the Go code and
 the plug-in must agree on.
 
 This is deliberately **not** a general-purpose remote unlock: it authorizes one
-turn's unlock, not other applications or local processes. Setup, the full grant
-contract, and the honest threat-model limits — including that the signing key is
-a file rather than Secure-Enclave-bound, and that there is no root deadman
-process — are in
+bounded Codex tool or Claude provider transaction, not other applications or
+local processes. Claude's Desktop-first route has the same close/relock and
+fresh-observation requirements, but the target-Mac locked prompt/question/
+one-time-approval E2E is still a release gate and is not claimed complete here.
+There is also no independent root deadman yet, so unit tests cannot certify the
+real locked-device boundary. The current signature pin identifies trusted code,
+not the one managed process instance, so hostile same-UID/TCC environments
+require the root broker described in the threat model. Setup, the full contract
+and limits are in
 [`docs/computer-use-locked-user.md`](docs/computer-use-locked-user.md).
 
 ### API-price estimates
@@ -314,8 +411,9 @@ path.
 | POST | `/question_answer` | `{provider_id, session_id, request_id, answers}` for provider user-input questions |
 | GET  | `/computer_use` | computer-use capability, Locked Use state, and a secret-free audit ring |
 | POST | `/computer_use/locked_use` | `{active}` runtime switch, bounded by on-device config |
-| POST | `/computer_use/window` | `{turn_id, action}` open/close a Locked Use unlock window |
-| POST | `/computer_use/action` | one validated desktop action from a closed vocabulary |
+| POST | `/computer_use/window` | debug open / always-safe close, scoped by provider + session + authoritative turn; Locked Use open is model-only by default |
+| POST | `/computer_use/action` | ordinary-unlocked compatibility action; Locked Use is model-only by default |
+| POST | `/computer_use/ax` | ordinary-unlocked AX compatibility route; Locked Use is model-only by default |
 
 Typed actions give clients a closed operation id plus `endpoint`, `scope`,
 `risk`, and `supported`; legacy boolean capabilities remain for older clients.
@@ -328,14 +426,31 @@ unscoped task list.
 ### 1. Install
 
 ```bash
-cd remote-agent
+cd /path/to/agenthalo
 make go-build
 cp config.example.json config.json       # edit device_id, cwd, providers
 ```
 
-Requires a runnable standalone `claude` CLI for the `claude` provider. Mutable
-Codex control requires OpenAI's managed standalone install and its local
-app-server daemon:
+`make go-build` is a local development build; it is not an installable macOS
+release identity. A fresh macOS install must use either the signed/notarized
+artifact from `deploy/publish-release.sh`, or run `deploy/install.sh` with
+`AGENTHALO_EXPECTED_TEAM_ID` and a non-ad-hoc
+`AGENTHALO_SIGN_IDENTITY`. The installer verifies the exact identifier
+`dev.linsheng.agenthalo`, Team ID and hardened-runtime flag before replacing
+the installed binary; a prebuilt binary passed through
+`AGENTHALO_SKIP_BUILD=1` is subject to the same checks.
+
+```bash
+AGENTHALO_EXPECTED_TEAM_ID=ABCDE12345 \
+AGENTHALO_SIGN_IDENTITY="Developer ID Application: AgentHalo (ABCDE12345)" \
+  bash deploy/install.sh <device-id> --no-log-upload
+```
+
+Claude Desktop, the signed AgentHalo desktop helper, and its local permissions
+are the primary `claude` route. A runnable standalone `claude` CLI is optional
+but required if a brand-new session is to use the configured pre-mutation
+fallback. Mutable Codex control requires OpenAI's managed standalone install and
+its local app-server daemon:
 
 ```bash
 which claude
@@ -347,12 +462,14 @@ test -x ~/.codex/packages/standalone/current/codex
 
 | Permission | Needed by | Where |
 |------------|-----------|-------|
-| **Screen Recording** | `screencapture` (screenshots, the OCR input) | System Settings → Privacy & Security → Screen Recording |
-| **Accessibility** | synthetic keyboard/pointer events for computer use | System Settings → Privacy & Security → Accessibility |
+| **Screen Recording** | `screencapture` and the signed desktop helper (Codex observations and Claude Desktop transactions) | System Settings → Privacy & Security → Screen Recording |
+| **Accessibility** | synthetic keyboard/pointer/AX actions for computer use and Claude Desktop input | System Settings → Privacy & Security → Accessibility |
 
-The Claude stream-json path and Codex app-server path need **none** of these for core
-operation. Screen Recording is only needed if you use the `/screenshot` or
-`/ocr` endpoints, and Accessibility only if you enable computer use.
+The Claude CLI fallback and Codex app-server path need **none** of these for core
+protocol operation. Claude's primary Desktop route does: Screen Recording is
+needed for fresh observations and Accessibility for input. Neither permission is
+granted through Claude's `/approval` action; TCC remains a manual administrator/
+user setup step.
 
 Locked Use additionally requires installing the Apple Authorization Plug-in —
 see [`docs/computer-use-locked-user.md`](docs/computer-use-locked-user.md). It is
@@ -362,7 +479,7 @@ stays inert until you also opt in via `config.json`.
 ### 3. Run
 
 ```bash
-./bin/remote-agent --config config.json
+./bin/agenthalo --config config.json
 # -> unix socket from config.json, or http://127.0.0.1:8765 when no uds is set
 ```
 
@@ -375,19 +492,19 @@ The agent binds loopback only. Expose it through a private-tunnel-compatible
 reverse tunnel (mTLS). Two config edits —
 see [deploy/private-tunnel.example.yaml](deploy/private-tunnel.example.yaml):
 
-1. **Relay**: add a `remotecoding` service with `port: 8765` and
+1. **Relay**: add an `agenthalo` service with `port: 8765` and
    `default_device: <this-mac>` (no `static_dir` — the agent serves its own UI).
-   `default_device` makes the relay strip the `/s/remotecoding/` prefix and
+   `default_device` makes the relay strip the `/s/agenthalo/` prefix and
    forward clean paths to the agent, so the UI's absolute paths work.
 2. **private-edge profile**: keep port `8765` mapped through the dedicated
    vmnet UDS gateway. Do not install or restart a host tunnel agent.
 
 Then on the phone (mTLS client cert installed):
-`https://<user>-relay.<domain>/s/remotecoding/`.
+`https://<user>-relay.<domain>/s/agenthalo/`.
 
 The service root serves a relay-owned device host. It keeps the root PWA URL,
 chooses the last device from browser storage (or the most recently connected
-available device), and loads `/s/remotecoding/d/<device>/` inside a same-origin
+available device), and loads `/s/agenthalo/d/<device>/` inside a same-origin
 frame. The embedded console keeps every tab bound to its own device, so session
 switches route status, output, input, approvals, and WebSocket traffic to that
 session's agent. Normal UI/backend releases therefore update devices through
@@ -397,11 +514,11 @@ The security boundary is the local UDS/filesystem permission plus
 private-tunnel **mTLS**. Never expose port 8765 directly.
 
 Auto-update and log upload are opt-in in the public repository. Set
-`RC_UPDATE_RELAY_URL` while running `deploy/install.sh`, or pass
-`--update-relay-url`, to persist manifest polling in the `remote-agent`
-supervisor drop-in. Set `RC_UPDATE_CERT_DIR` or pass `--update-cert-dir` when
+`AGENTHALO_UPDATE_RELAY_URL` while running `deploy/install.sh`, or pass
+`--update-relay-url`, to persist manifest polling in the `agenthalo`
+supervisor drop-in. Set `AGENTHALO_UPDATE_CERT_DIR` or pass `--update-cert-dir` when
 the updater's mTLS certificates are outside its default discovery paths.
-Pass `--log-relay-url` (or set `RC_LOG_UPLOAD_RELAY_URL`) when installing with
+Pass `--log-relay-url` (or set `AGENTHALO_LOG_UPLOAD_RELAY_URL`) when installing with
 log upload, or use `deploy/install.sh <device> --no-log-upload`.
 
 ## Test
@@ -414,12 +531,12 @@ make go-vet
 ## Go runtime
 
 The Go backend now covers the main runtime path: REST APIs, static UI serving,
-Claude stream-json sessions, Claude/Codex native transcript readers, Codex app-server,
-Codex Desktop IPC sync, WebSocket streaming, Web Push VAPID/subscription storage,
-encrypted push delivery, foreground presence suppression, and approval-action
-callbacks.
-The deploy installer builds `bin/remote-agent`, installs an immutable runtime
-copy at `/opt/private-tunnel/libexec/remote-agent/remote-agent`, and registers it with
+Claude Desktop Computer Use transactions plus stream-json fallback sessions,
+Claude/Codex native transcript readers, Codex app-server, Codex Desktop IPC sync,
+WebSocket streaming, Web Push VAPID/subscription storage, encrypted push
+delivery, foreground presence suppression, and approval-action callbacks.
+The deploy installer builds and verifies the signed `bin/agenthalo`, installs an immutable runtime
+copy at `/opt/private-tunnel/libexec/agenthalo/agenthalo`, and registers it with
 private-services.
 
 ```bash
@@ -429,24 +546,35 @@ make go-run     # http://127.0.0.1:18765
 
 ### Acceptance walkthrough
 
-Claude stream-json provider, end-to-end:
+Claude Desktop-first provider, end-to-end:
 
-1. `POST /sessions {provider_id: "claude", title: "..."}` starts the real
-   CLI with bidirectional NDJSON pipes.
-2. `POST /send_prompt` writes one SDK `user` frame; `/stream` receives assistant,
-   thinking, tool/result, and turn lifecycle frames.
-3. A permission `control_request` makes `/status` report
-   `waiting_approval`; `/approval` returns the matching `control_response`.
-4. `AskUserQuestion` uses `/question_answer`, scoped by session and request id.
-5. A second prompt while running is rejected; `/interrupt` sends a structured
-   interrupt request and returns the session to idle.
-6. `GET /output` returns `{source:"claude_cli_stream", ...}` and transcript
-   preview remains available after the child exits.
+1. `POST /sessions {provider_id: "claude", title: "..."}` creates a logical
+   session whose sticky route is `desktop_computer_use`; capability preflight
+   occurs before any Desktop mutation.
+2. `POST /send_prompt` opens a bounded internal Computer Use / Locked Use
+   transaction, verifies exact bundle/Team/session identity, obtains a fresh AX
+   observation before each mutation, submits once, and synchronously closes and
+   relocks. A result after an ambiguous mutation is `delivery_unknown`, never a
+   CLI retry.
+3. Side-effect-free observer hooks/transcripts update `/stream`, `/status`, and
+   `/output` while the screen remains locked. Polling alone must not open a
+   window.
+4. A pending Claude permission or `AskUserQuestion` is keyed by session +
+   request id. The human's `/approval` or `/question_answer` starts its own
+   short transaction; allow selects only “Allow Once”, then closes/relocks.
+5. Test a brand-new session with a deliberately failed capability preflight:
+   it may bind once to `stream_json_cli`, after which SDK user frames,
+   request-scoped control responses, output, and interrupt stay on that route.
+6. Test that existing Desktop ownership, local input, exact-identity failure,
+   and every post-mutation timeout refuse CLI replay.
 7. Image blocks in Claude/Codex transcripts are returned as opaque asset ids;
    the PWA loads their bytes through the session-bound `/session_asset` route.
-   Uploaded images are native multimodal inputs (`image` for Claude,
-   `localImage` for Codex); other uploaded files are passed as private local
-   paths visible only to the selected agent session.
+   Uploaded images follow the capabilities of the selected sticky route and are
+   never silently rerouted.
+
+The real target-Mac locked prompt, question, one-time allow/deny, terminal
+close/relock, and no-duplicate-fallback walkthrough remains pending final E2E
+acceptance; this document does not claim that `m4pro` has passed it.
 
 > Codex login and account state are surfaced through the app-server provider; the
 > agent never attempts to switch accounts or auto-answer human approval prompts.
@@ -454,9 +582,10 @@ Claude stream-json provider, end-to-end:
 Attaching a Claude Desktop session: `GET /native_sessions?provider_id=claude`
 lists sessions from both CLI and Claude Desktop origins, deduped by transcript
 uuid and tagged with `origin`. `POST /resume_native_session
-{native_session_id}` first hands off any matching Claude Desktop internal CLI
-owner, then resumes that transcript in the managed stream-json CLI process.
-Non-Desktop owners must still become idle before resume.
+{native_session_id}` persists the exact Desktop/native binding and keeps that
+owner on `desktop_computer_use`. It must not terminate the Desktop owner or move
+the session to CLI. Historical sessions already bound to `stream_json_cli`
+remain on that route.
 
 ## Security
 
@@ -465,9 +594,12 @@ Non-Desktop owners must still become idle before resume.
 * Account credentials / cookies / tokens / recovery codes are **never** logged.
 * Upload ids are scoped to provider + logical session and never disclose the
   device path to the browser. A request cannot reuse another session's id.
-* **Approval policy is provider-specific.** Claude is launched without bypass
-  flags, and risky/login prompts surface as `waiting_approval` /
-  `needs_manual`. Stream sessions use request-scoped SDK responses.
+* **Approval policy is provider-specific.** Claude tool permissions surface as
+  request-scoped `waiting_approval`; the Desktop route may press only an exact
+  one-time allow/deny control after a human decision. Always/session-wide
+  permission, macOS passwords, TCC, Touch ID, account login, SSO, and MFA remain
+  manual-only. CLI-fallback sessions are launched without bypass flags and use
+  request-scoped SDK responses.
   Codex defaults to app-server
   `approval_policy=never` with `workspace-write` sandbox and can be tightened
   via config.
@@ -493,14 +625,16 @@ Non-Desktop owners must still become idle before resume.
   already exist in the agent and bubble up.
 * **Approval workflow**: `waiting_approval` tasks fan in to one console queue;
   the human's response is routed by provider + session + request id to the
-  owning Claude stream-json process, Codex app-server, or Codex Desktop owner.
+  owning Claude Desktop transaction or sticky CLI-fallback process, Codex
+  app-server, or Codex Desktop owner.
 * **Native task integration**: providers expose real sessions
   (`list_native_sessions`) and live output; a coordinator can poll per session
   for a multi-device task board.
 * **Output-fidelity workers** plug into existing hooks: the Apple Vision OCR
-  worker (`/ocr`) is available for screenshot analysis. Claude reads structured
-  stream events plus transcript, and Codex reads app-server thread items plus notifications;
-  neither needs OCR or clipboard for normal operation.
+  worker (`/ocr`) is available for screenshot analysis. Claude reads observer
+  hook/transcript events (or structured stream events on its CLI fallback), and
+  Codex reads app-server thread items plus notifications; neither needs OCR or
+  clipboard for normal operation.
 
 The phone selects **device → provider → session**, sends prompts, watches state,
 and answers approvals — across the whole fleet.

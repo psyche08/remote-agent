@@ -10,7 +10,7 @@ import (
 
 const codexAppServerSource = "codex_app_server"
 
-func remoteCodingClientVersion() string {
+func agentHaloClientVersion() string {
 	version := strings.TrimSpace(buildinfo.Version)
 	if version == "" {
 		return "dev"

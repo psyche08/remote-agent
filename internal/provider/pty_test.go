@@ -153,6 +153,40 @@ func TestPTYProviderRejectsOverlappingTurns(t *testing.T) {
 	}
 }
 
+func TestPTYProviderPublishesRealTurnIDOnUnexpectedExit(t *testing.T) {
+	p := NewPTYProvider("terminal-agent", config.ProviderConfig{
+		Command: "/bin/sh", Args: []string{"-c", `IFS= read -r line; exit 7`}, Cwd: t.TempDir(),
+	})
+	t.Cleanup(p.Shutdown)
+	frames := make(chan map[string]any, 8)
+	p.SetStreamPublisher(func(target string, frame map[string]any) {
+		if target == "session-a" {
+			frames <- frame
+		}
+	})
+	if _, err := p.OpenOrCreateSession("session-a", StartOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if result := p.SendPrompt("session-a", "exit now"); !result.OK {
+		t.Fatalf("send failed: %#v", result)
+	}
+
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case frame := <-frames:
+			if frame["type"] == "turn" && frame["status"] == "error" {
+				if frame["turn_id"] != "pty-1" {
+					t.Fatalf("unexpected-exit turn_id=%v, want pty-1", frame["turn_id"])
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("timed out waiting for unexpected-exit terminal frame")
+		}
+	}
+}
+
 func TestPTYProviderClosesExitedTerminalAndBoundsRetainedSessions(t *testing.T) {
 	p := NewPTYProvider("terminal-agent", config.ProviderConfig{
 		Command: "/bin/sh", Args: []string{"-c", "exit 0"}, Cwd: t.TempDir(),

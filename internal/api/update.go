@@ -36,7 +36,7 @@ func (s *Server) update(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) autoUpdateLoop() {
-	if os.Getenv("RC_AUTO_UPDATE") == "0" {
+	if os.Getenv("AGENTHALO_AUTO_UPDATE") == "0" {
 		return
 	}
 	timer := time.NewTimer(45 * time.Second)
@@ -65,10 +65,10 @@ func (s *Server) updateSnapshot() map[string]any {
 }
 
 func (s *Server) startAutoUpdate(reason string) (bool, error) {
-	if os.Getenv("RC_AUTO_UPDATE") == "0" {
+	if os.Getenv("AGENTHALO_AUTO_UPDATE") == "0" {
 		return false, nil
 	}
-	relayURL := strings.TrimSpace(os.Getenv("RC_UPDATE_RELAY_URL"))
+	relayURL := strings.TrimSpace(os.Getenv("AGENTHALO_UPDATE_RELAY_URL"))
 	if relayURL == "" {
 		return false, nil
 	}
@@ -96,7 +96,7 @@ func (s *Server) startAutoUpdate(reason string) (bool, error) {
 		"--reason", reason,
 		"--relay-url", relayURL,
 	}
-	if certDir := os.Getenv("RC_UPDATE_CERT_DIR"); certDir != "" {
+	if certDir := os.Getenv("AGENTHALO_UPDATE_CERT_DIR"); certDir != "" {
 		args = append(args, "--cert-dir", certDir)
 	}
 	if s.cfg.UDS != "" {

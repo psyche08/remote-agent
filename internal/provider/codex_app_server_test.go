@@ -23,6 +23,12 @@ func codexHelperMode() string {
 	return ""
 }
 
+func codexInitializeExperimentalAPIEnabled(request map[string]any) bool {
+	capabilities := mapAny(mapAny(request["params"])["capabilities"])
+	enabled, ok := capabilities["experimentalApi"].(bool)
+	return ok && enabled
+}
+
 func TestCodexAppServerHelperProcess(t *testing.T) {
 	mode := codexHelperMode()
 	if mode == "" {
@@ -37,6 +43,16 @@ func TestCodexAppServerHelperProcess(t *testing.T) {
 		}
 		switch stringAny(request["method"]) {
 		case "initialize":
+			if mode == "require-experimental-api" && !codexInitializeExperimentalAPIEnabled(request) {
+				_ = encoder.Encode(map[string]any{
+					"id": request["id"],
+					"error": map[string]any{
+						"code":    -32602,
+						"message": "initialize.params.capabilities.experimentalApi must be true",
+					},
+				})
+				continue
+			}
 			_ = encoder.Encode(map[string]any{
 				"id": request["id"],
 				"result": map[string]any{
@@ -60,13 +76,24 @@ func codexHelperCommand(mode string) []string {
 	}
 }
 
+func TestCodexAppServerStdioInitializeAdvertisesExperimentalAPI(t *testing.T) {
+	client := NewCodexAppServerClient(codexHelperCommand("require-experimental-api"), t.TempDir(), nil, nil)
+	if err := client.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if err := client.Initialize("agenthalo-stdio-test"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCodexAppServerExitImmediatelyFailsPendingRPC(t *testing.T) {
 	client := NewCodexAppServerClient(codexHelperCommand("eof"), t.TempDir(), nil, nil)
 	if err := client.Start(); err != nil {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if err := client.Initialize("remote-coding-test"); err != nil {
+	if err := client.Initialize("agenthalo-test"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -235,11 +262,14 @@ func newFakeSharedCodexClient(t *testing.T, transport *fakeCodexAppServerJSONTra
 func initializeFakeSharedCodexClient(t *testing.T, client *CodexAppServerClient, transport *fakeCodexAppServerJSONTransport) {
 	t.Helper()
 	result := make(chan error, 1)
-	go func() { result <- client.Initialize("remote-agent-shared-test") }()
+	go func() { result <- client.Initialize("agenthalo-shared-test") }()
 
 	initialize := transport.nextWrite(t)
 	if method := stringAny(initialize["method"]); method != "initialize" {
 		t.Fatalf("first method=%q want=initialize", method)
+	}
+	if !codexInitializeExperimentalAPIEnabled(initialize) {
+		t.Fatalf("initialize.params.capabilities.experimentalApi=%#v want=true", mapAny(initialize["params"])["capabilities"])
 	}
 	transport.send(t, map[string]any{"id": initialize["id"], "result": map[string]any{
 		"codexHome": "/tmp/codex-home", "platformFamily": "unix",

@@ -29,7 +29,7 @@ func Handler(version string) http.Handler {
 			if strings.TrimSpace(version) == "" {
 				version = "dev"
 			}
-			body = []byte(strings.ReplaceAll(string(body), "__REMOTE_AGENT_STATIC_VERSION__", version))
+			body = []byte(strings.ReplaceAll(string(body), "__AGENTHALO_STATIC_VERSION__", version))
 			// The console uses inline application code today, so script/style
 			// cannot yet drop unsafe-inline. Keep every fetch and embedded
 			// diagram resource same-origin, and block plugin/object execution.

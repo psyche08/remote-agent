@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// helper is a scripted stand-in for remote-agent-desktop.
+// helper is a scripted stand-in for agenthalo-desktop.
 type helper struct {
 	listener net.Listener
 	path     string
@@ -107,7 +107,7 @@ func TestARefusedRequestIsNotResent(t *testing.T) {
 	c := NewController(h.path, true, true)
 	defer c.Stop()
 
-	err := c.OpenWindow("turn-1")
+	_, err := c.OpenWindow("turn-1")
 	if !errors.Is(err, ErrLocalInput) {
 		t.Fatalf("err = %v, want ErrLocalInput", err)
 	}
@@ -168,7 +168,7 @@ func TestAnAbsentHelperReportsUnavailable(t *testing.T) {
 	c := NewController("/tmp/ra-no-such-helper.sock", true, true)
 	defer c.Stop()
 
-	err := c.OpenWindow("turn-1")
+	_, err := c.OpenWindow("turn-1")
 	if !errors.Is(err, ErrHelperUnavailable) {
 		t.Fatalf("err = %v, want ErrHelperUnavailable", err)
 	}
@@ -207,7 +207,8 @@ func TestZeroCoordinatesSurviveForwarding(t *testing.T) {
 	defer c.Stop()
 
 	if _, err := c.RunAction(ActionRequest{
-		Action: "pointer.click", X: intPtr(0), Y: intPtr(0),
+		Action: "pointer.click", CoordinateSpace: "screenshot",
+		X: intPtr(0), Y: intPtr(0),
 	}); err != nil {
 		t.Fatalf("action: %v", err)
 	}
@@ -219,6 +220,353 @@ func TestZeroCoordinatesSurviveForwarding(t *testing.T) {
 		if _, ok := seen[0][key]; !ok {
 			t.Errorf("%s was dropped from the forwarded action: %#v", key, seen[0])
 		}
+	}
+	if seen[0]["coordinate_space"] != "screenshot" {
+		t.Fatalf("coordinate space was not forwarded: %#v", seen[0])
+	}
+}
+
+func TestRunActionPreservesInMemoryCaptureFields(t *testing.T) {
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		if req["op"] == "action" && req["action"] == "screen.capture" {
+			return map[string]any{
+				"ok": true, "action": "screen.capture",
+				"media_type": "image/png", "image_base64": "iVBORw0KGgo=",
+			}
+		}
+		return nil
+	})
+	c := NewController(h.path, true, false)
+	defer c.Stop()
+
+	result, err := c.RunAction(ActionRequest{TurnID: "turn-1", Action: "screen.capture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["media_type"] != "image/png" || result["image_base64"] != "iVBORw0KGgo=" {
+		t.Fatalf("in-memory capture fields were not preserved: %#v", result)
+	}
+	if _, exists := result["ok"]; exists {
+		t.Fatalf("RunAction leaked the transport ok field: %#v", result)
+	}
+}
+
+func TestOpenAndCloseUseTheOperationResponse(t *testing.T) {
+	windowOpen := false
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		switch req["op"] {
+		case "window_open":
+			windowOpen = true
+			return map[string]any{
+				"ok": true, "window_open": true,
+				"window_turn_id": req["turn_id"], "window_closing": false,
+			}
+		case "window_close":
+			windowOpen = false
+			return map[string]any{
+				"ok": true, "window_open": false,
+				"window_turn_id": "", "window_closing": false,
+			}
+		case "window_state":
+			return map[string]any{
+				"ok": true, "window_open": windowOpen,
+				"window_turn_id": "turn-1", "window_closing": false,
+			}
+		default:
+			return nil
+		}
+	})
+	c := NewController(h.path, true, true)
+	defer c.Stop()
+
+	opened, err := c.OpenWindow("turn-1")
+	if err != nil || !opened.Open || opened.TurnID != "turn-1" {
+		t.Fatalf("open state=%#v err=%v", opened, err)
+	}
+	closed, err := c.CloseWindowForTurn("turn-1", "done")
+	if err != nil || closed.Open || closed.Closing {
+		t.Fatalf("close state=%#v err=%v", closed, err)
+	}
+	seen := h.seen()
+	if len(seen) != 2 {
+		t.Fatalf("helper saw %d requests, want exactly open and close", len(seen))
+	}
+}
+
+func TestUnconfirmedOpenClosesTheSameOwner(t *testing.T) {
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		switch req["op"] {
+		case "window_open":
+			// The helper claims the window is open but omits part of the
+			// authoritative state. The caller cannot treat this as success or
+			// leave the possibly open window until its TTL.
+			return map[string]any{
+				"ok": true, "window_open": true, "window_turn_id": req["turn_id"],
+			}
+		case "window_close":
+			return map[string]any{
+				"ok": true, "window_open": false,
+				"window_turn_id": "", "window_closing": false,
+			}
+		default:
+			return nil
+		}
+	})
+	c := NewController(h.path, true, true)
+	defer c.Stop()
+
+	if state, err := c.OpenWindow("turn-1"); err == nil {
+		t.Fatalf("incomplete open state=%#v reported success", state)
+	}
+	seen := h.seen()
+	if len(seen) != 2 || seen[0]["op"] != "window_open" || seen[1]["op"] != "window_close" {
+		t.Fatalf("unconfirmed open requests=%#v, want open then scoped close", seen)
+	}
+	if seen[1]["turn_id"] != "turn-1" || seen[1]["reason"] != "window open was not confirmed" {
+		t.Fatalf("unconfirmed open used the wrong cleanup owner: %#v", seen[1])
+	}
+}
+
+func TestClosePreservesTransportAndOwnerErrors(t *testing.T) {
+	c := NewController("/tmp/ra-no-such-helper.sock", true, true)
+	if _, err := c.CloseWindowForTurn("turn-1", "done"); !errors.Is(err, ErrHelperUnavailable) {
+		t.Fatalf("unavailable close err=%v, want ErrHelperUnavailable", err)
+	}
+
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		if req["op"] == "window_close" {
+			return map[string]any{
+				"ok": true, "window_open": true,
+				"window_turn_id": "turn-2", "window_closing": false,
+			}
+		}
+		return nil
+	})
+	c = NewController(h.path, true, true)
+	defer c.Stop()
+	if _, err := c.CloseWindowForTurn("turn-1", "done"); !errors.Is(err, ErrWindowBusy) {
+		t.Fatalf("wrong-owner close err=%v, want ErrWindowBusy", err)
+	}
+}
+
+func TestCloseRequiresTheHelperToClearItsOwner(t *testing.T) {
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		if req["op"] == "window_close" {
+			return map[string]any{
+				"ok": true, "window_open": false,
+				"window_turn_id": "turn-1", "window_closing": false,
+			}
+		}
+		return nil
+	})
+	c := NewController(h.path, true, true)
+	defer c.Stop()
+	if state, err := c.CloseWindowForTurn("turn-1", "done"); err == nil {
+		t.Fatalf("stale owner state=%#v reported a confirmed relock", state)
+	}
+}
+
+func TestWindowStatePreservesTransportAndProtocolErrors(t *testing.T) {
+	c := NewController("/tmp/ra-no-such-helper.sock", true, true)
+	if _, err := c.WindowState(); !errors.Is(err, ErrHelperUnavailable) {
+		t.Fatalf("unavailable state err=%v, want ErrHelperUnavailable", err)
+	}
+
+	h := startHelper(t, nil)
+	c = NewController(h.path, true, false)
+	defer c.Stop()
+	if state, err := c.WindowState(); err == nil {
+		t.Fatalf("incomplete helper state=%#v reported no protocol error", state)
+	}
+}
+
+func TestStopClosesAnOpenWindowBeforeDisconnecting(t *testing.T) {
+	windowOpen := true
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		switch req["op"] {
+		case "window_state":
+			return map[string]any{
+				"ok": true, "window_open": windowOpen,
+				"window_turn_id": "turn-1", "window_closing": false,
+			}
+		case "window_close":
+			windowOpen = false
+			return map[string]any{
+				"ok": true, "window_open": false,
+				"window_turn_id": "", "window_closing": false,
+			}
+		default:
+			return nil
+		}
+	})
+	c := NewController(h.path, true, true)
+	c.Stop()
+
+	seen := h.seen()
+	if len(seen) != 2 || seen[0]["op"] != "window_state" || seen[1]["op"] != "window_close" {
+		t.Fatalf("shutdown requests=%#v, want window_state then window_close", seen)
+	}
+	if seen[1]["reason"] != "AgentHalo shutdown" {
+		t.Fatalf("shutdown close reason=%v", seen[1]["reason"])
+	}
+}
+
+func TestStopCancelsAndWaitsForAnOpeningWindow(t *testing.T) {
+	phase := WindowPhaseOpening
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		switch req["op"] {
+		case "window_state":
+			return map[string]any{
+				"ok": true, "window_registered": phase != WindowPhaseClosed,
+				"window_phase": phase, "window_open": phase == WindowPhaseOpen,
+				"window_turn_id": "turn-opening", "window_closing": phase == WindowPhaseClosing,
+			}
+		case "window_close":
+			phase = WindowPhaseClosed
+			return map[string]any{
+				"ok": true, "window_registered": false,
+				"window_phase": WindowPhaseClosed, "window_open": false,
+				"window_turn_id": "", "window_closing": false,
+			}
+		default:
+			return nil
+		}
+	})
+	c := NewController(h.path, true, true)
+	c.Stop()
+
+	seen := h.seen()
+	if len(seen) != 2 || seen[0]["op"] != "window_state" || seen[1]["op"] != "window_close" {
+		t.Fatalf("opening shutdown requests=%#v, want state then synchronous close", seen)
+	}
+	if seen[1]["turn_id"] != "turn-opening" {
+		t.Fatalf("opening shutdown lost the registered owner: %#v", seen[1])
+	}
+}
+
+func TestStopWaitsForClosingWindowConfirmation(t *testing.T) {
+	closeStarted := make(chan struct{})
+	allowClose := make(chan struct{})
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		switch req["op"] {
+		case "window_state":
+			return map[string]any{
+				"ok": true, "window_registered": true,
+				"window_phase": WindowPhaseClosing, "window_open": false,
+				"window_turn_id": "turn-closing", "window_closing": true,
+			}
+		case "window_close":
+			close(closeStarted)
+			<-allowClose
+			return map[string]any{
+				"ok": true, "window_registered": false,
+				"window_phase": WindowPhaseClosed, "window_open": false,
+				"window_turn_id": "", "window_closing": false,
+			}
+		default:
+			return nil
+		}
+	})
+	c := NewController(h.path, true, true)
+	done := make(chan struct{})
+	go func() {
+		c.Stop()
+		close(done)
+	}()
+	<-closeStarted
+	select {
+	case <-done:
+		t.Fatal("Stop returned before the helper confirmed closing-window cleanup")
+	default:
+	}
+	close(allowClose)
+	<-done
+}
+
+func TestPrepareForRestartRequiresAtomicHelperConfirmation(t *testing.T) {
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		if req["op"] != "prepare_restart" {
+			t.Fatalf("restart preflight used non-atomic request: %#v", req)
+		}
+		return map[string]any{"ok": true, "safe_to_restart": true}
+	})
+	c := NewController(h.path, true, true)
+	if err := c.PrepareForRestart(); err != nil {
+		t.Fatalf("restart preflight: %v", err)
+	}
+	seen := h.seen()
+	if len(seen) != 1 || seen[0]["op"] != "prepare_restart" {
+		t.Fatalf("restart preflight requests=%#v, want one atomic prepare_restart", seen)
+	}
+}
+
+func TestPrepareForRestartFailsClosedWithoutStrictSafeConfirmation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply map[string]any
+	}{
+		{name: "missing", reply: map[string]any{"ok": true}},
+		{name: "false", reply: map[string]any{"ok": true, "safe_to_restart": false}},
+		{name: "wrong-type", reply: map[string]any{"ok": true, "safe_to_restart": "true"}},
+		{name: "legacy-unknown-op", reply: map[string]any{
+			"ok": false, "code": "bad_request", "error": "unknown op",
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := startHelper(t, func(map[string]any) map[string]any { return tc.reply })
+			c := NewController(h.path, true, true)
+			if err := c.PrepareForRestart(); err == nil {
+				t.Fatal("helper without strict safe_to_restart=true was accepted")
+			}
+			seen := h.seen()
+			if len(seen) != 1 || seen[0]["op"] != "prepare_restart" {
+				t.Fatalf("unsafe preflight requests=%#v", seen)
+			}
+		})
+	}
+}
+
+func TestAXForwardsEmptyValueAndRejectsUnsafePaths(t *testing.T) {
+	h := startHelper(t, nil)
+	c := NewController(h.path, true, false)
+	defer c.Stop()
+	empty := ""
+	if _, err := c.RunAX(AXRequest{
+		TurnID: "turn-1", Op: "ax_setvalue", App: "Notes", Path: []int{0}, Value: &empty,
+	}); err != nil {
+		t.Fatalf("empty setvalue: %v", err)
+	}
+	seen := h.seen()
+	if got, ok := seen[0]["value"]; !ok || got != "" {
+		t.Fatalf("empty value was not forwarded: %#v", seen[0])
+	}
+	if seen[0]["turn_id"] != "turn-1" {
+		t.Fatalf("turn_id was not forwarded: %#v", seen[0])
+	}
+	if _, err := c.RunAX(AXRequest{
+		TurnID: "turn-focus", Op: "ax_focus", BundleID: "com.example.App", Path: []int{2, 1},
+	}); err != nil {
+		t.Fatalf("focus: %v", err)
+	}
+	seen = h.seen()
+	focus := seen[len(seen)-1]
+	if focus["op"] != "ax_focus" || focus["turn_id"] != "turn-focus" ||
+		focus["bundle_id"] != "com.example.App" {
+		t.Fatalf("focus fields were not forwarded: %#v", focus)
+	}
+	path, ok := focus["path"].([]any)
+	if !ok || len(path) != 2 || path[0] != float64(2) || path[1] != float64(1) {
+		t.Fatalf("focus path was not forwarded: %#v", focus)
+	}
+	if _, present := focus["value"]; present {
+		t.Fatalf("focus unexpectedly forwarded a value: %#v", focus)
+	}
+	if _, err := c.RunAX(AXRequest{Op: "ax_press", Path: []int{-1}}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("negative path err=%v, want ErrBadRequest", err)
+	}
+	tooDeep := make([]int, MaxAXPathDepth+1)
+	if _, err := c.RunAX(AXRequest{Op: "ax_press", Path: tooDeep}); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("deep path err=%v, want ErrBadRequest", err)
 	}
 }
 

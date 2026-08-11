@@ -19,11 +19,21 @@
 # Exit: 0 all attempted checks passed · 1 something failed
 set -uo pipefail
 
+# Keep compiler caches outside user Library paths. Besides making the probe
+# reproducible under launch/sandboxed shells, this prevents a read-only SwiftPM
+# or Go cache from being reported as a product build failure.
+: "${GOCACHE:=/tmp/agenthalo-go-cache}"
+: "${CLANG_MODULE_CACHE_PATH:=/tmp/agenthalo-clang-cache}"
+: "${SWIFT_MODULECACHE_PATH:=/tmp/agenthalo-swift-cache}"
+export GOCACHE CLANG_MODULE_CACHE_PATH SWIFT_MODULECACHE_PATH
+mkdir -p "$GOCACHE" "$CLANG_MODULE_CACHE_PATH" "$SWIFT_MODULECACHE_PATH"
+
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER_DIR="$REPO/mac/RemoteAgentDesktop"
-PLUGIN_SRC="$REPO/mac/authorization-plugin/RemoteAgentLockedUse.m"
-GRANT_SRC="$HELPER_DIR/Sources/RemoteAgentDesktopCore/Grant.swift"
-CONFIG_SRC="$HELPER_DIR/Sources/RemoteAgentDesktopCore/LockedUseConfig.swift"
+PLUGIN_SRC="$REPO/mac/authorization-plugin/AgentHaloLockedUse.m"
+GRANT_SRC="$HELPER_DIR/Sources/AgentHaloDesktopCore/Grant.swift"
+CONFIG_SRC="$HELPER_DIR/Sources/AgentHaloDesktopCore/LockedUseConfig.swift"
+SHIELD_SRC="$HELPER_DIR/Sources/AgentHaloDesktopCore/DisplayShield.swift"
 CHECK_SHIELD=0
 CHECK_LOCK=0
 FAILED=0
@@ -75,20 +85,20 @@ else
 fi
 
 step "desktop helper builds and its tests pass"
-if (cd "$HELPER_DIR" && swift build -c release 2>&1 | tail -3); then
-  pass "remote-agent-desktop builds"
+if (cd "$HELPER_DIR" && swift build --disable-sandbox -c release 2>&1 | tail -3); then
+  pass "agenthalo-desktop builds"
 else
-  fail "remote-agent-desktop does not build"
+  fail "agenthalo-desktop does not build"
 fi
 # This is where the safeguards live: the action vocabulary and its bounds, the
 # grant contract, and the Locked Use state machine.
-if (cd "$HELPER_DIR" && swift test 2>&1 | tail -3); then
+if (cd "$HELPER_DIR" && swift test --disable-sandbox 2>&1 | tail -3); then
   pass "helper tests"
 else
   fail "helper tests"
 fi
 
-HELPER="$HELPER_DIR/.build/release/remote-agent-desktop"
+HELPER="$HELPER_DIR/.build/release/agenthalo-desktop"
 
 step "helper answers the read-only probes"
 # These three are what the controller polls constantly. If any cannot answer,
@@ -117,24 +127,39 @@ else
   skip "accessibility not granted — grant it in System Settings > Privacy & Security > Accessibility, or synthetic input will do nothing"
 fi
 
-step "there is no unlock operation in the helper"
-# The helper must not be able to unlock a Mac. Unlocking belongs to macOS and
-# the authorization plug-in; a helper that could do it directly would make every
-# controller safeguard bypassable.
-if grep -rqiE '"(unlock|sac_?unlock)"|SACUnlock' "$HELPER_DIR/Sources"; then
-  fail "the helper appears to expose an unlock operation"
+step "lock-screen authorization contains no credential path"
+# Locked Use asks loginwindow to evaluate the screensaver right; the signed
+# Authorization Plug-in is the branch that may authorize it.  The helper must
+# never store/inject a login password or call a private direct-unlock primitive.
+if grep -rqiE 'import LocalAuthentication|setCredential|kAuthorizationEnvironmentPassword|SACUnlock' \
+     "$HELPER_DIR/Sources"; then
+  fail "the helper contains a credential or direct-unlock path"
 else
-  pass "no unlock operation in the helper"
+  pass "no password storage/injection or direct-unlock primitive"
+fi
+
+if grep -q 'captureSharingType: NSWindow.SharingType = .readOnly' "$SHIELD_SRC" && \
+   ! grep -q 'window.sharingType = .none' "$SHIELD_SRC"; then
+  pass "ordinary capture clients retain the black display shield"
+else
+  fail "display shield is omitted from ordinary screen captures"
+fi
+INTERACTOR="$HELPER_DIR/Sources/AgentHaloDesktopCore/LockScreenAuthorizationInteractor.swift"
+if grep -q 'UserPasswordTextField' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'kAXConfirmAction' "$INTERACTOR" 2>/dev/null; then
+  pass "unlock request targets the exact loginwindow authorization control"
+else
+  fail "the bounded loginwindow AX authorization interactor is missing"
 fi
 
 step "authorization plug-in builds"
 # Ad-hoc signing is enough to prove it compiles and links. Installing requires a
 # Developer ID identity and is a separate, explicit step.
-if (cd "$REPO/mac/authorization-plugin" && ./build.sh --adhoc >/tmp/ra-plugin-build.log 2>&1); then
-  pass "RemoteAgentLockedUse.bundle builds and ad-hoc signs"
+if (cd "$REPO/mac/authorization-plugin" && ./build.sh --adhoc >/tmp/agenthalo-plugin-build.log 2>&1); then
+  pass "AgentHaloLockedUse.bundle builds and ad-hoc signs"
 else
-  fail "plug-in build failed — see /tmp/ra-plugin-build.log"
-  tail -20 /tmp/ra-plugin-build.log 2>/dev/null | sed 's/^/       /'
+  fail "plug-in build failed — see /tmp/agenthalo-plugin-build.log"
+  tail -20 /tmp/agenthalo-plugin-build.log 2>/dev/null | sed 's/^/       /'
 fi
 
 step "plug-in and helper agree on the grant contract"
@@ -143,13 +168,25 @@ step "plug-in and helper agree on the grant contract"
 # symptom is a Mac that never unlocks.
 check_const() {
   local label="$1" objc_pattern="$2" swift_pattern="$3" swift_file="${4:-$GRANT_SRC}"
-  local objc swift
+  local objc swift objc_value swift_value equal=0
   objc="$(grep -oE "$objc_pattern" "$PLUGIN_SRC" | head -1)"
   swift="$(grep -oE "$swift_pattern" "$swift_file" | head -1)"
-  if [ -n "$objc" ] && [ -n "$swift" ]; then
-    pass "$label (plug-in: $objc, helper: $swift)"
-  else
+  if [ -z "$objc" ] || [ -z "$swift" ]; then
     fail "$label could not be compared (plug-in: '${objc:-?}', helper: '${swift:-?}')"
+    return
+  fi
+  objc_value="$(printf '%s' "$objc" | sed -E 's/.*= *//; s/[;[:space:]]+$//')"
+  swift_value="$(printf '%s' "$swift" | sed -E 's/.*= *//; s/[;[:space:]]+$//')"
+  if [[ "$objc_value" =~ ^[0-9]+([.][0-9]+)?$ ]] && \
+     [[ "$swift_value" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    awk -v a="$objc_value" -v b="$swift_value" 'BEGIN { exit(a == b ? 0 : 1) }' && equal=1
+  elif [ "$objc_value" = "$swift_value" ]; then
+    equal=1
+  fi
+  if [ "$equal" = "1" ]; then
+    pass "$label matches ($objc_value)"
+  else
+    fail "$label differs (plug-in: $objc_value, helper: $swift_value)"
   fi
 }
 check_const "grant version"   'kGrantVersion[^;]*= *[0-9]+'   'let version *= *[0-9]+'
@@ -158,13 +195,137 @@ check_const "max clock skew"  'kMaxClockSkew[^;]*= *[0-9.]+'  'let maxClockSkew:
 check_const "grant purpose"   'screensaver-unlock'            'screensaver-unlock'
 check_const "public key size" 'kPublicKeyBytes[^;]*= *[0-9]+' 'let publicKeyBytes *= *[0-9]+'
 
-PLUGIN_DIR_CONST="$(grep -oE '/Library/Application Support/remote-agent/locked-use' "$PLUGIN_SRC" | head -1)"
-HELPER_DIR_CONST="$(grep -oE '/Library/Application Support/remote-agent/locked-use' "$CONFIG_SRC" | head -1)"
+PLUGIN_NONCE_HEX="$(grep -oE 'kNonceHexLen[^;]*= *[0-9]+' "$PLUGIN_SRC" | sed -E 's/.*= *//' | head -1)"
+HELPER_NONCE_BYTES="$(grep -oE 'let nonceBytes *= *[0-9]+' "$GRANT_SRC" | sed -E 's/.*= *//' | head -1)"
+if [[ "$PLUGIN_NONCE_HEX" =~ ^[0-9]+$ ]] && \
+   [[ "$HELPER_NONCE_BYTES" =~ ^[0-9]+$ ]] && \
+   [ "$PLUGIN_NONCE_HEX" -eq $((HELPER_NONCE_BYTES * 2)) ]; then
+  pass "nonce/receipt size matches ($HELPER_NONCE_BYTES bytes = $PLUGIN_NONCE_HEX hex characters)"
+else
+  fail "nonce size differs (plug-in hex: ${PLUGIN_NONCE_HEX:-?}, helper bytes: ${HELPER_NONCE_BYTES:-?})"
+fi
+
+PLUGIN_DIR_CONST="$(grep -oE '/Library/Application Support/AgentHalo/locked-use' "$PLUGIN_SRC" | head -1)"
+HELPER_DIR_CONST="$(grep -oE '/Library/Application Support/AgentHalo/locked-use' "$CONFIG_SRC" | head -1)"
 if [ -n "$PLUGIN_DIR_CONST" ] && [ "$PLUGIN_DIR_CONST" = "$HELPER_DIR_CONST" ]; then
   pass "grant directory matches on both sides"
 else
   fail "grant directory differs — the agent would publish grants where the plug-in never looks"
 fi
+
+PLUGIN_RECEIPT="$(grep -oE 'AGENTHALO_LOCKED_USE_DIR \"/receipt\"' "$PLUGIN_SRC" | head -1)"
+HELPER_RECEIPT="$(grep -oE 'receiptFileName *= *\"receipt\"' "$GRANT_SRC" | head -1)"
+if [ -n "$PLUGIN_RECEIPT" ] && [ -n "$HELPER_RECEIPT" ]; then
+  pass "exact-nonce receipt path matches on both sides"
+else
+  fail "authorization receipt contract is missing or differs"
+fi
+
+PLUGIN_PENDING_RECEIPT="$(grep -oE 'AGENTHALO_LOCKED_USE_DIR "/receipt.pending"' "$PLUGIN_SRC" | head -1)"
+HELPER_PENDING_RECEIPT="$(grep -oE 'pendingReceiptFileName *= *"receipt.pending"' "$GRANT_SRC" | head -1)"
+if [ -n "$PLUGIN_PENDING_RECEIPT" ] && [ -n "$HELPER_PENDING_RECEIPT" ]; then
+  pass "pre-Allow exact-nonce pending receipt matches on both sides"
+else
+  fail "pending authorization receipt contract is missing or differs"
+fi
+
+PLUGIN_COMPLETION_RECEIPT="$(grep -oE 'AGENTHALO_LOCKED_USE_DIR "/receipt.complete"' "$PLUGIN_SRC" | head -1)"
+HELPER_COMPLETION_RECEIPT="$(grep -oE 'completionReceiptFileName *= *"receipt.complete"' "$GRANT_SRC" | head -1)"
+if [ -n "$PLUGIN_COMPLETION_RECEIPT" ] && [ -n "$HELPER_COMPLETION_RECEIPT" ]; then
+  pass "mechanism-terminal exact-nonce receipt matches on both sides"
+else
+  fail "terminal authorization receipt contract is missing or differs"
+fi
+
+DEACTIVATE_BODY="$(sed -n '/static OSStatus MechanismDeactivate/,/static OSStatus MechanismDestroy/p' "$PLUGIN_SRC")"
+DESTROY_BODY="$(sed -n '/static OSStatus MechanismDestroy/,/static OSStatus PluginDestroy/p' "$PLUGIN_SRC")"
+if ! grep -q 'AgentHaloPublishNonceProof' <<<"$DEACTIVATE_BODY" && \
+   grep -q 'mechanism->completionEligible = NO' <<<"$DEACTIVATE_BODY" && \
+   grep -q 'memset(mechanism->completionNonce' <<<"$DEACTIVATE_BODY" && \
+   grep -q 'AGENTHALO_COMPLETION_RECEIPT_PATH' <<<"$DESTROY_BODY" && \
+   grep -q 'mechanism->completionEligible = NO' "$PLUGIN_SRC" && \
+   grep -q 'memset(mechanism->completionNonce' "$PLUGIN_SRC"; then
+  pass "only successful mechanism Destroy can publish terminal proof and re-invoke clears eligibility"
+else
+  fail "authorization terminal proof lifecycle is not fail-closed"
+fi
+
+if grep -q 'flock(fd, LOCK_SH)' "$PLUGIN_SRC" && \
+   grep -q 'flock(fd, LOCK_EX | LOCK_NB)' "$GRANT_SRC"; then
+  pass "grant verification and bounded withdrawal share an advisory fd lock"
+else
+  fail "grant verifier/withdrawal serialization lock is missing"
+fi
+
+if grep -q 'case consoleUID = "console_uid"' "$GRANT_SRC" && \
+   grep -q 'case consoleUsername = "console_username"' "$GRANT_SRC" && \
+   grep -q 'claims\[@"console_uid"\]' "$PLUGIN_SRC" && \
+   grep -q 'claims\[@"console_username"\]' "$PLUGIN_SRC" && \
+   grep -q 'GetContextValue' "$PLUGIN_SRC" && \
+   grep -q 'kAuthorizationEnvironmentUsername' "$PLUGIN_SRC"; then
+  pass "grant console uid/username claims match the public authorization context contract"
+else
+  fail "cross-user grant binding is missing or differs across helper and plug-in"
+fi
+
+if grep -Fq 'expectedDevice.length == 0 || ![device isEqualToString:expectedDevice]' "$PLUGIN_SRC" && \
+   grep -Fq 'guard !deviceID.isEmpty, payload.deviceID == deviceID' "$GRANT_SRC"; then
+  pass "missing device binding fails closed in plug-in and helper verifier"
+else
+  fail "device binding may be skipped when its provisioned value is unavailable"
+fi
+
+step "screensaver authorization right has a safe branch shape"
+# Reading authorizationdb is non-mutating.  The installer only understands the
+# rule/k-of-n form used by modern macOS; discovering a different shape before
+# installation is much safer than guessing how authd will evaluate it.
+RIGHT_PLIST="$(mktemp -t agenthalo-screensaver-right)"
+if security authorizationdb read system.login.screensaver >"$RIGHT_PLIST" 2>/dev/null; then
+  if /usr/bin/python3 - "$RIGHT_PLIST" <<'PYEOF'
+import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    right = plistlib.load(f)
+ok = (right.get("class") == "rule"
+      and int(right.get("k-of-n", 0)) == 1
+      and "use-login-window-ui" in right.get("rule", []))
+raise SystemExit(0 if ok else 1)
+PYEOF
+  then
+    pass "system.login.screensaver is a 1-of-n rule with the normal password fallback"
+  else
+    fail "system.login.screensaver has an unsupported shape; do not install the plug-in"
+  fi
+else
+  fail "could not read system.login.screensaver"
+fi
+rm -f "$RIGHT_PLIST"
+
+PLUGIN_RULE="dev.linsheng.agenthalo.locked-use"
+RULE_PLIST="$(mktemp -t agenthalo-locked-use-rule)"
+if security authorizationdb read "$PLUGIN_RULE" >"$RULE_PLIST" 2>/dev/null; then
+  if /usr/bin/python3 - "$RULE_PLIST" <<'PYEOF'
+import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    rule = plistlib.load(f)
+timeout = rule.get("timeout")
+timeout_ok = timeout is None or (type(timeout) is int and timeout == 0)
+ok = (rule.get("class") == "evaluate-mechanisms"
+      and rule.get("mechanisms") == ["AgentHaloLockedUse:invoke,privileged"]
+      and rule.get("shared") is False
+      and timeout_ok
+      and type(rule.get("tries")) is int
+      and rule.get("tries") == 1)
+raise SystemExit(0 if ok else 1)
+PYEOF
+  then
+    pass "$PLUGIN_RULE is non-shared, single-use, and names only the expected mechanism"
+  else
+    fail "$PLUGIN_RULE may cache/reuse authorization or has an unexpected mechanism"
+  fi
+else
+  skip "$PLUGIN_RULE is not installed yet"
+fi
+rm -f "$RULE_PLIST"
 
 step "plug-in uses only public Security API"
 # A mechanism bundle is loaded inside authd, in the screensaver-unlock right. If
@@ -186,6 +347,14 @@ if [ -d "$SEC_HEADERS" ]; then
   else
     fail "plug-in references SPI (exported but undeclared):$UNDECLARED"
   fi
+  if grep -q 'kAuthorizationEnvironmentUsername' \
+       "$SEC_HEADERS/AuthorizationTags.h" 2>/dev/null && \
+     grep -q 'GetContextValue' \
+       "$SEC_HEADERS/AuthorizationPlugin.h" 2>/dev/null; then
+    pass "username context key and GetContextValue callback are public Security API"
+  else
+    fail "authorization username context API is not declared by this SDK"
+  fi
 else
   skip "cannot locate Security.framework headers in the SDK"
 fi
@@ -196,16 +365,17 @@ step "a helper-minted grant verifies in the plug-in's own verifier"
 # from "each is self-consistent and rejects the other" — which fails silently:
 # the agent mints, the plug-in refuses, and the Mac simply never unlocks. This
 # is the one place the two are run against each other, so it happens here.
-VECTOR="$(mktemp -t ra-interop-vector)"
-CHECKER="$(mktemp -d -t ra-interop)/interop_check"
-if (cd "$HELPER_DIR" && RA_INTEROP_VECTOR_OUT="$VECTOR" \
+VECTOR="$(mktemp -t agenthalo-interop-vector)"
+CHECKER="$(mktemp -d -t agenthalo-interop)/interop_check"
+if (cd "$HELPER_DIR" && AGENTHALO_INTEROP_VECTOR_OUT="$VECTOR" \
       swift test --filter testInteropVector >/dev/null 2>&1) && [ -s "$VECTOR" ]; then
   if clang -fobjc-arc -Wno-unused-function -framework Foundation -framework Security \
-       -o "$CHECKER" "$REPO/mac/authorization-plugin/interop_check.m" 2>/tmp/ra-interop-build.log; then
+       -o "$CHECKER" "$REPO/mac/authorization-plugin/interop_check.m" 2>/tmp/agenthalo-interop-build.log; then
     PUB="$(sed -n 1p "$VECTOR")"
     PAYLOAD="$(sed -n 2p "$VECTOR")"
     SIG="$(sed -n 3p "$VECTOR")"
     WRONG_PUB="$(sed -n 4p "$VECTOR")"
+    CONSOLE_USER="$(sed -n 5p "$VECTOR")"
     if "$CHECKER" "$PUB" "$PAYLOAD" "$SIG"; then
       pass "plug-in verifier accepts a grant minted by the helper"
     else
@@ -217,9 +387,20 @@ if (cd "$HELPER_DIR" && RA_INTEROP_VECTOR_OUT="$VECTOR" \
     else
       pass "plug-in verifier refuses a grant signed by another key"
     fi
+    if [ -n "$CONSOLE_USER" ] && \
+       "$CHECKER" --claims-user "$PAYLOAD" "$CONSOLE_USER"; then
+      pass "plug-in verifier accepts the signed active console identity"
+    else
+      fail "plug-in verifier rejected the helper's signed console identity"
+    fi
+    if "$CHECKER" --claims-user "$PAYLOAD" "__remote_agent_wrong_user__"; then
+      fail "plug-in verifier accepted a grant for the wrong authorization username"
+    else
+      pass "plug-in verifier refuses a grant from another user session"
+    fi
   else
-    fail "interop harness did not build — see /tmp/ra-interop-build.log"
-    tail -20 /tmp/ra-interop-build.log 2>/dev/null | sed 's/^/       /'
+    fail "interop harness did not build — see /tmp/agenthalo-interop-build.log"
+    tail -20 /tmp/agenthalo-interop-build.log 2>/dev/null | sed 's/^/       /'
   fi
 else
   fail "could not mint an interop vector from the helper"
@@ -263,10 +444,11 @@ if [ "$FAILED" -eq 0 ]; then
 
   Next, in order:
     1. Re-run with --check-shield --check-lock to exercise the disruptive paths.
-    2. Enable computer_use.enabled in config.json, start the helper, and try
-       /computer_use/action (screen.capture, pointer.move) with locked_use off.
-    3. Only then read docs/computer-use-locked-user.md "未验证事项" and install
-       the plug-in on a spare Mac or VM first. It changes how the Mac unlocks.
+    2. With locked_use still off, start a new Codex turn and verify
+       get_app_state -> one mutation -> get_app_state on the ordinary desktop.
+    3. Follow mac/RemoteAgentDesktop/SETUP-locked-unlock.md from the signing
+       checks onward. Install the plug-in on a spare Mac or VM first: it changes
+       the system.login.screensaver authorization right.
 NEXT
   exit 0
 fi

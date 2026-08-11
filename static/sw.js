@@ -1,9 +1,9 @@
-// remote-agent service worker.
+// AgentHalo service worker.
 //   - Receive Web Push events (waiting_approval / waiting_input) and render them.
 //   - Route notification clicks back to the PWA, focusing the right session.
 //
 // No fetch handler — no offline / no asset caching. Live tunnel traffic
-// (/s/remotecoding/d/<device>/..., /_pt/...) must always hit the network.
+// (/s/agenthalo/d/<device>/..., /_pt/...) must always hit the network.
 //
 // Note: with userVisibleOnly subscriptions every push MUST show a
 // notification, so we do NOT suppress when the app is foreground (that would
@@ -11,14 +11,14 @@
 // per-session instead. True foreground suppression needs a server-side
 // presence signal — deferred.
 
-const APP_STATIC_VERSION = "__REMOTE_AGENT_STATIC_VERSION__";
+const APP_STATIC_VERSION = "__AGENTHALO_STATIC_VERSION__";
 function versionHeaders(extra = {}) {
   const v = APP_STATIC_VERSION && !APP_STATIC_VERSION.startsWith("__") ? APP_STATIC_VERSION : "dev";
   return {
     "Content-Type": "application/json",
-    "X-Remote-Agent-Web-Version": v,
-    "X-Remote-Agent-Client-Id": "sw:" + self.registration.scope,
-    "X-Remote-Agent-Client-Kind": "service-worker",
+    "X-AgentHalo-Web-Version": v,
+    "X-AgentHalo-Client-Id": "sw:" + self.registration.scope,
+    "X-AgentHalo-Client-Kind": "service-worker",
     ...extra,
   };
 }
@@ -33,7 +33,7 @@ self.addEventListener('push', (event) => {
   const nativeSession = data.native_session || session;
   const opts = {
     body: data.body || '',
-    tag: data.tag || session || 'remotecoding',
+    tag: data.tag || session || 'agenthalo',
     renotify: true,
     icon: self.registration.scope + 'icon-192.png',
     badge: self.registration.scope + 'icon-192.png',
@@ -49,7 +49,7 @@ self.addEventListener('push', (event) => {
     ];
     opts.requireInteraction = true;   // keep approvals visible until acted on
   }
-  event.waitUntil(self.registration.showNotification(data.title || 'Remote Agent', opts));
+  event.waitUntil(self.registration.showNotification(data.title || 'AgentHalo', opts));
 });
 
 self.addEventListener('notificationclick', (event) => {

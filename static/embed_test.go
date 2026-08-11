@@ -17,10 +17,13 @@ func TestHandlerServesVersionedDeviceUI(t *testing.T) {
 		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
 	}
 	body := rr.Body.String()
+	if !strings.Contains(body, "AgentHalo") {
+		t.Fatal("device UI did not expose the AgentHalo product name")
+	}
 	if !strings.Contains(body, `const APP_STATIC_VERSION = "abc12345"`) {
 		t.Fatalf("device UI was not stamped: %s", body[:min(len(body), 200)])
 	}
-	if strings.Contains(body, "__REMOTE_AGENT_STATIC_VERSION__") {
+	if strings.Contains(body, "__AGENTHALO_STATIC_VERSION__") {
 		t.Fatal("device UI retained the build placeholder")
 	}
 }
@@ -41,7 +44,7 @@ func TestRelayShellOnlyBootstrapsDevices(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
-		"sendPrompt(", "pending_approvals", "session_preview", `id="devices"`, `id="picker"`, "remote-agent-show-devices",
+		"sendPrompt(", "pending_approvals", "session_preview", `id="devices"`, `id="picker"`, "agenthalo-show-devices",
 	} {
 		if strings.Contains(shell, forbidden) {
 			t.Fatalf("relay shell contains device UI behavior %q", forbidden)
@@ -49,6 +52,33 @@ func TestRelayShellOnlyBootstrapsDevices(t *testing.T) {
 	}
 	if strings.Contains(shell, "location.href = deviceURL") {
 		t.Fatal("relay shell must host device content without navigating away")
+	}
+}
+
+func TestAgentHaloPWAIdentity(t *testing.T) {
+	for _, name := range []string{"index.html", "shell.html", "manifest.webmanifest", "sw.js"} {
+		body, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(body), "AgentHalo") {
+			t.Fatalf("%s is missing the AgentHalo product identity", name)
+		}
+	}
+	manifest, err := os.ReadFile("manifest.webmanifest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(manifest), `"name": "AgentHalo"`) ||
+		!strings.Contains(string(manifest), `"short_name": "AgentHalo"`) {
+		t.Fatal("PWA manifest does not use AgentHalo for its install identity")
+	}
+	worker, err := os.ReadFile("sw.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(worker), `data.title || 'AgentHalo'`) {
+		t.Fatal("push notification fallback title is not AgentHalo")
 	}
 }
 
@@ -64,7 +94,7 @@ func TestRelayShellRecoversFromTransientDeviceGatewayErrors(t *testing.T) {
 		`doc.getElementById("app") && doc.getElementById("device")`,
 		`function scheduleFrameRetry(id)`,
 		`Math.min(frameRetryDelay * 2, FRAME_RETRY_MAX_DELAY)`,
-		`params.set("_rc_retry", Date.now().toString())`,
+		`params.set("_agenthalo_retry", Date.now().toString())`,
 		`if (!force && frameReady && hostDevice === id`,
 		`loadDevice(id, true, true)`,
 	} {
@@ -424,6 +454,51 @@ func TestDeviceUIDirectlySendsNativeCodexSessionWithoutAttach(t *testing.T) {
 	for _, forbidden := range []string{`发消息将接入此 Codex thread`, `接入 Codex thread…`} {
 		if strings.Contains(ui, forbidden) {
 			t.Fatalf("device UI still exposes Codex attach flow %q", forbidden)
+		}
+	}
+}
+
+func TestClaudePromptRequiresDurableBrowserOperationIdentity(t *testing.T) {
+	body, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := string(body)
+	for _, want := range []string{
+		`function providerIsClaude(provider)`,
+		`function persistedPromptOperationMatches(tab, operationID, digest)`,
+		`!tab || !STATE_READY || !STATE_PERSISTENT`,
+		`window.localStorage.getItem(stateKey("agenthalo_tabs"))`,
+		`matches.length === 1`,
+		`promptOperationID === operationID`,
+		`promptOperationDigest === digest`,
+		`Re-persist the same identity; never mint a replacement operation.`,
+		`if (durableRequired && !persistedPromptOperationMatches`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Fatalf("Claude prompt durability gate missing %q", want)
+		}
+	}
+	if strings.Contains(ui, `if (tab && tab.promptOperationID && tab.promptOperationDigest === digest) return tab.promptOperationID;`) {
+		t.Fatal("Claude prompt identity may be reused from memory without durable read-back")
+	}
+}
+
+func TestClaudePromptIdentityClearsOnlyAfterMatchingConfirmedTask(t *testing.T) {
+	body, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := string(body)
+	for _, want := range []string{
+		`function clearConfirmedPromptOperation(tab, task)`,
+		`tab.promptOperationID !== task.task_id`,
+		`status !== "running" && status !== "completed"`,
+		`clearConfirmedPromptOperation(tab, task);`,
+		`task.task_id === tab.promptOperationID && (task.status === "running" || task.status === "completed")`,
+	} {
+		if !strings.Contains(ui, want) {
+			t.Fatalf("Claude late task reconciliation missing %q", want)
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -37,6 +38,39 @@ func TestLoadConfigKeepsUnknownProviderFields(t *testing.T) {
 	}
 }
 
+func TestExampleEnablesFreshInstallRuntimeDefaults(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "config.example.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.ComputerUse.Enabled {
+		t.Fatal("fresh-install example disables computer use")
+	}
+	if !cfg.ComputerUse.LockedUse.Enabled {
+		t.Fatal("fresh-install example disables Locked Use")
+	}
+	if cfg.ComputerUse.DebugHTTPActions {
+		t.Fatal("fresh-install example enables HTTP debug actions")
+	}
+	claude := cfg.Providers["claude"].Extra
+	if got := claude["primary_route"]; got != "desktop_computer_use" {
+		t.Fatalf("fresh-install Claude primary_route=%#v", got)
+	}
+	if got := claude["fallback_route"]; got != "stream_json_cli" {
+		t.Fatalf("fresh-install Claude fallback_route=%#v", got)
+	}
+	if got := claude["desktop_bundle_id"]; got != "com.anthropic.claudefordesktop" {
+		t.Fatalf("fresh-install Claude desktop_bundle_id=%#v", got)
+	}
+	if got := claude["desktop_team_id"]; got != "Q6L2SF6YDW" {
+		t.Fatalf("fresh-install Claude desktop_team_id=%#v", got)
+	}
+	got, ok := cfg.Providers["codex"].Extra["shared_daemon_autostart"].(bool)
+	if !ok || !got {
+		t.Fatalf("fresh-install Codex autostart=%#v, want true", cfg.Providers["codex"].Extra["shared_daemon_autostart"])
+	}
+}
+
 func TestResolvePathPrefersExplicit(t *testing.T) {
 	dir := t.TempDir()
 	example := filepath.Join(dir, "config.example.json")
@@ -63,6 +97,9 @@ func TestComputerUseDefaultsOff(t *testing.T) {
 	if cfg.ComputerUse.Enabled {
 		t.Error("computer use defaulted to enabled")
 	}
+	if cfg.ComputerUse.DebugHTTPActions {
+		t.Error("computer-use HTTP debug actions defaulted to enabled")
+	}
 	if cfg.ComputerUse.LockedUse.Enabled {
 		t.Error("locked use defaulted to enabled")
 	}
@@ -70,6 +107,28 @@ func TestComputerUseDefaultsOff(t *testing.T) {
 	// zero-valued config cannot open an unshielded window.
 	if !cfg.ComputerUse.LockedUse.ShieldRequired() {
 		t.Error("display shield is not required by default")
+	}
+}
+
+func TestComputerUseDebugHTTPActionsRequiresExplicitConfig(t *testing.T) {
+	cfg := Config{ComputerUse: ComputerUseConfig{
+		Enabled: true, DebugHTTPActions: true,
+		LockedUse: LockedUseConfig{Enabled: true},
+	}}
+	ApplyDefaults(&cfg)
+	if !cfg.ComputerUse.DebugHTTPActions {
+		t.Fatal("explicit debug_http_actions was not preserved")
+	}
+
+	var decoded Config
+	if err := json.Unmarshal([]byte(`{
+		"computer_use":{"enabled":true,"locked_use":{"enabled":true}}
+	}`), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	ApplyDefaults(&decoded)
+	if decoded.ComputerUse.DebugHTTPActions {
+		t.Fatal("omitted debug_http_actions normalized to true")
 	}
 }
 
@@ -122,16 +181,25 @@ func TestLockedUseTimingsAreClamped(t *testing.T) {
 	}
 }
 
-// An explicit opt-out of the shield must be honored, since it is the only way
-// the field differs from its fail-closed default.
-func TestShieldCanBeExplicitlyDisabled(t *testing.T) {
+func TestLockedUseForcesShieldWhenConfigRequestsOptOut(t *testing.T) {
 	off := false
 	cfg := Config{ComputerUse: ComputerUseConfig{
 		Enabled:   true,
 		LockedUse: LockedUseConfig{Enabled: true, RequireDisplayShield: &off},
 	}}
 	ApplyDefaults(&cfg)
-	if cfg.ComputerUse.LockedUse.ShieldRequired() {
-		t.Error("explicit require_display_shield=false was ignored")
+	if !cfg.ComputerUse.LockedUse.ShieldRequired() {
+		t.Error("Locked Use retained an unsafe require_display_shield=false opt-out")
+	}
+
+	// Ordinary computer use does not own an unlock window or InputGuard, so a
+	// disabled Locked Use block retains the caller's value unchanged.
+	ordinary := Config{ComputerUse: ComputerUseConfig{
+		Enabled:   true,
+		LockedUse: LockedUseConfig{Enabled: false, RequireDisplayShield: &off},
+	}}
+	ApplyDefaults(&ordinary)
+	if ordinary.ComputerUse.LockedUse.ShieldRequired() {
+		t.Error("Locked Use-disabled config did not retain require_display_shield=false")
 	}
 }

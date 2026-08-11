@@ -1,428 +1,469 @@
-# Computer Use 与 Locked User
+# Computer Use 与 Locked Use
 
-本文描述 `remote-agent` 的 computer-use 控制面，以及基于 **Apple Authorization
-Plug-in** 的 **Locked Use**（锁屏后继续操作桌面）。
+本文描述 AgentHalo 的 macOS computer use，以及在机器已锁屏、现场无人时继续让
+大模型截图和操作界面的 Locked Use。产品语义参考
+[ChatGPT Locked Use](https://learn.chatgpt.com/docs/computer-use#locked-use)，系统集成使用
+Apple 的 [Authorization Plug-in](https://developer.apple.com/documentation/security/extending-authorization-services-with-plug-ins)。
 
-参考实现语义对齐 ChatGPT 的 locked use：安装一个参与 macOS unlock flow 的
-authorization plug-in，在一次已授权的 computer-use turn 内允许临时解锁，并以
-限时窗口、显示遮罩、本地输入即时重新锁屏作为约束。
+AgentHalo fresh-install 配置模板默认显式开启两个功能；如果配置块缺失，运行时仍按
+fail-closed 处理：
 
-> **两个功能都默认关闭。** `computer_use.enabled` 打开动作面；
-> `computer_use.locked_use.enabled` 才打开解锁能力。两者都必须在设备本机的
-> `config.json` 里显式开启——**任何网络请求都无法开启它们**。
+- `computer_use.enabled` 打开普通桌面操作；
+- `computer_use.locked_use.enabled` 允许受信任 Codex turn 或 server-bound Claude
+  provider transaction 参与锁屏解锁；
+- 能力只由目标机本地 config 和管理员安装授予，网络请求不能安装 plug-in 或提升配置上限；
+- `computer_use.debug_http_actions` 继续默认关闭，锁屏操作只能走绑定权威 Codex turn
+  或 Claude operation 的进程内 broker。
 
-## 结论先行
+Apple 产品身份以 `dev.linsheng.agenthalo` 为根：Go agent 使用根 identifier，
+desktop helper/LaunchAgent 使用 `.desktop`，Authorization Plug-in 使用
+`.locked-use.plugin`，authorization child rule 使用 `.locked-use`。新安装只使用
+`agenthalo` service/relay、AgentHalo state/socket 和 `AGENTHALO_*` 环境变量；
+安装前必须先用旧版自带的卸载器完整移除旧产品，不做原地迁移。
 
-- Locked Use **不是通用远程解锁**。它只在一次已授权 turn 的解锁瞬间生效，
-  不为其他应用或本地进程提供解锁路径。
-- plug-in **从不接触密码**。它既不读取也不写入
-  `kAuthorizationEnvironmentPassword`，只回答"这次解锁是否放行"。
-- plug-in **永远不会把你锁在门外**：它从不返回 Deny，也从不返回 `undefined`。
-  `undefined` 的语义是"该 mechanism 未做出决定"，authd 可能据此判定整个授权失败
-  ——在解锁 right 上那意味着一台谁都解不开的 Mac。因此无 grant 时返回 Allow，
-  含义仅是"本 mechanism 不反对"，后续的密码 mechanism 照常质询。
-- grant 是**秒级、单次、签名**的凭据，在解锁前一刻签发、被该次解锁消费后立刻撤下。
-  磁盘上长期存在的 grant 就是环境权限，正是本功能必须避免的东西。
-- 控制器的核心不变量是 **不确定即重新锁屏**。任何 safeguard 读不出结果都按失败
-  处理，没有"记录日志然后继续"的分支。
+## 安全定义
+
+Locked Use 不是通用远程解锁，也不是登录密码托管。一次允许的窗口必须满足：
+
+1. 请求来自 provider 协议确认的当前 active Codex model turn，或 server 创建且绑定
+   exact Claude logical/native session 的短时 operation；
+2. 物理显示器在撤锁前已经遮黑，物理输入 tap 已生效；
+3. Apple Authorization Plug-in 验证并原子消费本 turn 的短时签名 grant；
+4. root-context plug-in 为本 nonce 写入 pending/final/complete proofs；`complete` 只能由成功 Allow 对应的 `MechanismDestroy` 写入；
+5. `complete` 前 loginwindow 的 exact password field 持续是同一 AX element 且系统保持 locked；仅在 `complete` 后才接受该 element 的 lifecycle completion 与实际 unlocked；
+6. 所有操作都仍属于同一个 turn/operation；
+7. turn/operation 结束、TTL、本地输入、遮罩/进程/系统状态异常时，撤 grant 并确认
+   重新锁屏。
+
+总不变量是：**不确定就拒绝或重锁，不能“记录错误后继续”。**
 
 ## 总体拓扑
 
 ```mermaid
-flowchart TB
-    PWA["PWA / mobile"] -->|"/computer_use/*"| API["Go API server"]
-    API --> Ctl["computeruse.Controller"]
+flowchart LR
+    Model["Codex model turn"] -->|"dynamic tool call\nthread + turn + call"| Codex["Codex app-server provider"]
+    Human["Remote human action"] -->|"prompt / exact question / one-time decision"| Claude["Claude provider\nsession-sticky Desktop route"]
+    Observer["Claude observer hook + transcript"] -->|"side-effect-free pending/output"| Claude
+    Codex -->|"in-process authoritative request"| Broker["AgentHalo tool broker"]
+    Claude -->|"short server-bound provider transaction"| Broker
+    Broker -->|"lease owner over signed UDS"| Helper["Swift desktop helper"]
 
-    Ctl -->|"mint + publish (秒级)"| Grant["signed grant"]
-    Grant --> Plugin["Authorization Plug-in<br/>(SecurityAgent, root)"]
-    Plugin -->|"verify + consume nonce"| Unlock["macOS unlock flow"]
-    Plugin -.->|"不反对(Allow)"| Password["正常密码机制"]
+    Helper --> Shield["black display shield + input guard"]
+    Helper --> Grant["signed one-use grant"]
+    Grant --> Plugin["Apple Authorization Plug-in"]
+    Plugin -->|"pending → Allow → final → Destroy/complete"| Login["macOS loginwindow unlock flow"]
 
-    Ctl -->|"newline-JSON over UDS"| Helper["mac/RemoteAgentDesktop<br/>remote-agent-desktop"]
-    Swift --> Desktop["CoreGraphics 桌面"]
-
-    Ctl --> Audit["audit ring (no secrets)"]
+    Helper --> Capture["ScreenCaptureKit PNG in memory"]
+    Helper --> AX["Accessibility tree and actions"]
+    Capture --> Broker
+    AX --> Broker
+    Broker -->|"inputImage + inputText"| Model
+    Broker -->|"fresh AX + exact Claude action"| ClaudeApp["Claude Desktop\nexact bundle + Team + session + request"]
 ```
 
-`remote-agent` 持有 ECDSA P-256 **私钥**；plug-in 只被 provision 对应的**公钥**。
-私钥永远不离开 agent 进程，公钥永远不足以签发 grant。
+Go agent 不持有登录密码，也不直接改桌面。Swift helper 不提供“unlock” socket op；它只
+能唤醒 loginwindow 并确认其授权控件。是否撤锁由 macOS authorization engine 和已安装
+plug-in 决定。
 
-选 P-256 而不是 Ed25519，是被验证方一侧逼出来的，不是偏好：plug-in 只能走
-Security.framework 验签，而 SecKey 的 Ed25519 常量（`kSecAttrKeyTypeEd25519`、
-`kSecKeyAlgorithmEdDSASignatureMessage…`）是 **SPI** —— 只由 `Security.tbd`
-导出，任何公开头文件里都没有声明。mechanism bundle 一旦绑定私有符号，Apple
-哪天撤掉它，bundle 就会在 **authd 内部、screensaver-unlock right 上**加载失败，
-那正是设计承诺 1 要避免的锁死方向。`kSecKeyAlgorithmECDSASignatureMessageX962SHA256`
-是公开 API，Go 的 `ecdsa.SignASN1` 产出的正是它要的 X9.62 DER。
+## 权威操作绑定
 
-`mac/preflight.sh` 会在目标 Mac 上做两件 CI 做不到的事：拒绝 plug-in 引用任何
-未在公开头文件中声明的 `kSec*` 常量，以及用 Go 真实签出的 grant 跑一遍 plug-in
-自己的验签函数（并确认换一把公钥会被拒）。两侧各自自洽却互不接受是静默失败——
-agent 一直签，plug-in 一直拒，唯一症状是"这台 Mac 就是解不开锁"。
+### Codex dynamic tools
 
-## Grant 契约
+AgentHalo 为**新建 Codex thread**在 `thread/start` 注册 `computer_use` namespace：
 
-grant 的权威定义在 `internal/computeruse/grant.go`；plug-in
-(`mac/authorization-plugin/RemoteAgentLockedUse.m`) 是**执行副本**，Go 侧的
-`VerifyGrant` 是可在 CI 里测试的镜像实现，不是替代品。
-
-签名载荷（字段与顺序属于 wire contract，改动必须 bump `GrantVersion`）：
-
-| 字段 | 含义 |
+| Tool | 作用 |
 |---|---|
-| `v` | grant 版本；verifier 不认识就拒绝 |
-| `purpose` | 固定 `screensaver-unlock`；grant 不是通用授权令牌 |
-| `nonce` | 16 字节随机数，hex 编码；verifier ledger 里的单次使用键 |
-| `device_id` | 绑定设备；跨设备重放无效 |
-| `turn_id` | 归属的 turn，仅用于审计关联 |
-| `issued_at` / `expires_at` | 签发/过期时间 |
+| `get_app_state` | 自动建立本 turn 的唯一 Locked Use window，返回 PNG 与目标 app AX tree |
+| `press` | 对最新 AX path 执行 press |
+| `set_value` | 对最新 AX path 写值；允许空字符串清空输入框 |
+| `click` | 点击 composite PNG 的左上角原点坐标 |
+| `type_text` | 输入文本 |
+| `press_key` | 输入单键或组合键 |
+| `scroll` | 在 composite PNG 的左上角原点坐标滚动 |
 
-载荷里**没有**、也不允许出现任何可以充当凭据的字段
-（`TestGrantPayloadCarriesNoCredentialFields` 会盯住这一点）。
+Provider 从 app-server request 自己取得 `generation/threadId/turnId/callId`，并同时校验：
 
-### verifier 的检查顺序
+- 当前 app-server generation；
+- 该 thread 是本 generation 新建并实际拿到 dynamic tools 的 thread；
+- thread 当前 active，且 turn→thread 映射完全一致；
+- 不在 interrupt/terminal 状态；
+- 最近一次 `get_app_state` 已成功，且 AX mutation 的 app 与该次检查目标一致。
 
-1. **签名先行**——先验签，再解析被签名覆盖的那份字节。不解析未被签名的结构。
-2. 版本、`purpose`、`device_id`、nonce 格式。
-3. **新鲜度由 verifier 决定，不信任 grant 自述**：
-   `expires_at - issued_at > 15s` 直接**拒绝**（不是截断后接受），
-   `issued_at` 超前于当前时间（允许 5s 偏移）拒绝，已过期拒绝。
-   这样一个被泄漏或误签的 grant 不可能变成长期万能钥匙。
-4. **最后原子消费 nonce**：以 `O_CREAT|O_EXCL` 写入 root-owned ledger。
-   `EEXIST` 即重放，拒绝；写入失败也拒绝——**没有任何路径让一个 grant 被用两次**。
+模型参数不能覆盖 provider/session/thread/turn 身份。tool callback 直接进入同进程 broker，
+不绕回 HTTP。provider terminal、interrupt、error 或 app-server loss 会撤 lease、等待在途
+操作结束、关闭窗口并重锁。
 
-全部通过才算一次"已授权解锁"并消费 nonce。**但无论结果如何，mechanism 都返回
-`kAuthorizationResultAllow`**——见下面的"未验证事项"。
+一次 `get_app_state` 只授权**一次**后续 mutation；mutation 在进入 broker 前原子消费这份
+观察能力（并发调用最多一条通过），之后必须重新截图/读 AX。这样 UI 改变后不能继续沿用
+旧坐标或旧 index path 盲操作。
 
-## Locked Use 窗口生命周期
+Codex `thread/resume` 目前不能安全补发 thread-only dynamic tools，因此不宣称支持。
+
+### Claude provider transaction
+
+Claude 不把 PWA 参数伪装成 model turn，也不让 observer hook 自己取得桌面能力。
+canonical `claude` 的每个 logical session 持久化 session-sticky route：fresh session
+默认 `desktop_computer_use`；`stream_json_cli` 只允许在任何 UI mutation 之前的
+capability preflight 失败时，为该 fresh session 选定一次。
+
+Desktop route 的 prompt input、`AskUserQuestion` answer 和 Claude tool allow/deny
+进入一个 server 创建的短时进程内 transaction：
+
+1. API 从持久 record 恢复 provider + logical/native session + Desktop alias；调用方
+   不能覆盖这些 identity，也不能自报 turn/lease id；
+2. server 生成随机 operation id 和短时 lease，并固定 configured Claude bundle id、
+   Team id、session id；question/permission 还固定 exact pending request id；
+3. capability、owner、locked/shield/input-guard preflight 在任何 app activate、focus、
+   set-value、press、click、type 或 key mutation 前完成；
+4. 每个 mutation 前读取 fresh screenshot + AX tree；一次 mutation 消费一次
+   observation，第二个 mutation 必须重新观察；
+5. transaction 同步停止 admission、等待在途动作、close、撤 grant、relock 并 read
+   back，全部完成后调用才返回。Claude model 运行和 observer polling 期间保持锁屏。
+
+fallback 是 pre-mutation route selection，不是 retry。session 已有 Desktop owner、
+发生或可能发生过任何 UI mutation、local physical input、bundle/Team/session/request
+不匹配、shield/lock state 不确定等安全拒绝，均不得改走 CLI。投递是否发生不确定时返回
+`delivery_unknown`；禁止重复发送 prompt、答案或 allow/deny。
+
+Claude 的 observer hook、turn-state 和 transcript 只承担无副作用 discovery/read side。
+`/status`、`/output`、native list、preview、push/stream polling 不得打开 window 或撤锁；
+只有 prompt delivery 或远端人类携 exact request id 的 `/question_answer` / `/approval`
+可以开始 transaction。模型不能给自己授权。
+
+`allow` 仅能选择当前 Claude tool request 的最小一次性权限（“Allow Once”）。AX 必须
+匹配 exact card/tool/request 并确认 control enabled；若界面只提供 Always、session-wide、
+修改默认策略或其他扩大范围的允许方式，则 fail closed。`deny` 也只能作用于 exact
+request。
+
+本文中的 Claude “授权”不包括 macOS 登录密码、Touch ID、TCC/Accessibility/Screen
+Recording、账号登录、SSO、MFA 或恢复码。AgentHalo 不读取、保存、输入或代替人工批准
+这些系统/身份认证。
+
+### HTTP 边界
+
+普通未启用 Locked Use 的 computer use 仍保留现有 HTTP 兼容面。设备一旦配置
+`locked_use.enabled=true`，以下 HTTP 操作默认返回 `403 model_tool_required`：
+
+- window open；
+- action；
+- AX read/mutation。
+
+window close 始终允许，因为它只能撤权和重锁。设备本地可以显式设置
+`computer_use.debug_http_actions=true` 做人工调试；这会削弱“只有权威绑定的
+turn/operation 能操作”的边界，生产环境必须保持 false。Claude provider transaction 也不使用这些 HTTP
+routes；它与 Codex dynamic tool 一样只调用进程内 broker。
+
+## Authorization Plug-in
+
+### authorizationdb 形状
+
+在当前 macOS 上，`system.login.screensaver` 是 `class=rule`、`k-of-n=1` 的 rule 列表。
+安装器创建：
+
+```text
+dev.linsheng.agenthalo.locked-use
+  class = evaluate-mechanisms
+  mechanisms = [AgentHaloLockedUse:invoke,privileged]
+  shared = false
+  timeout = 0
+  tries = 1
+```
+
+再把子规则放在 `use-login-window-ui` 普通密码分支之前。结果是：
+
+- 有效 grant：AgentHalo 分支 Allow，本次解锁获得授权；
+- 无效/缺失 grant：该分支 Deny，求值继续到正常登录窗口；
+- 正常密码分支永远保留，因此安装后仍可人工解锁。
+
+安装器仍显式写入 `timeout=0`。macOS 26.5.2 的 `authd` 在回读这个
+`evaluate-mechanisms` rule 时会省略该键，因此安装器和 preflight 只接受“键缺失”或
+“整数 0”；任何非零值或错误类型仍失败关闭。`shared=false` 防止一次 Allow 进入全局
+credential cache、被后续
+authorization instance 重用；`tries=1` 限制同一 authorization transaction 只求值一次，
+原子消费 nonce 和 root-owned ledger 再阻止同一 grant 在同一事务或后续事务中重放。这三层
+不能互相替代。
+
+如果目标系统不是安装器明确支持的 `rule` 或 `evaluate-mechanisms` 形状，安装器拒绝修改，
+而不是猜测一个 authorizationdb 布局。
+
+### Grant 契约
+
+grant 使用 ECDSA P-256，签名覆盖：
+
+| 字段 | 约束 |
+|---|---|
+| `v` | 固定为 grant v2 |
+| `purpose` | 固定 `screensaver-unlock` |
+| `nonce` | 16 随机字节，32 个小写 hex 字符 |
+| `device_id` | 与安装时目标设备一致 |
+| `turn_id` | 审计归属 |
+| `console_uid` / `console_username` | helper 必须是当前 primary console user；两项同时匹配本次 authorization transaction username 及其 passwd UID |
+| `issued_at` / `expires_at` | 有效期 > 0 且不超过 15 秒 |
+
+Plug-in 的检查顺序：签名 → schema/设备/主体/新鲜度 → `O_EXCL` 原子消费 nonce →
+写 root-owned exact-nonce `receipt.pending` → `SetResult(Allow)` → 写 final `receipt` →
+成功 Allow 对应的 `MechanismDestroy` 写终态 `receipt.complete`。从第一次读取 grant
+到 final proof 完成持有 shared fd lock；controller 撤销 grant 必须取得 exclusive
+lock，随后再从磁盘复核三份 proof。任何读取、owner/mode、symlink、长度、签名、
+主体、时钟、ledger 或 proof 写入失败都失败关闭；final 存在但 complete 缺失也不得开窗。
+
+helper 不能靠“屏幕变成 unlocked”认领成功：真人、Apple Watch 或另一个授权分支可能
+恰好获胜。`receipt.complete` 前，exact `UserPasswordTextField` 必须持续是同一
+AX element，且屏幕必须一直 locked；仅在 complete 之后，才接受该 element
+失效/完成与 unlocked 状态的组合。complete 前发生的 alternate unlock 必须重锁并
+进入 quarantine，不能被归因到本 turn。
+
+### 密钥
+
+grant 私钥保存在当前用户的 file-based login Keychain：
+
+- 只有显式执行 `--provision-locked-use-key --config <path>` 时才允许创建缺失的 key；
+- 首次创建使用 Keychain 默认 creator ACL，把 item 绑定到已安装 helper 的
+  code-signing designated requirement；不使用 restricted keychain access-group entitlement；
+- 正常运行时只读取既有 key，禁止认证 UI；缺失、不可访问或 ACL 不匹配都失败关闭，
+  不删除、不轮换 key；
+- helper 与 agent 必须使用同 Team 和固定 signing identifier；
+- plug-in 只安装对应 public key，公钥不能签发 grant。
+
+provisioning 命令只创建缺失的 key（或读取既有 key）并输出 public-key JSON；不锁屏、
+不启动服务、不接触登录密码。AgentHalo 没有 plaintext key 文件或旧产品 key 导入路径。
+屏幕锁定与 login Keychain 锁定是两套状态：helper 启动时会读取 key 并驻留内存；如果
+login Keychain 被手工或策略锁定后 helper 需要重启，key 将不可读，Locked Use 必须
+fail closed，且不得弹出认证 UI、绕过 Keychain 策略或静默生成新 key。
+
+root-owned `grant.json` 保持 mode `0600`，安装器只用 named-user ACL 给实际 helper 账户
+write/truncate 权限；不能用常见的 `root:staff 0620`，否则另一个本地账户可以截断或持锁
+把无人值守窗口钉在故障状态。
+
+## Locked Use 生命周期
 
 ```mermaid
 sequenceDiagram
-    participant Turn as 已授权 turn
-    participant Ctl as Controller
-    participant Sys as macOS
-    participant Plug as Plug-in
+    participant M as "Bound Codex turn / Claude operation"
+    participant H as "Swift helper"
+    participant P as "Authorization Plug-in"
+    participant L as "loginwindow"
 
-    Turn->>Ctl: POST /computer_use/window {open}
-    Ctl->>Sys: 读取本地 idle 时间
-    Note over Ctl: 有人在用这台机器 → 拒绝
-    Ctl->>Sys: 升起显示遮罩（先于解锁）
-    Note over Ctl: 遮罩确认不了 → 拒绝，不解锁
-    Ctl->>Plug: 签发并发布 grant（秒级 TTL）
-    Plug->>Sys: 验证 + 消费 nonce → Allow
-    Ctl->>Ctl: 立刻撤下 grant
-    Ctl-->>Turn: 窗口开启
-
-    loop 每 40ms
-        Ctl->>Sys: idle / 遮罩 / TTL 检查
-        Note over Ctl: 任一项异常或读不出 → 关闭窗口
-    end
-
-    Ctl->>Sys: 重新锁屏并**读回确认**
-    Ctl->>Sys: 确认锁上后才放下遮罩
+    M->>H: open transaction(owner lease)
+    H->>H: idle check + reserve opening
+    H->>H: engage shield + input guard
+    H->>H: mint and publish signed grant
+    H->>L: wake + confirm loginwindow authorization UI
+    L->>P: evaluate AgentHalo mechanism
+    P->>P: verify + O_EXCL consume nonce
+    P-->>H: pending → Allow → final → Destroy/complete
+    H->>H: same field + locked until complete
+    H->>H: then require field lifecycle completion + unlocked + shield
+    H-->>M: PNG + AX tree
+    M->>H: fresh observation before each mutation
+    M->>H: AX / keyboard / pointer mutation
+    M-->>H: completed / interrupted / error
+    H->>H: stop admission and wait in-flight ops
+    H->>H: withdraw grant + relock + read back
+    H->>H: release shield only after safe boundary
 ```
 
-### 各项 safeguard
+opening、open、closing 是显式状态。same-turn 重试会等待原 opening 结果；不同 turn 不能
+共用窗口。close 先禁止新操作，再等待 opening/authorization 和在途操作结束，避免
+“close 已返回后，迟到的 loginwindow Allow 又把机器解开”。
 
-| Safeguard | 行为 | 失败时 |
-|---|---|---|
-| 本地输入 | 开窗前要求已 idle；窗口内固定 **40ms** 轮询 | 有输入 → 立即关窗重新锁屏 |
-| 显示遮罩 | 覆盖全部活动显示器，**先于解锁**升起 | 无法确认 → 拒绝开窗 |
-| 窗口硬 TTL | 与 turn 活跃度无关的上限（默认 300s） | 到期 → 关窗重新锁屏 |
-| grant TTL | 默认 10s，上限 15s，解锁后立刻撤下 | 过期 → 解锁失败 |
-| 重新锁屏 | 命令后**读回确认**，有界重试 | 确认不了 → **保持遮罩** 并审计告警 |
-| 启动清扫 | arm 前删除全部 grant 并强制锁屏 | 无法建立锁定基线 → 拒绝 arm |
-| 截屏闸门 | 窗口开启且遮罩未确认时拒绝 `/screenshot`、`/ocr` | 拒绝，不落盘 |
+如果 pending/final/complete proof 未按上述顺序出现，或授权/解锁转换迟到，controller
+使用独立 settle deadline；
+超时不是普通失败，而是 quarantine。quarantine 会 disarm、保持遮罩、持续撤 grant，并在
+必要时先观察迟到 unlock 再重新锁上。如果 nonce proof 已存在但 ordered UI lifecycle
+未能确认，状态会标记 `requires_manual_recovery=true`；任意后续 unlocked 快照都不能修复
+归因歧义，helper 会持续保留遮罩和重锁，直到受控重启/人工恢复。open 后一旦观察到系统重新 locked（或锁态不可读），
+该 turn 的窗口永久结束，之后即使外部机制再次解锁也不能恢复旧 lease。SIGTERM 的优雅退出
+也只有确认 grant 不在且系统 locked 后才退出。
 
-轮询间隔**不可配置**，避免部署把它放宽到秒级从而给现场的人留出操作时间。
+Apple 公开 Authorization Plug-in API 只给出 mechanism 的 result/lifecycle 回调，没有承诺
+`MechanismDestroy` 晚于 loginwindow 实际应用可见解锁副作用。因此 `complete -> field
+lifecycle completion -> unlocked` 的真实顺序是目标 macOS 版本的强制 E2E 门禁，
+不是单元测试可以证明的 API 保证。同时发生的 Apple Watch/其他 alternate unlock
+必须在真机测试中证明会 fail closed、保持 shield 并重锁。
 
-### 为什么这个顺序
+实现已能在 `complete` 前发现 exact field 消失或屏幕提前 unlocked，并进入
+permanent quarantine。但 `complete` 之后，Apple 公开 API 不再暴露可把“可见撤锁”
+因果绑定到本 nonce 的 transaction ID/completion callback；Apple Watch 或另一授权路径可以
+产生同样的 `field disappeared + unlocked` 观测。在目标机证明原 transaction 不会继续
+迟到应用之前，无人值守部署必须保证 alternate unlock 不可用/不在场，或增加独立
+guardian 与真正的 client-side completion primitive。当前实现不把这个 post-terminal
+竞态宣称为已形式封闭。
 
-清理顺序是 **先确认锁屏 → 再放下遮罩 → 最后撤 grant**（撤 grant 实际最先做，
-因为它只会阻止新的解锁）。如果在确认锁屏之前放下遮罩，就会出现最糟糕的状态：
-桌面是活的、没有遮挡，而 agent 以为自己已经清理完毕。因此**重新锁屏失败时遮罩
-保持升起**，并记入审计。
+## 截图、AX 与输入
+
+### 截图
+
+helper 使用 ScreenCaptureKit 抓取显示器，同时排除自身 application/windows。物理屏上的
+黑色 shield 使用 `sharingType=.readOnly`：普通截图、录屏和会议应用保留黑罩，只有 helper
+自己的 ScreenCaptureKit filter 排除该 application/windows，向当前绑定的模型 turn 返回下层
+目标应用。多屏帧按 `CGDisplayBounds` 在内存合成为左上角原点的 sRGB PNG；helper 不落临时
+截图文件。
+
+模型 `click`/`scroll` 的 `(x,y)` 属于这张 composite PNG，而不是未经说明的全局桌面坐标。
+Swift 用当前活动显示器 union 的原点映射到 Core Graphics global coordinates，因此覆盖左侧
+负 X、上方负 Y 和上下排列显示器；落在 union 外或显示器间空洞的点失败关闭。旧 HTTP/debug
+调用保留显式 global-coordinate contract。该转换已有纯函数覆盖，但 Retina、旋转与真实多屏
+布局仍必须在目标 Mac 真机校准。
+
+wire response 只包含：
+
+```json
+{
+  "media_type": "image/png",
+  "image_base64": "..."
+}
+```
+
+Swift 和 Go 两侧都限制尺寸；Go 再验证 strict base64、PNG magic 和 25 MiB 上限，之后才
+构造 model `inputImage` data URL。
+
+### AX
+
+`get_app_state` 同时读取目标应用的 Accessibility tree。地址是非负 index path，最大深度
+40。bundle ID 存在时优先使用它，避免 name OR matching 选错应用。所有 AX mutation 和
+键鼠动作在 Swift controller 内原子验证当前 owner；独立 `window_state` 查询不充当权限。
+Claude exact-card matching 还使用 identifier、subrole、enabled/selected/focused 和 frame 等
+结构字段，不能只凭可本地化 label 或窗口 title 选择 composer/question/permission control。
+focus 本身也是 mutation，必须消费 fresh observation。
+
+### 物理输入隔离
+
+shield window 忽略鼠标，以便 helper 自己的事件落到下层应用。真正的隔离由 session
+CGEvent tap 完成：
+
+- helper 发布前给每个 synthetic event 写入进程随机 marker；
+- tap 只放行同时匹配 marker 且被 Core Graphics 报告为 helper PID 的事件；marker 可观察，不能单独充当权限；
+- 未标记的键盘、鼠标、滚轮和 tablet 事件被丢弃；
+- 未标记事件同时置 sticky local-input latch，controller 约每 40 ms 检查并重锁。
+
+sticky latch 解决了一个关键盲点：被成功丢弃的物理事件可能不再改变应用或普通 idle
+计数，但“现场有人”本身仍必须结束 Locked Use。tap 被 user input 禁用、重启失败、显示器
+热插拔或遮罩 coverage 失效也都沿故障关闭路径处理。
+
+这里的 PID/marker 是输入分类的纵深防御，不是 code-signing 证明。Apple 文档没有承诺
+CGEvent 字段对另一个持有 Accessibility/Event Injection 权限的同 UID 进程不可伪造；
+signed UDS peer pin 也不会自动覆盖系统事件流。因此当前目标是无人值守时屏蔽物理到场和
+普通 synthetic input，恶意同登录用户进程仍是明确的剩余威胁边界。
 
 ## 配置
 
 ```json
 "computer_use": {
-  "enabled": false,
+  "enabled": true,
+  "debug_http_actions": false,
+  "helper_socket": "~/Library/Application Support/AgentHalo/desktop.sock",
   "locked_use": {
-    "enabled": false,
+    "enabled": true,
     "grant_ttl_seconds": 10,
     "window_ttl_seconds": 300,
     "input_relock_grace_ms": 250,
     "require_display_shield": true
   }
+},
+"providers": {
+  "claude": {
+    "primary_route": "desktop_computer_use",
+    "fallback_route": "stream_json_cli",
+    "desktop_bundle_id": "com.anthropic.claudefordesktop",
+    "desktop_team_id": "Q6L2SF6YDW",
+    "desktop_app_path": "/Applications/Claude.app",
+    "ui_operation_timeout_seconds": 30,
+    "interaction_dir": "~/.claude/agenthalo-interactions",
+    "turnstate_dir": "~/.claude/agenthalo-turnstate"
+  }
 }
 ```
 
-所有数值都会被 clamp（`grant_ttl` [2,15]、`window_ttl` [15,900]、
-`input_relock_grace_ms` [100,5000]），且 `grant_ttl` 不会超过 `window_ttl`。
-`0`/缺省取默认值，越界值收紧到边界——配置只能收窄窗口，不能放宽。
+这是 `config.example.json` 的 fresh-install 契约：Computer Use、Locked Use 和 Claude
+Desktop primary route 显式开启。它不改变 fail-closed normalization：配置块缺失、任一
+enabled 为 false、helper/plug-in/TCC/codesign/capability 不满足时，运行时仍拒绝桌面动作；
+网络 API 不能把这些本地条件从 false 提升为 true。
 
-运行时开关 `POST /computer_use/locked_use {"active":bool}` 只能在配置允许的
-范围内移动：可以关，但**不能在配置没开的设备上打开**。
+`grant_ttl_seconds` clamp 到 `[2,15]`，`window_ttl_seconds` 到 `[15,900]`，
+`input_relock_grace_ms` 到 `[100,5000]`。monitor 的约 40 ms cadence 不可配置，部署不能把
+真人输入检测放宽到秒级。
 
-## API
+Locked Use 开启时 `require_display_shield=false` 也会被强制规范化为 true；shield 生命周期
+同时承载物理输入 guard，这不是可独立关闭的外观选项。
 
-| Method | Path | 用途 |
-|---|---|---|
-| GET | `/computer_use` | 能力、arm 状态、窗口状态、审计环（不含任何 secret） |
-| POST | `/computer_use/locked_use` | `{active}` 运行时开关，配置为上限 |
-| POST | `/computer_use/window` | `{turn_id, action:"open"\|"close"}` |
-| POST | `/computer_use/action` | 封闭动作集：`screen.capture`、`pointer.move/click/scroll`、`keyboard.type/key` |
+helper 直接读取设备 config，socket 没有 configure op。配置文件存在但 computer_use 块
+缺失/关闭时，helper 仍安装 disabled controller 并拒绝动作；只有显式无 config 的开发模式
+才允许无 controller 的本地诊断路径。
 
-动作集是**封闭**的：未知 id 在 API 边界被拒绝，不会传给 native helper，也不经过
-shell。所有坐标、文本长度、组合键数量、点击次数、滚动幅度都有上界。
+## 安装与验证
 
-`/computer_use/window` 的 open 会等待 macOS 真正完成解锁，上界是 grant 自身的
-秒级 TTL。失败路径上耗时最长的"确认重新锁屏"被移到后台执行（窗口占位保留到清理
-完成，因此重试不会开出第二个窗口），所以 HTTP 响应不会被 20s 的重锁重试拖过
-relay 的 30s 超时。控制器**不使用请求的 context**：客户端断开或 relay 截断都不会
-丢下一个半开的窗口。
+完整步骤见 [SETUP-locked-unlock.md](../mac/RemoteAgentDesktop/SETUP-locked-unlock.md)。顺序是：
 
-## 安装
+1. 只读 preflight；
+2. 同 Team 签名 agent/helper；
+3. helper provisioning 输出公钥；
+4. 管理员签名并安装 plug-in、公钥和 device ID，备份 authorization right；
+5. 以登录用户安装 LaunchAgent，并授予 helper Accessibility 与 Screen Recording；
+6. 保持无 grant，连续至少两次执行真实锁屏→人工密码解锁；每次都必须落到普通密码分支，
+   不得自动放行、挂起或让下一次继承授权。这个连续无 grant 真机回归是启用无人值守前的
+   硬门禁；失败时立即停止部署并按备份/卸载恢复 authorization right；
+7. 再验证一次正常人工密码解锁；
+8. 先在锁屏状态仅轮询 Claude native/status/output/observer hook，证明不会打开 window、
+   激活 Claude 或撤锁；
+9. 锁屏后从远端新 Codex turn 完成 get_app_state → mutation → terminal relock；
+10. 锁屏后从远端 Claude fresh session 分别完成 prompt input、AskUserQuestion、一次性
+    allow、deny，并在每个短时 transaction 后证明 close/relock；Claude model 运行期间
+    必须保持 locked；
+11. 注入 pre-mutation capability failure，证明仅 fresh session 固定选择 CLI fallback；
+    再注入 post-mutation timeout、已有 Desktop owner、local input 和 identity mismatch，
+    证明返回 `delivery_unknown`/安全拒绝且 CLI 调用次数为零；
+12. 验证物理输入、interrupt/error、外接扩展显示器和更新/退出路径。
 
-### 0. 先跑 preflight
+单元测试、fake helper、receipt fixture 或 authdb 静态检查都不能替代第 6、9、10、11
+步。没有真实
+Developer ID、TCC、目标 macOS loginwindow 和实际锁态时，正确状态只能写“实现/自动化已
+验证，真机 E2E 待验收”。
 
-Swift helper 与 ObjC plug-in 只能在 macOS 上编译和运行，而 grant 契约的两侧
-（helper 签发 / plug-in 验签）也只有在这里才能被拿来互相跑一遍。CI 与 Linux
-容器都做不到这些。**在装任何东西之前**，先在目标机器上跑一次：
+当前 `m4pro` 的 Claude locked prompt/question/一次性授权/no-duplicate-fallback 最终
+E2E 仍待执行和取证；安装、签名、公证、health 或 unlocked smoke 都不能替代该结论。
 
-```bash
-cd /path/to/remote-agent && bash mac/preflight.sh
-```
+## 已知边界
 
-默认**只读**：不锁屏、不升遮罩、不安装 plug-in、不改 authorization database。
-它检查工具链、Go 构建/vet/测试、helper 能否构建并通过自己的测试（护栏、词表、
-grant 契约都在那里）、三个只读探针能否回答、helper 里确实没有 unlock 操作、
-Accessibility 是否授权、plug-in 能否编译，以及三件跨语言的事：
-
-* **常量是否漂移**（`version`、`maxTTL`、`maxClockSkew`、公钥长度、grant 目录）
-  ——漂移会让 helper 签发的 grant 永远被 plug-in 拒绝，唯一症状是"就是解不开锁"。
-* **plug-in 是否只用公开 Security API**——它引用的每个 `kSec*` 常量都必须在公开
-  头文件里有声明。绑定私有符号的 mechanism 会在 authd 内部加载失败，那是锁死方向。
-* **helper 真实签出的 grant，能否被 plug-in 自己的验签函数接受**，并且换一把
-  公钥必须被拒绝（否则一个"永远放行"的验证器也能通过检查）。
-
-两个会打断桌面的检查需要显式开启：`--check-shield`（短暂遮挡屏幕）、
-`--check-lock`（锁屏）。它们是二进制的一次性命令行开关，**不是 socket 操作**：
-一个任何已连接进程都能释放的遮罩，等于可以在窗口开着时被掀掉。
-
-### 1. 安装桌面 helper
-
-桌面能力与全部 Locked Use 护栏都在常驻进程 `remote-agent-desktop` 里。它随 agent
-二进制一起分发（release 仍然只有一个产物、一个 sha256、一套签名），安装时落盘：
-
-```bash
-remote-agent desktop install                       # 写出 helper，打印路径
-mac/launchagent/install.sh --config /path/config.json   # 以登录用户身份运行
-```
-
-必须是**用户会话里的 LaunchAgent**，两条理由不可互换：遮罩是真实窗口，
-需要 Aqua 会话；而 TCC 把 Accessibility / Screen Recording 归属到*责任进程*，
-由 agent 派生的子进程会把授权记到 agent 头上，合成事件于是静默失效——看起来像
-功能坏了，而不是缺权限。
-
-装好后要在「系统设置 > 隐私与安全性」里给 **helper 二进制本身**授予
-Accessibility 与 Screen Recording。
-
-`deploy/install.sh` 会在首次安装时自动做完这两步。后续的 relay 自动更新只替换
-agent 二进制，agent 启动时会把内嵌的 helper 写出并在内容变化时 `launchctl
-kickstart -k` 重启它——否则更新会落盘但不生效：launchd 仍在跑旧进程。
-
-### 2. 构建并安装 plug-in
-
-plug-in 必须在目标 Mac 上编译和签名（它会被加载进 SecurityAgent 进程），CI 不构建它。
-
-```bash
-cd remote-agent/mac/authorization-plugin
-RA_PLUGIN_SIGN_IDENTITY="Developer ID Application: ..." ./build.sh
-sudo ./install.sh                     # 安装 bundle，注册 mechanism
-```
-
-安装后读取公钥并 provision。签名私钥由 helper 持有（`P256`，base64 PKCS#8，0600），
-公钥经 agent 的状态接口发布——它只能验签、不能签发，所以公开它不授予任何东西：
-
-```bash
-curl --unix-socket <agent.sock> http://localhost/computer_use   # locked_use.public_key
-sudo install -o root -g wheel -m 0600 <key-file> \
-  "/Library/Application Support/remote-agent/locked-use/public.key"
-```
-
-然后在 `config.json` 打开两个开关，重启 `remote-agent` 与 helper。
-
-一台已经跑过旧版本（Go 侧签发 grant）的设备**不需要重新 provision 公钥**：
-helper 能读同一份 PKCS#8 私钥并导出完全相同的公钥，这条由测试里的金标向量钉住。
-
-### 部署注意
-
-grant 目录默认就是 plug-in 编译期常量
-`/Library/Application Support/remote-agent/locked-use`。若改成别处，plug-in 将
-读不到 grant——Locked Use 会显示 armed 却永远解不开锁。
-
-桌面能力与全部 Locked Use 护栏都在常驻 helper `remote-agent-desktop` 里，
-agent 只通过 UDS 转发。helper 自己读设备的 config.json——**配置永远不经 socket
-下发**：Locked Use 让机器能自解锁，这个能力必须在设备上授予，否则任何能连上
-socket 的本地进程都能把它打开。helper 未运行时 `/computer_use` 如实报告
-`available:false` 并对操作返回 503，功能保持关闭而不是半开。
-
-完全回退：
-
-```bash
-sudo ./uninstall.sh    # 先摘 mechanism，再删 bundle 与信任状态
-```
-
-`uninstall.sh` 优先直接还原安装前备份的原始 right；备份不可用时才退回"先摘
-mechanism、再删 bundle"的顺序——顺序不能反，指向缺失 mechanism 的 right 是这个
-功能唯一可能让 Mac 变得**更难**解锁的情况。
-
-## 未验证事项(务必先读)
-
-**安装本 plug-in 单独并不会绕过密码。** mechanism 只会"不反对"，因此一次有效
-grant 能否真正缩短解锁流程，取决于该 right 的 mechanism 列表在你这个 macOS
-版本上的排布方式。这一点**无法在 CI 或非 macOS 环境验证**，必须在目标机器上确认：
-
-1. 先在**备用 Mac 或同版本虚拟机**上安装，保留第二个管理员账户或 Recovery 入口。
-2. 安装后**先确认仍能正常手动解锁**。
-3. 再确认一次 Locked Use turn 是否真的解锁。
-4. 如果没有解锁：功能**失败关闭**（不解锁），不会造成锁死；调整 right 的
-   mechanism 排布后重试。
-
-`install.sh` 因此要求显式 `RA_LOCKED_USE_ACK=1`，并在改动前把原始 right 备份到
-`$STATE_DIR/system.login.screensaver.original.plist`；`uninstall.sh` 优先直接
-还原该备份。
-
-### 已在真机验证 / 仍未验证
-
-| 项 | 状态 |
-|---|---|
-| helper 构建、只读探针、词表与护栏测试 | 已验证（`swift test`，preflight） |
-| helper 签发的 grant 被 plug-in 自己的验签函数接受、换公钥被拒 | 已验证（preflight 跨语言实测） |
-| plug-in 只引用公开 Security API | 已验证（对照 SDK 头文件） |
-| Go 写的私钥能被 helper 读取并导出相同公钥 | 已验证（金标向量） |
-| 遮罩在**单屏 / 外接镜像**下确实黑屏且无边缘漏光 | 已验证（人工目视 + 窗口服务器几何） |
-| 遮罩在**外接扩展**排布下的覆盖 | **未复验**——最初的漏遮缺陷正是在此排布下发现的 |
-| `SACLockScreenImmediate` 真能锁屏 | **已验证**（真机锁屏，helper 的 `lock` 生效） |
-| 授权链本身（plug-in 被求值 → 验签 → 消费 nonce → 放行） | **已验证**（真机 authd 日志，见下） |
-| 从锁屏状态自动解锁并接管桌面 | **未打通**——缺口在 loginwindow 内部，见下 |
-
-遮罩这一项无法用截屏自证：实测表明 `screencapture` 在这条路径上抓不到本进程的
-窗口（连普通层级的全屏窗口也抓不到），所以像素采样不能作为证据，只能靠窗口服务器
-报告的几何 + 人工目视。
-
-### 锁屏自动解锁：链路已通，缺 loginwindow 的最后一跳
-
-在真机（macOS 26.5，屏幕真实锁定）上，用 `AuthorizationCopyRights` 直接求值
-`system.login.screensaver`、同时 helper 发布一个有效 grant，authd 日志确凿地
-显示整条授权链按设计工作：
-
-```
-authd: engine … running mechanism CodexComputerUseAuthorizationPlugin:allow (1 of 1)
-authd: engine … running mechanism RemoteAgentLockedUse:invoke,privileged (1 of 1)
-authd: Succeeded authorizing right 'system.login.screensaver'
-```
-
-即 `k-of-n=1` 的“或”语义正确：同机已装的 OpenAI CUA 分支先跑、因无 pending 而
-拒绝，落到我们的分支，grant 验签通过 → 授权成功，`consumed/` 里 nonce 被烧掉。
-**grant 契约、plug-in、rule 排布三者都已在真机证实无误。**
-
-缺的一跳**不在本仓库的可达范围内**：loginwindow 撤销锁屏有两条独立路径——
-
-* **PAM 路径**（`/etc/pam.d/screensaver`，密码/生物识别），以及
-* **authorizationdb 路径**（求值 `system.login.screensaver`，我们的 mechanism 挂在这里）。
-
-`IOPMAssertionDeclareUserActivity`（`kIOPMUserActiveLocal`/`Remote` 均试过）能
-可靠地让 loginwindow **发起**解锁（日志 `startUnlock: kLWUnlockFromUserActive`），
-但它总是走 PAM 路径、报 `AvailableMechanisms=( ) · User interaction required`
-后停下，**从不进入 authorizationdb 路径**。以下用户态手段全部试过、均无法让它改走
-authorizationdb 路径：local/remote 用户活动声明、显示器休眠→唤醒、锁屏 UI 已显示
-（用户已选定）状态、`CGEventPostToPid` 直投 loginwindow、合成 HID 事件（锁屏时
-根本到不了 HID 层，实测空闲计时器不重置）。
-
-参照实现（OpenAI CUA）的 plug-in 注释自述为“**询问 SkyComputerUseClient 是否有
-pending 的 Computer Use 登录授权**”，与我们“读磁盘 grant”在语义上等价；其组件也
-未链接 login.framework、未安装任何特权守护进程。因此这最后一跳要么依赖某个尚未
-定位的 loginwindow 内部触发条件，要么需要一个特权（root）组件在 HID 层注入真实
-输入。**在补上这一跳之前，Locked Use 不能在“无人在场、纯远程唤起已锁 Mac”的场景
-下工作**；但一旦有真实用户活动使 loginwindow 走上 authorizationdb 路径，授权链已
-证实会正确放行。
-
-## 威胁模型与已知边界
-
-诚实地说明这一版**不覆盖**什么，比声称覆盖更重要：
-
-1. **签名私钥是文件（0600），不是 Secure Enclave。**
-   文件权限挡得住其他用户，挡不住**已经以该用户身份运行的进程**。能读到该文件的
-   本地恶意进程可以签发 grant。要抵御同用户攻击者，需要把私钥换成 Secure Enclave
-   中不可导出的 P-256 密钥，并把 ACL 绑定到 agent 的代码签名。
-   **这是本功能最重要的待办硬化项**，在此之前不要把 Locked Use 部署到会遭遇
-   同用户攻击者的设备上。
-
-2. **没有 root deadman 进程。** 输入监控、TTL 与重新锁屏都在 agent 进程内。
-   `kill -9` 或 `SIGSTOP` 会同时冻结它们：grant 过期能阻止**新的**解锁，但不会把
-   **已经解锁**的屏幕重新锁上。健壮的做法是由 root 监督的独立进程在 agent 心跳
-   失效时强制锁屏。当前实现依赖 supervisor 尽快重启 agent，而 agent 启动时的
-   清扫会强制锁屏。
-
-3. **grant 目录是 root-owned，但 agent 需要写入。** 安装脚本把目录设为 root 拥有；
-   更强的做法是 agent 通过 XPC/UDS 把 grant 交给 root helper（以 peer audit-token
-   与代码签名鉴权），由 helper 落盘，从而让 plug-in 完全不读取用户可写路径。
-   plug-in 侧已经做了 `O_NOFOLLOW` + `fstat` + uid/类型/大小校验作为纵深防御。
-
-4. **审计环在内存中，并会出现在 `/computer_use` 响应里。** 它只记录事件、时间、
-   turn id、nonce 前 8 字符与原因，不含 grant 正文或密钥材料。注意
-   `remote-agent.log` 会被上传到 relay——任何新增日志都必须遵守同样的约束。
-
-5. **遮罩是 helper 进程自己持有的窗口。** 显示器热插拔会让覆盖检查失败并触发
-   重新锁屏（安全方向）。`Engaged()` 每次实时探测，不使用缓存标志——否则"遮罩掉了"
-   这条 safeguard 会是死代码。
-
-   升起时的确认向**窗口服务器**求证（几何：位置、尺寸、层级），而不是信任
-   `NSWindow.isVisible`——后者只是本进程的一面之词，对"已 orderFront 但从未合成
-   上屏"的窗口同样返回 true。检查只读几何、绝不读像素：一个需要截屏来自证"我遮住了
-   屏幕"的遮罩，读的正是它要藏起来的内容。
-
-   屏幕数量以 `NSScreen` 为准，不用 `CGGetActiveDisplayList`——后者在镜像时报 1、
-   **在屏幕睡眠时报 0**，用它做门槛会让"没人在、屏幕已睡"这个唯一使用场景永远开不了窗口。
-   覆盖按去重后的矩形匹配：镜像的两块屏共享矩形、内容相同，一个窗口即可；扩展排布下
-   的两块屏必须各有一个。
-
-6. **本地输入判定排除了 agent 自己的合成事件。** `hidSystemState` 的 idle 计数
-   包含本进程 post 的事件，直接使用会让 agent 一打字就把自己锁掉，而且无法区分
-   真人与 agent。helper 因此记录自己最后一次 post 的时间戳，只有无法归因于 agent
-   的输入才算"有人在场"。这个归因基于时间戳而非事件来源标记，存在 ~0.35s 的判定
-   窗口。
-
-7. **锁屏使用 `SACLockScreenImmediate`（login.framework 私有符号）**，而不是
-   `pmset displaysleepnow`——后者只让显示器睡眠，是否真正锁屏取决于用户的
-   "睡眠后要求密码"设置及其宽限期。私有符号在未来 macOS 版本上可能变化；调用失败
-   会表现为"重新锁屏无法确认"，从而保持遮罩并告警（安全方向）。
-
-## 必须保持的不变量
-
-1. 任何代码路径都不得读取、请求或记录用户密码。
-2. plug-in 没有有效 grant 时必须返回 `undefined`，永远不返回 deny。
-3. grant 只在解锁前一刻签发，解锁结束立刻撤下；不得在窗口期间常驻磁盘。
-4. nonce 消费必须是 `O_EXCL` 原子操作，且发生在返回 Allow **之前**。
-5. verifier 自行决定新鲜度上限，不接受 grant 自述的更长寿命。
-6. safeguard 读不出结果 = 失败 = 关窗重新锁屏，不允许"记录后继续"。
-7. 重新锁屏必须读回确认；确认不了就保持遮罩，不得放下。
-8. 配置是能力上限；网络请求只能在其之下收窄，不能开启。
-9. native helper 不得提供任何 unlock 操作——解锁只属于 macOS 与 plug-in。
+1. **没有独立 root deadman。** helper 被 SIGKILL 或 WindowServer/系统故障时，进程内
+   shield 和 monitor 会一起消失；launchd 重启后的 startup scrub 会重锁，但无法证明中间
+   零暴露。更高威胁环境需要独立 privileged guardian + heartbeat。
+2. **Codex resume 仍不是 dynamic-tool route。** Codex `thread/resume` 不能安全补发
+   thread-only tools；Claude 则使用独立、server-bound、短时 provider transaction，
+   不是把 Desktop session 冒充 Codex turn。Claude 真机 E2E 仍是启用前门禁。
+3. **系统版本敏感。** authorizationdb rule、loginwindow AX identifiers 和 ScreenCaptureKit
+   行为必须在每个目标 macOS 版本实测。
+4. **管理员安装是显式授权。** 自动更新可以刷新已安装 helper，但不能静默安装 plug-in 或
+   改 authorizationdb。
+5. **code signature 不是实例身份。** 当前 UDS pin 能拒绝任意同 UID app，却不能区分受管
+   agent 与同一用户另起的、字节完全相同的已签名 agent/helper。敌对同登录用户可利用这个
+   living-off-the-land 路径自建 provider/配置并获得桌面能力。要把 hostile same-UID 纳入保证，
+   需要 root-owned launchd broker/Mach service 把 capability 绑定到唯一受管 audit token/PID；
+   仅增加 path、Team、identifier 或 creator-ACL-bound Keychain secret 都不能区分满足同一
+   designated requirement 的副本。
+6. **同一 Aqua session 的 TCC 权限是剩余威胁。** 另一个已有 Screen Recording 的恶意进程
+   可显式排除 shield，已有 Accessibility/Event Injection 的进程可直接读写 UI 或伪造事件。
+   普通录屏应看到黑罩，但对恶意 filter 的隔离需要独立 agent account/GUI session 或特权
+   broker 管控；signed UDS 不会扩展到系统级 TCC API。
+7. **本地同 Team 供应链属于信任根。** 能签出不同的同 Team、同 identifier 恶意产物等价于
+   发布密钥失陷；这不是运行时协议能修复的边界。
 
 ## 代码导航
 
 | 主题 | 文件 |
 |---|---|
-| grant 签发/校验/单次消费 | `internal/computeruse/grant.go` |
-| 窗口状态机、safeguard、审计 | `internal/computeruse/locked.go` |
-| 封闭动作集与校验 | `internal/computeruse/action.go` |
-| agent 侧转发客户端 | `internal/computeruse/client.go` |
-| 桌面 helper（护栏与 grant 的实现处） | `mac/RemoteAgentDesktop/Sources/` |
-| API 路由与截屏闸门 | `internal/api/computeruse.go` |
-| Authorization Plug-in（执行副本） | `mac/authorization-plugin/RemoteAgentLockedUse.m` |
-| 构建/安装/卸载 | `mac/authorization-plugin/*.sh` |
-| CoreGraphics 与遮罩 | `mac/RemoteAgentDesktop/Sources/RemoteAgentDesktopCore/Desktop.swift` |
+| Codex dynamic tools 与 turn binding | `internal/provider/codex_computeruse.go` |
+| Claude sticky route 与 Desktop transaction | `internal/provider/claude.go`、`internal/provider/claude_computeruse.go` |
+| provider→desktop short transaction | `internal/api/computeruse_automation.go` |
+| in-process action broker | `internal/api/computeruse_tool.go` |
+| HTTP lease/gate 与 provider lifecycle | `internal/api/computeruse.go` |
+| Go helper UDS client | `internal/computeruse/client.go` |
+| Swift 状态机 | `mac/RemoteAgentDesktop/Sources/AgentHaloDesktopCore/LockedUseController.swift` |
+| 截图、键鼠与 lock state | `mac/RemoteAgentDesktop/Sources/AgentHaloDesktopCore/Desktop.swift` |
+| exact AX read/focus/mutation | `mac/RemoteAgentDesktop/Sources/AgentHaloDesktopCore/Accessibility.swift` |
+| shield 与 physical input guard | `DisplayShield.swift`、`InputGuard.swift` |
+| loginwindow authorization interaction | `LockScreenAuthorizationInteractor.swift` |
+| grant、receipt 与 Keychain key | `Grant.swift`、`GrantSigningKeyStore.swift` |
+| signed peer UDS | `SocketServer.swift`、`PeerCodeSigning.swift` |
+| Authorization Plug-in | `mac/authorization-plugin/AgentHaloLockedUse.m` |
+| 安装、发布与 preflight | `mac/authorization-plugin/*.sh`、`mac/launchagent/install.sh`、`deploy/publish-release.sh`、`mac/preflight.sh` |

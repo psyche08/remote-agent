@@ -59,6 +59,10 @@ const (
 	// quickTimeout bounds the status and gate calls that sit on request paths
 	// which must stay responsive.
 	quickTimeout = 5 * time.Second
+	// restartTimeout covers cancellation of an opening authorization boundary
+	// plus verified relock. It is a startup-only safety barrier, not an HTTP
+	// request path.
+	restartTimeout = 55 * time.Second
 )
 
 // NewController returns a handle on the helper at socketPath.
@@ -69,11 +73,21 @@ func NewController(socketPath string, enabled, lockedUseEnabled bool) *Controlle
 }
 
 // Start and Stop exist for symmetry with the server's lifecycle. The helper is
-// a separate long-lived process with its own startup scrub and its own
-// shutdown relock, so neither owns the feature's lifetime.
+// a separate long-lived process, but Stop still asks it to unwind any open
+// window before this controller disconnects.
 func (c *Controller) Start() {}
 
 func (c *Controller) Stop() {
+	// The helper outlives the Go process. If this controller opened a window,
+	// merely closing the transport would leave the helper to wait for its TTL
+	// before relocking. Reconcile the current owner and ask the helper to close
+	// synchronously first. This is best-effort because shutdown must still be
+	// able to finish when the helper has already gone away.
+	if c.lockedUseEnabled {
+		if state, err := c.WindowState(); err == nil && state.Registered && state.TurnID != "" {
+			_, _ = c.CloseWindowForTurn(state.TurnID, "AgentHalo shutdown")
+		}
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.closeLocked()
@@ -109,7 +123,11 @@ func (e *Error) Is(target error) bool {
 	case ErrLocalInput:
 		return e.Code == "local_input"
 	case ErrNoWindow:
-		return e.Code == "no_window" || e.Code == "window_busy"
+		return e.Code == "no_window"
+	case ErrWindowBusy:
+		return e.Code == "window_busy"
+	case ErrTurnNotActive:
+		return e.Code == "turn_not_active"
 	case ErrUnsupported:
 		return e.Code == "unsupported"
 	case ErrBadRequest:
@@ -132,8 +150,13 @@ var (
 	// ErrLocalInput means a person is using the machine.
 	ErrLocalInput = errors.New("local input detected at the device")
 	// ErrNoWindow means an action needed an open unlock window and none exists,
-	// or another turn owns it.
+	// for the requested turn.
 	ErrNoWindow = errors.New("no open locked-use window for this turn")
+	// ErrWindowBusy means a different turn owns the open (or closing) window.
+	ErrWindowBusy = errors.New("another turn owns the locked-use window")
+	// ErrTurnNotActive means the requested turn was not established by a live
+	// provider stream, or has already reached a terminal state.
+	ErrTurnNotActive = errors.New("the provider turn is not active")
 	// ErrUnsupported means the device cannot provide the capability at all.
 	ErrUnsupported = errors.New("computer use is not supported on this platform")
 	// ErrBadRequest means the helper refused the request as malformed.
@@ -144,19 +167,105 @@ var (
 	ErrHelperUnavailable = errors.New("the computer-use helper is not running")
 )
 
-// ActionRequest is the raw wire shape accepted by the API and forwarded
-// verbatim. Validation happens in the helper, which is the only process that
-// can act on it.
+// ActionRequest is the wire shape accepted by the API. Provider/session fields
+// establish the server-side lease and are never forwarded; the server replaces
+// TurnID with its scoped trusted owner before this controller sees the request.
+// Action vocabulary validation happens in the helper, which is the only
+// process that can act on it.
 type ActionRequest struct {
-	Action string   `json:"action"`
-	X      *int     `json:"x,omitempty"`
-	Y      *int     `json:"y,omitempty"`
-	Button string   `json:"button,omitempty"`
-	Count  int      `json:"count,omitempty"`
-	Text   string   `json:"text,omitempty"`
-	Keys   []string `json:"keys,omitempty"`
-	DeltaX int      `json:"delta_x,omitempty"`
-	DeltaY int      `json:"delta_y,omitempty"`
+	ProviderID      string   `json:"provider_id"`
+	SessionID       string   `json:"session_id"`
+	TurnID          string   `json:"turn_id"`
+	Action          string   `json:"action"`
+	CoordinateSpace string   `json:"coordinate_space,omitempty"`
+	X               *int     `json:"x,omitempty"`
+	Y               *int     `json:"y,omitempty"`
+	Button          string   `json:"button,omitempty"`
+	Count           int      `json:"count,omitempty"`
+	Text            string   `json:"text,omitempty"`
+	Keys            []string `json:"keys,omitempty"`
+	DeltaX          int      `json:"delta_x,omitempty"`
+	DeltaY          int      `json:"delta_y,omitempty"`
+}
+
+// WindowState is the helper's authoritative view of the per-turn unlock
+// window. Closing is separate from Open because the helper keeps a reservation
+// until it has verified the relock; callers must not mistake that interval for
+// a free desktop.
+type WindowState struct {
+	Registered bool
+	Phase      string
+	Open       bool
+	TurnID     string
+	Closing    bool
+}
+
+const (
+	WindowPhaseClosed  = "closed"
+	WindowPhaseOpening = "opening"
+	WindowPhaseOpen    = "open"
+	WindowPhaseClosing = "closing"
+)
+
+func windowStateFrom(res map[string]any) (WindowState, error) {
+	open, openOK := res["window_open"].(bool)
+	turn, turnOK := res["window_turn_id"].(string)
+	closing, closingOK := res["window_closing"].(bool)
+	if !openOK || !turnOK || !closingOK {
+		return WindowState{}, errors.New("the computer-use helper returned an incomplete window state")
+	}
+
+	phase, phasePresent := res["window_phase"].(string)
+	if _, exists := res["window_phase"]; exists && !phasePresent {
+		return WindowState{}, errors.New("the computer-use helper returned an invalid window phase")
+	}
+	if !phasePresent {
+		// Compatibility with helpers predating window_phase. Treat a retained
+		// owner with neither legacy boolean set as opening, which is the only
+		// safe interpretation for admission and shutdown.
+		switch {
+		case open:
+			phase = WindowPhaseOpen
+		case closing:
+			phase = WindowPhaseClosing
+		case turn != "":
+			phase = WindowPhaseOpening
+		default:
+			phase = WindowPhaseClosed
+		}
+	}
+	registered := phase != WindowPhaseClosed
+	if raw, exists := res["window_registered"]; exists {
+		value, ok := raw.(bool)
+		if !ok || value != registered {
+			return WindowState{}, errors.New("the computer-use helper returned an inconsistent window registration")
+		}
+	}
+	switch phase {
+	case WindowPhaseClosed:
+		if open || closing || (phasePresent && turn != "") {
+			return WindowState{}, errors.New("the computer-use helper returned an inconsistent closed window")
+		}
+	case WindowPhaseOpening:
+		if open || closing || turn == "" {
+			return WindowState{}, errors.New("the computer-use helper returned an inconsistent opening window")
+		}
+	case WindowPhaseOpen:
+		if !open || closing || turn == "" {
+			return WindowState{}, errors.New("the computer-use helper returned an inconsistent open window")
+		}
+	case WindowPhaseClosing:
+		// A legacy response could not retain the closing owner. New phase-aware
+		// helpers must, so Stop can wait for that exact window's cleanup.
+		if open || !closing || (phasePresent && turn == "") {
+			return WindowState{}, errors.New("the computer-use helper returned an inconsistent closing window")
+		}
+	default:
+		return WindowState{}, errors.New("the computer-use helper returned an unknown window phase")
+	}
+	return WindowState{
+		Registered: registered, Phase: phase, Open: open, TurnID: turn, Closing: closing,
+	}, nil
 }
 
 // call sends one request and reads one reply, reconnecting once when the
@@ -270,34 +379,129 @@ func (c *Controller) SetLockedUseActive(active bool) error {
 	return err
 }
 
-// OpenWindow opens a per-turn unlock window.
-func (c *Controller) OpenWindow(turnID string) error {
-	_, err := c.call(callTimeout, map[string]any{
+// PrepareForRestart asks the helper to atomically stop admitting work, wait for
+// every opening/windowed/unwindowed operation, withdraw grants, and confirm a
+// locked baseline. A separate status -> close -> status sequence is not safe:
+// another signed agent could begin opening after the final query and before
+// launchd kills the process. Helpers predating prepare_restart fail closed and
+// require a deliberate/manual upgrade.
+func (c *Controller) PrepareForRestart() error {
+	defer func() {
+		c.mu.Lock()
+		c.closeLocked()
+		c.mu.Unlock()
+	}()
+	res, err := c.call(restartTimeout, map[string]any{"op": "prepare_restart"})
+	if err != nil {
+		return fmt.Errorf("desktop helper restart preflight failed: %w", err)
+	}
+	safe, ok := res["safe_to_restart"].(bool)
+	if !ok || !safe {
+		return errors.New("desktop helper did not confirm safe_to_restart")
+	}
+	return nil
+}
+
+// OpenWindow opens a per-turn unlock window and returns the state from that
+// same operation. A second status query could fail after the unlock succeeded
+// and falsely report the window as closed.
+func (c *Controller) OpenWindow(turnID string) (WindowState, error) {
+	res, err := c.call(callTimeout, map[string]any{
 		"op": "window_open", "turn_id": turnID,
 	})
-	return err
+	if err != nil {
+		return WindowState{}, c.reconcileUnconfirmedOpen(turnID, err)
+	}
+	state, err := windowStateFrom(res)
+	if err != nil {
+		return state, c.reconcileUnconfirmedOpen(turnID, err)
+	}
+	if !state.Registered || state.Phase != WindowPhaseOpen ||
+		!state.Open || state.TurnID != turnID || state.Closing {
+		err := errors.New("the computer-use helper did not confirm the requested window owner")
+		return state, c.reconcileUnconfirmedOpen(turnID, err)
+	}
+	return state, nil
+}
+
+// reconcileUnconfirmedOpen removes authority when an open request may have
+// taken effect but its response did not prove the resulting owner. The close
+// is scoped to the same turn, so it cannot relock a newer/different owner's
+// window. A well-formed helper refusal is authoritative and an initial dial
+// failure delivered no request, so neither creates cleanup work.
+func (c *Controller) reconcileUnconfirmedOpen(turnID string, openErr error) error {
+	var refusal *Error
+	if errors.As(openErr, &refusal) || errors.Is(openErr, ErrHelperUnavailable) {
+		return openErr
+	}
+	_, closeErr := c.CloseWindowForTurn(turnID, "window open was not confirmed")
+	if closeErr == nil || errors.Is(closeErr, ErrNoWindow) || errors.Is(closeErr, ErrWindowBusy) {
+		return openErr
+	}
+	// Keep the open failure as the error identity. A cleanup refusal is useful
+	// diagnostic context, but must not turn an uncertain-open protocol failure
+	// into (for example) a harmless-looking not_enabled API response.
+	return fmt.Errorf(
+		"%w; the computer-use helper could not confirm cleanup after window open: %v",
+		openErr, closeErr,
+	)
 }
 
 // CloseWindowForTurn ends the window only if the named turn owns it, so a
 // finishing turn cannot relock a window another turn legitimately opened.
-func (c *Controller) CloseWindowForTurn(turnID string, reason string) {
-	_, _ = c.call(callTimeout, map[string]any{
+func (c *Controller) CloseWindowForTurn(turnID string, reason string) (WindowState, error) {
+	res, err := c.call(callTimeout, map[string]any{
 		"op": "window_close", "turn_id": turnID, "reason": reason,
 	})
+	if err != nil {
+		return WindowState{}, err
+	}
+	state, err := windowStateFrom(res)
+	if err != nil {
+		return WindowState{}, err
+	}
+	if state.Registered && state.TurnID != turnID {
+		return state, &Error{
+			Code: "window_busy", Detail: "another turn owns the locked-use window",
+		}
+	}
+	if state.Registered || state.Phase != WindowPhaseClosed ||
+		state.Open || state.Closing || state.TurnID != "" {
+		return state, errors.New("the computer-use helper did not confirm the relock")
+	}
+	return state, nil
 }
 
-// WindowOpen reports whether a window is currently open, and for which turn.
-func (c *Controller) WindowOpen() (string, bool) {
+// WindowState reports the authoritative window state. Transport and protocol
+// errors are preserved; an unknown state must never be collapsed into closed.
+func (c *Controller) WindowState() (WindowState, error) {
 	res, err := c.call(quickTimeout, map[string]any{"op": "window_state"})
 	if err != nil {
-		return "", false
+		return WindowState{}, err
 	}
-	open, _ := res["window_open"].(bool)
-	turn, _ := res["window_turn_id"].(string)
-	return turn, open
+	return windowStateFrom(res)
 }
 
-// CaptureAllowed reports whether a screen capture may proceed right now.
+// CheckTurnOwner prevents one remote turn from riding another turn's open
+// unlock window. With no window open, ordinary unlocked computer use and the
+// lock-preserving AX channel remain available; the helper still validates the
+// action itself.
+func (c *Controller) CheckTurnOwner(turnID string) error {
+	state, err := c.WindowState()
+	if err != nil {
+		return err
+	}
+	if state.Registered && (state.Phase != WindowPhaseOpen || state.TurnID != turnID) {
+		return &Error{
+			Code: "window_busy", Detail: "another turn owns the locked-use window",
+		}
+	}
+	return nil
+}
+
+// CaptureAllowed reports the helper's legacy-capture gate. The API permanently
+// disables its on-disk screenshot/OCR routes whenever Locked Use is configured;
+// this remains a defense-in-depth query for other callers and older flows.
 //
 // When Locked Use is configured on and the helper cannot answer, this refuses.
 // The helper owns the shield as windows in its own process, so a helper that
@@ -327,7 +531,12 @@ func (c *Controller) CaptureAllowed() (bool, string) {
 
 // RunAction forwards a validated-by-the-helper action and returns its result.
 func (c *Controller) RunAction(req ActionRequest) (map[string]any, error) {
-	payload := map[string]any{"op": "action", "action": req.Action}
+	payload := map[string]any{
+		"op": "action", "turn_id": req.TurnID, "action": req.Action,
+	}
+	if req.CoordinateSpace != "" {
+		payload["coordinate_space"] = req.CoordinateSpace
+	}
 	if req.X != nil {
 		payload["x"] = *req.X
 	}
@@ -360,23 +569,46 @@ func (c *Controller) RunAction(req ActionRequest) (map[string]any, error) {
 	return res, nil
 }
 
-// AXRequest is the wire shape for an Accessibility operation. Unlike the
-// pointer/keyboard actions, these reach an app's element tree in-process, so
-// they work while the screen is locked — this is the channel that operates a
-// locked machine without unlocking it. Validation lives in the helper, which is
-// the only process that can act on it.
+// AXRequest is the wire shape for an Accessibility operation. In Locked Use it
+// runs only after the helper's temporary unlock has completed behind the
+// display shield and input guard. Validation lives in the helper, which is the
+// only process that can act on it.
 type AXRequest struct {
-	Op       string `json:"op"`
-	App      string `json:"app"`
-	BundleID string `json:"bundle_id"`
-	Path     []int  `json:"path"`
-	Value    string `json:"value"`
+	ProviderID string  `json:"provider_id"`
+	SessionID  string  `json:"session_id"`
+	TurnID     string  `json:"turn_id"`
+	Op         string  `json:"op"`
+	App        string  `json:"app"`
+	BundleID   string  `json:"bundle_id"`
+	Path       []int   `json:"path"`
+	Value      *string `json:"value"`
+}
+
+// MaxAXPathDepth mirrors the helper's bounded Accessibility traversal. Keeping
+// invalid paths away from the Swift array subscript is also important because a
+// negative index would otherwise trap the resident helper process.
+const MaxAXPathDepth = 40
+
+func validateAXPath(path []int) error {
+	if len(path) > MaxAXPathDepth {
+		return &Error{Code: "bad_request", Detail: "accessibility path is too deep"}
+	}
+	for _, index := range path {
+		if index < 0 {
+			return &Error{Code: "bad_request", Detail: "accessibility path contains a negative index"}
+		}
+	}
+	return nil
 }
 
 // RunAX forwards an Accessibility operation. op is one of ax_read, ax_press,
-// ax_setvalue; the helper refuses anything else.
+// ax_setvalue, or the provider-internal ax_focus; the helper refuses anything
+// else. ax_focus is intentionally not advertised as a model-facing tool.
 func (c *Controller) RunAX(req AXRequest) (map[string]any, error) {
-	payload := map[string]any{"op": req.Op}
+	if err := validateAXPath(req.Path); err != nil {
+		return nil, err
+	}
+	payload := map[string]any{"op": req.Op, "turn_id": req.TurnID}
 	if req.App != "" {
 		payload["app"] = req.App
 	}
@@ -386,8 +618,8 @@ func (c *Controller) RunAX(req AXRequest) (map[string]any, error) {
 	if req.Path != nil {
 		payload["path"] = req.Path
 	}
-	if req.Value != "" {
-		payload["value"] = req.Value
+	if req.Value != nil {
+		payload["value"] = *req.Value
 	}
 	res, err := c.call(callTimeout, payload)
 	if err != nil {

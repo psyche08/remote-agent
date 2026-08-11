@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/psyche08/remote-agent/internal/config"
+	"github.com/psyche08/remote-agent/internal/turnstatehook"
 )
 
 type claudeRuntimeSession struct {
@@ -87,7 +88,7 @@ func NewClaude(id string, cfg config.ProviderConfig) *Claude {
 		cwd:                   expandUser(firstNonEmpty(cfg.Cwd, "~/Developer")),
 		permissionMode:        stringExtra(cfg.Extra, "permission_mode", "auto"),
 		preferDesktop:         boolExtra(cfg.Extra, "prefer_desktop_claude", false),
-		turnstateDir:          stringExtra(cfg.Extra, "turnstate_dir", "~/.claude/remote-agent-turnstate"),
+		turnstateDir:          stringExtra(cfg.Extra, "turnstate_dir", "~/.claude/agenthalo-turnstate"),
 		resumeWait:            durationExtra(cfg.Extra, "resume_wait_request_cap", 8*time.Second),
 		staleAfter:            durationExtra(cfg.Extra, "turnstate_stale_after", 90*time.Second),
 		killGrace:             durationExtra(cfg.Extra, "kill_grace", 3*time.Second),
@@ -108,19 +109,31 @@ func NewClaude(id string, cfg config.ProviderConfig) *Claude {
 }
 
 func NewClaudeCLI(id string, cfg config.ProviderConfig) *Claude {
+	// Tests, embedding callers, and the explicit legacy constructor ask for the
+	// stream-json backend by name. Production registry construction uses
+	// NewClaude so its configured/default Desktop-first route remains intact.
+	extra := make(map[string]any, len(cfg.Extra)+2)
+	for key, value := range cfg.Extra {
+		extra[key] = value
+	}
+	extra["primary_route"] = claudeRouteStreamJSONCLI
+	extra["fallback_route"] = claudeRouteStreamJSONCLI
+	cfg.Extra = extra
 	return NewClaude(id, cfg)
 }
 
 func (c *Claude) ID() string { return c.id }
 
-// Installed reports whether a runnable, authenticated Claude CLI exists on
-// this device. Claude Desktop and Claude CLI keep independent login state, so
-// the Desktop app being signed in is not sufficient for this CLI provider.
-// The registered provider prefers PATH; an explicitly configured absolute
-// path or extra.prefer_desktop_claude=true may opt into another binary.
+// Installed reports the union of the Desktop Computer Use primary and the
+// authenticated stream-json CLI fallback. Status exposes each readiness bit
+// separately; one backend being unavailable must not hide the other.
 func (c *Claude) Installed() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	desktopReady := c.claudeDesktopReady(ctx)
+	cancel()
 	cli := c.resolveCommand()
-	return cli != "" && c.cliAuthenticated(cli)
+	cliReady := cli != "" && c.cliAuthenticated(cli)
+	return desktopReady || cliReady
 }
 
 func (c *Claude) SetStreamPublisher(publish func(target string, frame map[string]any)) {
@@ -136,11 +149,19 @@ func (c *Claude) StopCLIStream() {
 }
 
 func (c *Claude) Status() Status {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	desktopReady := c.claudeDesktopReady(ctx)
+	cancel()
 	cli := c.resolveCommand()
-	ready := cli != "" && c.cliAuthenticated(cli)
+	cliReady := cli != "" && c.cliAuthenticated(cli)
+	ready := desktopReady || cliReady
 	err := (*string)(nil)
 	if c.lastError != "" {
 		err = &c.lastError
+	}
+	backend := "claude_desktop_computer_use"
+	if !desktopReady {
+		backend = "claude_stream_json_cli_fallback"
 	}
 	return Status{
 		ProviderID:  c.id,
@@ -152,13 +173,19 @@ func (c *Claude) Status() Status {
 		LastError:   err,
 		Capabilities: map[string]bool{
 			"native_sessions": true, "native_task_status": true, "clipboard_output": true,
-			"screenshot": true, "ocr": false, "approval": true, "interrupt": true, "steer": false,
-			"streaming": true, "desktop_wrapper": false, "tmux": false,
+			"screenshot": true, "ocr": false, "approval": true,
+			"interrupt": c.claudePrimaryRoute() == claudeRouteStreamJSONCLI, "steer": false,
+			"streaming": true, "desktop_wrapper": desktopReady, "computer_use": desktopReady,
+			"locked_use": desktopReady, "cli_fallback": cliReady, "tmux": false,
 			"stream_json": true, "create_session": true,
 		},
-		Backend: "claude_stream_json_go",
+		Backend: backend,
 		Command: c.command,
 		Cwd:     c.cwd,
+		Account: map[string]any{
+			"primary_route": c.claudePrimaryRoute(), "desktop_ready": desktopReady,
+			"fallback_route": c.claudeFallbackRoute(), "cli_fallback_ready": cliReady,
+		},
 	}
 }
 
@@ -361,6 +388,21 @@ func (c *Claude) PendingApprovalSessionIDs() []string {
 		}
 	}
 	c.streamMu.RUnlock()
+	runtime := claudeComputerUseRuntimeFor(c)
+	runtime.mu.Lock()
+	desktopSessions := make([]string, 0, len(runtime.routes))
+	for sessionID, binding := range runtime.routes {
+		if binding.route == claudeRouteDesktopComputerUse {
+			desktopSessions = append(desktopSessions, sessionID)
+		}
+	}
+	runtime.mu.Unlock()
+	for _, sessionID := range desktopSessions {
+		_, err := c.claudeDesktopInteraction(sessionID, "", "")
+		if err == nil || errors.Is(err, errClaudeInteractionAttempted) {
+			seen[sessionID] = true
+		}
+	}
 	ids := make([]string, 0, len(seen))
 	for id := range seen {
 		ids = append(ids, id)
@@ -390,6 +432,24 @@ func mergeClaudeNativeRuntime(row map[string]any, native map[string]any) {
 }
 
 func (c *Claude) OpenOrCreateSession(sessionID string, opts StartOptions) (string, error) {
+	c.rememberClaudeStartOptions(sessionID, opts)
+	if c.claudeComputerUseRoute(sessionID) == "" {
+		if c.claudePrimaryRoute() == claudeRouteDesktopComputerUse {
+			// A new Desktop-first session has no native identity until its first UI
+			// prompt is durably observed in Claude's transcript. Keep this route
+			// tentative so a capability failure before any UI mutation may atomically
+			// choose the CLI fallback.
+			c.tentativelyBindClaudeComputerUseRoute(sessionID)
+			c.lastSessionID = sessionID
+			c.lastState = "idle"
+			c.lastChange = time.Now()
+			return "", nil
+		}
+		c.bindClaudeComputerUseRoute(sessionID, claudeRouteStreamJSONCLI)
+	}
+	if c.claudeComputerUseRoute(sessionID) == claudeRouteDesktopComputerUse {
+		return c.transcriptIDForDesktopRoute(sessionID), nil
+	}
 	if !c.ensureReady() {
 		return "", nil
 	}
@@ -421,6 +481,36 @@ func (c *Claude) OpenOrCreateSession(sessionID string, opts StartOptions) (strin
 }
 
 func (c *Claude) OpenResumeSession(sessionID string, resumeID string, cwd string, fork bool) (string, error) {
+	c.rememberClaudeStartOptions(sessionID, StartOptions{Cwd: cwd})
+	if c.claudeComputerUseRoute(sessionID) == "" && c.claudePrimaryRoute() == claudeRouteDesktopComputerUse {
+		if fork {
+			return "", CodexAppServerError{"Claude Desktop Computer Use cannot fork a native session"}
+		}
+		if !claudeUUIDRE.MatchString(resumeID) {
+			return "", CodexAppServerError{"Claude Desktop resume requires an exact transcript UUID"}
+		}
+		found := false
+		for _, row := range claudeDesktopSessions(stringExtra(c.cfg.Extra, "claude_code_sessions_dir", ""), 0) {
+			if stringAny(row["cli_session_id"]) == resumeID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return "", CodexAppServerError{"Claude transcript is not bound to an exact Desktop session"}
+		}
+		c.BindTranscript(sessionID, resumeID)
+		c.bindClaudeComputerUseRoute(sessionID, claudeRouteDesktopComputerUse)
+		c.sessions[sessionID] = resumeID
+		c.lastSessionID = sessionID
+		c.lastState = "idle"
+		c.lastChange = time.Now()
+		return resumeID, nil
+	}
+	if c.claudeComputerUseRoute(sessionID) == claudeRouteDesktopComputerUse {
+		return resumeID, nil
+	}
+	c.bindClaudeComputerUseRoute(sessionID, claudeRouteStreamJSONCLI)
 	if !c.ensureReady() {
 		return "", CodexAppServerError{firstNonEmpty(c.lastError, "Claude CLI unavailable")}
 	}
@@ -509,8 +599,49 @@ func (c *Claude) prepareCLIResume(resumeID string, fork bool) (bool, error) {
 }
 
 func (c *Claude) CloseSession(sessionID string) map[string]any {
+	transcriptID := c.transcriptID(sessionID)
 	existed := c.cliStream != nil && c.cliStream.CloseSession(sessionID)
+
+	runtime := claudeComputerUseRuntimeFor(c)
+	runtime.mu.Lock()
+	delete(runtime.routes, sessionID)
+	delete(runtime.active, sessionID)
+	delete(runtime.startOptions, sessionID)
+	runtime.mu.Unlock()
+
+	c.mappingMu.Lock()
+	delete(c.cliIDs, sessionID)
+	sharedTranscript := false
+	for logicalID, candidate := range c.cliIDs {
+		if logicalID != sessionID && candidate != "" && candidate == transcriptID {
+			sharedTranscript = true
+			break
+		}
+	}
+	c.mappingMu.Unlock()
+
 	delete(c.sessions, sessionID)
+	c.streamMu.Lock()
+	for targetID, targets := range c.streamTargets {
+		delete(targets, sessionID)
+		if targetID == sessionID || len(targets) == 0 {
+			delete(c.streamTargets, targetID)
+		}
+	}
+	clearIDs := []string{sessionID}
+	if transcriptID != "" && transcriptID != sessionID && !sharedTranscript &&
+		len(c.streamTargets[transcriptID]) == 0 {
+		clearIDs = append(clearIDs, transcriptID)
+	}
+	for _, clearID := range clearIDs {
+		delete(c.streamTextDelta, clearID)
+		delete(c.streamTools, clearID)
+		delete(c.streamControls, clearID)
+		delete(c.streamControlOrder, clearID)
+		delete(c.recoveredQuestions, clearID)
+		delete(c.recoveredQuestionSeen, clearID)
+	}
+	c.streamMu.Unlock()
 	if c.lastSessionID == sessionID {
 		c.lastSessionID = ""
 	}
@@ -518,24 +649,146 @@ func (c *Claude) CloseSession(sessionID string) map[string]any {
 }
 
 func (c *Claude) SendPrompt(sessionID string, prompt string) SendResult {
-	return c.SendPromptWithAttachments(sessionID, prompt, nil)
+	return c.sendPromptWithAttachmentsOperation(sessionID, prompt, nil, "")
 }
 
 func (c *Claude) SendPromptWithAttachments(sessionID string, prompt string, attachments []Attachment) SendResult {
+	return c.sendPromptWithAttachmentsOperation(sessionID, prompt, attachments, "")
+}
+
+func (c *Claude) SendPromptOperation(sessionID string, prompt string, operationID string) SendResult {
+	return c.sendPromptWithAttachmentsOperation(sessionID, prompt, nil, operationID)
+}
+
+func (c *Claude) SendPromptOperationWithAttachments(
+	sessionID string, prompt string, attachments []Attachment, operationID string,
+) SendResult {
+	return c.sendPromptWithAttachmentsOperation(sessionID, prompt, attachments, operationID)
+}
+
+func (c *Claude) sendPromptWithAttachmentsOperation(
+	sessionID string, prompt string, attachments []Attachment, operationID string,
+) SendResult {
 	if strings.TrimSpace(prompt) == "" && len(attachments) == 0 {
 		msg := "empty prompt"
 		return SendResult{OK: false, State: c.lastState, Error: &msg}
+	}
+	promptSpec := &claudePromptAttemptSpec{
+		operationID: operationID, prompt: prompt, attachments: append([]Attachment(nil), attachments...),
+	}
+	if c.claudeComputerUseRoute(sessionID) == "" {
+		if c.claudePrimaryRoute() == claudeRouteDesktopComputerUse {
+			c.tentativelyBindClaudeComputerUseRoute(sessionID)
+		} else {
+			c.bindClaudeComputerUseRoute(sessionID, claudeRouteStreamJSONCLI)
+		}
+	}
+	if c.claudeComputerUseRoute(sessionID) == claudeRouteDesktopComputerUse {
+		canFallback := !c.ClaudeControlRouteCommitted(sessionID) &&
+			c.transcriptIDForDesktopRoute(sessionID) == "" && c.claudeFallbackRoute() == claudeRouteStreamJSONCLI
+		if len(attachments) > 0 {
+			if !canFallback {
+				msg := "Claude Desktop Computer Use does not support attachments for this bound session"
+				return SendResult{OK: false, State: "needs_manual", Error: &msg}
+			}
+			commitCtx, commitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			commitErr := c.commitClaudeControlRoute(commitCtx, sessionID, claudeRouteStreamJSONCLI)
+			commitCancel()
+			if commitErr != nil {
+				msg := "Claude CLI fallback route could not be committed"
+				return SendResult{OK: false, State: "needs_manual", Error: &msg}
+			}
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), c.claudeUIOperationTimeout())
+			outcome := c.claudeComputerUseSendPrompt(ctx, sessionID, prompt, promptSpec)
+			cancel()
+			if outcome.Disposition == claudeComputerUseConfirmed && outcome.TranscriptID != "" {
+				c.setTranscriptID(sessionID, outcome.TranscriptID)
+				c.sessions[sessionID] = outcome.TranscriptID
+				c.lastSessionID = sessionID
+				c.lastState = "running"
+				c.lastError = ""
+				c.lastChange = time.Now()
+				return SendResult{
+					OK: true, State: "running", Message: "prompt delivered through Claude Desktop Computer Use",
+					NativeTaskID: outcome.TranscriptID, NativeSessionID: outcome.TranscriptID,
+				}
+			}
+			if !outcome.canFallback() || !canFallback {
+				if errors.Is(outcome.Err, errClaudeDesktopTurnRunning) {
+					msg := outcome.Err.Error()
+					c.lastError = msg
+					c.lastState = "running"
+					return SendResult{OK: false, State: "running", Error: &msg}
+				}
+				msg := "Claude Desktop delivery is uncertain; CLI retry is disabled to prevent duplication"
+				if outcome.Disposition == claudeComputerUseNotAttempted {
+					msg = "Claude Desktop Computer Use is unavailable for this bound session"
+				}
+				c.lastError = msg
+				c.lastState = "needs_manual"
+				return SendResult{OK: false, State: "needs_manual", Error: &msg}
+			}
+			commitCtx, commitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			commitErr := c.commitClaudeControlRoute(commitCtx, sessionID, claudeRouteStreamJSONCLI)
+			commitCancel()
+			if commitErr != nil {
+				msg := "Claude CLI fallback route could not be committed"
+				return SendResult{OK: false, State: "needs_manual", Error: &msg}
+			}
+		}
+	}
+	if c.claudeComputerUseRoute(sessionID) == claudeRouteStreamJSONCLI &&
+		!c.ClaudeControlRouteCommitted(sessionID) {
+		// Explicit CLI-only constructor users predate the in-process persistence
+		// seam. Production Desktop fallback always has the server-installed
+		// barrier and may not perform any CLI side effect until it succeeds.
+		if c.claudePrimaryRoute() != claudeRouteStreamJSONCLI {
+			commitCtx, commitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			commitErr := c.commitClaudeControlRoute(commitCtx, sessionID, claudeRouteStreamJSONCLI)
+			commitCancel()
+			if commitErr != nil {
+				msg := "Claude CLI route could not be committed"
+				return SendResult{OK: false, State: "needs_manual", Error: &msg}
+			}
+		}
 	}
 	content, contentErr := claudeUserContent(prompt, attachments)
 	if contentErr != nil {
 		msg := contentErr.Error()
 		return SendResult{OK: false, State: "error", Error: &msg}
 	}
+	if err := c.rejectKnownClaudePromptAttempt(sessionID, claudeRouteStreamJSONCLI, promptSpec); err != nil {
+		msg := "Claude prompt operation was already attempted; delivery will not be retried"
+		return SendResult{OK: false, State: "needs_manual", Error: &msg}
+	}
 	if !c.ensureReady() {
 		msg := firstNonEmpty(c.lastError, "Claude CLI unavailable")
 		return SendResult{OK: false, State: "needs_manual", Error: &msg}
 	}
-	return c.sendCLIStreamPrompt(sessionID, content)
+	return c.deliverClaudeCLIPromptExactOnce(sessionID, content, promptSpec, c.sendCLIStreamPrompt)
+}
+
+func (c *Claude) deliverClaudeCLIPromptExactOnce(
+	sessionID string,
+	content []map[string]any,
+	promptSpec *claudePromptAttemptSpec,
+	send func(string, []map[string]any) SendResult,
+) SendResult {
+	promptAttempt, err := c.beginClaudePromptAttempt(sessionID, claudeRouteStreamJSONCLI, promptSpec)
+	if err != nil {
+		msg := "Claude prompt operation was already attempted; delivery will not be retried"
+		return SendResult{OK: false, State: "needs_manual", Error: &msg}
+	}
+	result := send(sessionID, content)
+	if !result.OK {
+		return result
+	}
+	if err := c.resolveClaudePromptAttempt(promptAttempt); err != nil {
+		msg := "Claude CLI prompt delivery could not be durably resolved"
+		return SendResult{OK: false, State: "needs_manual", Error: &msg}
+	}
+	return result
 }
 
 func (c *Claude) LatestOutput(sessionID string) map[string]any {
@@ -590,6 +843,18 @@ func (c *Claude) RelayApproval(sessionID string, decision string) map[string]any
 }
 
 func (c *Claude) PendingQuestion(sessionID string) map[string]any {
+	if c.claudeComputerUseRoute(sessionID) == claudeRouteDesktopComputerUse {
+		record, err := c.claudeDesktopInteraction(sessionID, "", "AskUserQuestion")
+		if err == nil {
+			return claudeDesktopInteractionRequest(record)
+		}
+		if errors.Is(err, errClaudeInteractionAttempted) {
+			return claudeDesktopInteractionUnknownRequest(record)
+		}
+		if errors.Is(err, errClaudeInteractionResolved) {
+			return nil
+		}
+	}
 	tid := c.transcriptID(sessionID)
 	if pending := c.pendingControl(tid, ""); pending != nil {
 		if pending.ToolName == "AskUserQuestion" {
@@ -623,6 +888,18 @@ func markClaudeTranscriptQuestion(q map[string]any) {
 }
 
 func (c *Claude) ApprovalRequest(sessionID string) map[string]any {
+	if c.claudeComputerUseRoute(sessionID) == claudeRouteDesktopComputerUse {
+		record, err := c.claudeDesktopInteraction(sessionID, "", "")
+		if err == nil {
+			return claudeDesktopInteractionRequest(record)
+		}
+		if errors.Is(err, errClaudeInteractionAttempted) {
+			return claudeDesktopInteractionUnknownRequest(record)
+		}
+		if errors.Is(err, errClaudeInteractionResolved) {
+			return nil
+		}
+	}
 	tid := c.transcriptID(sessionID)
 	if q := c.PendingQuestion(sessionID); q != nil {
 		return q
@@ -839,6 +1116,34 @@ func (c *Claude) RelayApprovalRequest(sessionID string, requestID string, decisi
 	if decision != "allow" && decision != "deny" {
 		return map[string]any{"ok": false, "detail": "decision must be allow or deny"}
 	}
+	if c.claudeComputerUseRoute(sessionID) == claudeRouteDesktopComputerUse {
+		record, err := c.claudeDesktopInteraction(sessionID, requestID, "")
+		if err != nil {
+			return map[string]any{"ok": false, "detail": "Claude Desktop permission request is no longer pending"}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), c.claudeUIOperationTimeout())
+		outcome := claudeComputerUseOutcome{}
+		if record.ToolName == "AskUserQuestion" {
+			if decision != "deny" {
+				cancel()
+				return map[string]any{"ok": false, "detail": "AskUserQuestion requires structured answers"}
+			}
+			outcome = c.claudeComputerUseDismissQuestion(ctx, sessionID, record)
+		} else {
+			outcome = c.claudeComputerUseRelayApproval(ctx, sessionID, record, decision)
+		}
+		cancel()
+		if outcome.Disposition != claudeComputerUseConfirmed {
+			return map[string]any{
+				"ok": false, "detail": "Claude Desktop permission decision is uncertain; it will not be retried",
+				"request_id": record.RequestID,
+			}
+		}
+		return map[string]any{
+			"ok": true, "detail": "Claude Desktop permission decision confirmed",
+			"request_id": record.RequestID, "decision": decision,
+		}
+	}
 	tid := c.transcriptID(sessionID)
 	pending := c.pendingControl(tid, requestID)
 	if pending == nil {
@@ -864,6 +1169,36 @@ func (c *Claude) RelayApprovalRequest(sessionID string, requestID string, decisi
 }
 
 func (c *Claude) AnswerQuestion(sessionID string, requestID string, answers map[string]string) map[string]any {
+	if c.claudeComputerUseRoute(sessionID) == claudeRouteDesktopComputerUse {
+		record, err := c.claudeDesktopInteraction(sessionID, requestID, "AskUserQuestion")
+		if err != nil {
+			return map[string]any{"ok": false, "detail": "AskUserQuestion request is no longer pending"}
+		}
+		structured := map[string]QuestionAnswer{}
+		for _, raw := range listAny(mapAny(record.ToolInput)["questions"]) {
+			question := mapAny(raw)
+			text := stringAny(question["question"])
+			answer := strings.TrimSpace(answers[text])
+			if text == "" || answer == "" {
+				return map[string]any{"ok": false, "detail": "every question requires a non-empty answer"}
+			}
+			// The legacy string contract cannot preserve commas in multi-select
+			// labels. Accept only one exact option; callers needing multi/Other use
+			// AnswerQuestionStructured.
+			exact := ""
+			for _, optionRaw := range listAny(question["options"]) {
+				label := stringAny(mapAny(optionRaw)["label"])
+				if answer == label {
+					exact = label
+				}
+			}
+			if exact == "" {
+				return map[string]any{"ok": false, "detail": "structured answers are required for multi-select or Other"}
+			}
+			structured[text] = QuestionAnswer{Selected: []string{exact}}
+		}
+		return c.answerClaudeDesktopQuestionStructured(sessionID, requestID, record, structured)
+	}
 	tid := c.transcriptID(sessionID)
 	pending := c.pendingControl(tid, requestID)
 	if pending == nil || pending.ToolName != "AskUserQuestion" {
@@ -898,6 +1233,47 @@ func (c *Claude) AnswerQuestion(sessionID string, requestID string, answers map[
 	}
 	c.resolveCLIStreamControl(tid, pending)
 	return map[string]any{"ok": true, "detail": "question answers sent to Claude", "request_id": pending.RequestID}
+}
+
+func (c *Claude) AnswerQuestionStructured(
+	sessionID string, requestID string, answers map[string]QuestionAnswer,
+) map[string]any {
+	if c.claudeComputerUseRoute(sessionID) == claudeRouteDesktopComputerUse {
+		record, err := c.claudeDesktopInteraction(sessionID, requestID, "AskUserQuestion")
+		if err != nil {
+			return map[string]any{"ok": false, "detail": "AskUserQuestion request is no longer pending"}
+		}
+		return c.answerClaudeDesktopQuestionStructured(sessionID, requestID, record, answers)
+	}
+	legacy := make(map[string]string, len(answers))
+	for question, answer := range answers {
+		parts := append([]string(nil), answer.Selected...)
+		if strings.TrimSpace(answer.Other) != "" {
+			parts = append(parts, "Other: "+strings.TrimSpace(answer.Other))
+		}
+		legacy[question] = strings.Join(parts, ", ")
+	}
+	return c.AnswerQuestion(sessionID, requestID, legacy)
+}
+
+func (c *Claude) answerClaudeDesktopQuestionStructured(
+	sessionID string,
+	requestID string,
+	record turnstatehook.InteractionRecord,
+	answers map[string]QuestionAnswer,
+) map[string]any {
+	ctx, cancel := context.WithTimeout(context.Background(), c.claudeUIOperationTimeout())
+	outcome := c.claudeComputerUseAnswerQuestion(ctx, sessionID, record, answers)
+	cancel()
+	if outcome.Disposition != claudeComputerUseConfirmed {
+		return map[string]any{
+			"ok": false, "detail": "Claude Desktop question delivery is uncertain; it will not be retried",
+			"request_id": requestID,
+		}
+	}
+	return map[string]any{
+		"ok": true, "detail": "Claude Desktop question answers confirmed", "request_id": requestID,
+	}
 }
 
 func (c *Claude) sendControlResponse(sessionID string, requestID string, response map[string]any) error {
@@ -1178,11 +1554,11 @@ func (c *Claude) sendCLIStreamPrompt(sessionID string, content []map[string]any)
 		knownTranscript := c.sessions[sessionID] != "" || claudeTranscriptPath(tid, stringExtra(c.cfg.Extra, "claude_projects_dir", "")) != ""
 		if knownTranscript && claudeUUIDRE.MatchString(tid) {
 			cwd := firstNonEmpty(c.cliStream.Cwd(sessionID), c.cwdForTranscript(tid))
-			if err := c.startCLIStream(sessionID, tid, cwd, true, false, StartOptions{}); err != nil {
+			if err := c.startCLIStream(sessionID, tid, cwd, true, false, c.claudeStartOptions(sessionID)); err != nil {
 				msg := err.Error()
 				return SendResult{OK: false, State: "error", Error: &msg}
 			}
-		} else if _, err := c.OpenOrCreateSession(sessionID, StartOptions{}); err != nil {
+		} else if _, err := c.OpenOrCreateSession(sessionID, c.claudeStartOptions(sessionID)); err != nil {
 			msg := err.Error()
 			return SendResult{OK: false, State: "error", Error: &msg}
 		}
@@ -1208,7 +1584,10 @@ func (c *Claude) sendCLIStreamPrompt(sessionID string, content []map[string]any)
 	c.lastChange = time.Now()
 	c.lastSessionID = sessionID
 	c.sessions[sessionID] = tid
-	return SendResult{OK: true, State: "running", Message: "prompt sent to Claude stream-json CLI", NativeTaskID: tid}
+	return SendResult{
+		OK: true, State: "running", Message: "prompt sent to Claude stream-json CLI",
+		NativeTaskID: tid, NativeSessionID: tid,
+	}
 }
 
 func (c *Claude) cwdForTranscript(transcriptID string) string {

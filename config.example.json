@@ -3,16 +3,17 @@
   "devices": ["mac-studio-01", "mac-pro-02"],
   "host": "127.0.0.1",
   "port": 8765,
-  "uds": "/opt/private-tunnel/state/remote-agent/sockets/backend.sock",
-  "state_dir": "/opt/private-tunnel/state/remote-agent",
+  "uds": "/opt/private-tunnel/state/agenthalo/sockets/backend.sock",
+  "state_dir": "/opt/private-tunnel/state/agenthalo",
   "push_proxy": "",
   "push_vapid": null,
   "default_provider": "claude",
   "computer_use": {
-    "enabled": false,
-    "helper_socket": "~/Library/Application Support/remote-agent/desktop.sock",
+    "enabled": true,
+    "debug_http_actions": false,
+    "helper_socket": "~/Library/Application Support/AgentHalo/desktop.sock",
     "locked_use": {
-      "enabled": false,
+      "enabled": true,
       "grant_ttl_seconds": 10,
       "window_ttl_seconds": 300,
       "input_relock_grace_ms": 250,
@@ -24,14 +25,22 @@
       "app_name": "Claude",
       "command": "claude",
       "cwd": "~/Developer",
+      "primary_route": "desktop_computer_use",
+      "fallback_route": "stream_json_cli",
+      "desktop_bundle_id": "com.anthropic.claudefordesktop",
+      "desktop_team_id": "Q6L2SF6YDW",
+      "desktop_app_path": "/Applications/Claude.app",
+      "ui_operation_timeout_seconds": 30,
+      "interaction_dir": "~/.claude/agenthalo-interactions",
       "permission_mode": "auto",
-      "turnstate_dir": "~/.claude/remote-agent-turnstate",
+      "turnstate_dir": "~/.claude/agenthalo-turnstate",
       "kill_grace": 3
     },
     "codex": {
       "app_name": "Codex",
       "command": "codex",
-      "cwd": "~/Developer"
+      "cwd": "~/Developer",
+      "shared_daemon_autostart": true
     },
     "terminal-agent": {
       "type": "pty",

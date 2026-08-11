@@ -322,6 +322,12 @@ func TestCodexDesktopBridgePreservesSnapshotBeforeInitializeResponse(t *testing.
 			done <- err
 			return
 		}
+		params := mapAny(initFrame["params"])
+		info := mapAny(params["clientInfo"])
+		if params["clientType"] != "agenthalo" || info["name"] != "AgentHalo" || info["title"] != "AgentHalo" {
+			done <- fmt.Errorf("Desktop initialize identity=%#v", params)
+			return
+		}
 		if err := writeDesktopFrame(server, bridgeSnapshotFrame(approvalThreadA, owner, 1, map[string]any{
 			"id": approvalThreadA, "requests": []any{},
 		})); err != nil {
@@ -330,7 +336,7 @@ func TestCodexDesktopBridgePreservesSnapshotBeforeInitializeResponse(t *testing.
 		}
 		done <- writeDesktopFrame(server, map[string]any{
 			"type": "response", "requestId": stringAny(initFrame["requestId"]), "resultType": "success",
-			"method": "initialize", "result": map[string]any{"clientId": "remote-agent-client"},
+			"method": "initialize", "result": map[string]any{"clientId": "agenthalo-client"},
 		})
 	}()
 
@@ -341,7 +347,7 @@ func TestCodexDesktopBridgePreservesSnapshotBeforeInitializeResponse(t *testing.
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if clientID != "remote-agent-client" || len(pending) != 1 {
+	if clientID != "agenthalo-client" || len(pending) != 1 {
 		t.Fatalf("client=%q pending=%d", clientID, len(pending))
 	}
 	b := newCodexDesktopBridge("", "local")

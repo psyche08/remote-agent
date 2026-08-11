@@ -8,7 +8,7 @@
   <link rel="apple-touch-icon" href="icon-192.png" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black" />
-  <title>Remote Agent</title>
+  <title>AgentHalo</title>
   <style>
     :root { color-scheme:dark; --bg:#0d0d0f; --fg:#ececed; --muted:#92929b; }
     * { box-sizing:border-box; }
@@ -19,12 +19,12 @@
   </style>
 </head>
 <body>
-  <iframe id="console" title="Remote Agent device console"></iframe>
+  <iframe id="console" title="AgentHalo device console"></iframe>
   <div id="status">正在连接设备…</div>
   <script>
     const SERVICE_ROOT = (location.pathname.match(/^(.*\/s\/[^/]+\/)/) || [null, location.pathname.replace(/[^/]*$/, "")])[1];
     const RELAY_ROOT = SERVICE_ROOT.replace(/s\/[^/]+\/$/, "");
-    const DEVICE_KEY = "remote-agent-shell-device";
+    const DEVICE_KEY = "agenthalo-shell-device";
     const frame = document.getElementById("console");
     const statusBox = document.getElementById("status");
     let rows = [];
@@ -51,8 +51,8 @@
     function deviceURL(id, retry = false) {
       const params = new URLSearchParams(location.search);
       params.delete("device");
-      params.delete("_rc_retry");
-      if (retry) params.set("_rc_retry", Date.now().toString());
+      params.delete("_agenthalo_retry");
+      if (retry) params.set("_agenthalo_retry", Date.now().toString());
       const query = params.toString();
       return SERVICE_ROOT + "d/" + encodeURIComponent(id) + "/" + (query ? "?" + query : "") + location.hash;
     }
@@ -129,7 +129,7 @@
           frameRetryDelay = 1000;
           clearFrameRetry();
           frame.removeAttribute("src");
-          showStatus("当前没有提供 remote-agent 的在线设备。");
+          showStatus("当前没有提供 AgentHalo 的在线设备。");
           return;
         }
         if (!available.has(activeDevice) || !available.has(hostDevice)) {
@@ -155,7 +155,7 @@
     });
     window.addEventListener("message", event => {
       if (event.origin !== location.origin || event.source !== frame.contentWindow || !event.data) return;
-      if (event.data.type === "remote-agent-device-selected" && rows.some(row => row.device === event.data.device)) {
+      if (event.data.type === "agenthalo-device-selected" && rows.some(row => row.device === event.data.device)) {
         if (event.data.activate_session) {
           // The selected session owns both the device UI and its provider state.
           // Move the iframe to that device; the target UI restores the persisted

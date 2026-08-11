@@ -12,14 +12,14 @@ import (
 
 func TestUploadOnceUploadsIncrementally(t *testing.T) {
 	dir := t.TempDir()
-	src := filepath.Join(dir, "remote-agent.log")
+	src := filepath.Join(dir, "agenthalo.log")
 	state := filepath.Join(dir, "state.json")
 	if err := os.WriteFile(src, []byte("hello\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	var got [][]byte
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		if r.URL.Path != "/_pt/logs/remocoding/device-a" {
+		if r.URL.Path != "/_pt/logs/agenthalo/device-a" {
 			t.Fatalf("path=%s", r.URL.Path)
 		}
 		b, _ := io.ReadAll(r.Body)
@@ -28,7 +28,7 @@ func TestUploadOnceUploadsIncrementally(t *testing.T) {
 	})}
 	opts := Options{
 		RelayURL:   "https://relay.example.test",
-		Namespace:  "remocoding",
+		Namespace:  "agenthalo",
 		DeviceID:   "device-a",
 		StatePath:  state,
 		Sources:    []string{src},
@@ -55,7 +55,7 @@ func TestUploadOnceUploadsIncrementally(t *testing.T) {
 
 func TestUploadOnceResetsOffsetAfterTruncate(t *testing.T) {
 	dir := t.TempDir()
-	src := filepath.Join(dir, "remote-agent.log")
+	src := filepath.Join(dir, "agenthalo.log")
 	state := filepath.Join(dir, "state.json")
 	if err := os.WriteFile(state, []byte(`{"offsets":{"`+src+`":99}}`), 0o600); err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestUploadOnceResetsOffsetAfterTruncate(t *testing.T) {
 	})}
 	_, err := UploadOnce(context.Background(), Options{
 		RelayURL:   "https://relay.example.test",
-		Namespace:  "remocoding",
+		Namespace:  "agenthalo",
 		DeviceID:   "device-a",
 		StatePath:  state,
 		Sources:    []string{src},

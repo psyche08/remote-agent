@@ -5,13 +5,13 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleExecutable</key>
-	<string>RemoteAgentLockedUse</string>
+	<string>AgentHaloLockedUse</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.psyche08.remote-agent.lockeduse</string>
+	<string>dev.linsheng.agenthalo.locked-use.plugin</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>RemoteAgentLockedUse</string>
+	<string>AgentHaloLockedUse</string>
 	<key>CFBundlePackageType</key>
 	<string>BNDL</string>
 	<key>CFBundleShortVersionString</key>

@@ -16,10 +16,10 @@ import (
 )
 
 const (
-	codexSharedDaemonTestStatusEnv = "RC_TEST_CODEX_DAEMON_STATUS"
-	codexSharedDaemonTestStartEnv  = "RC_TEST_CODEX_DAEMON_START"
-	codexSharedDaemonTestSleepEnv  = "RC_TEST_CODEX_DAEMON_SLEEP"
-	codexSharedDaemonTestExitEnv   = "RC_TEST_CODEX_DAEMON_EXIT"
+	codexSharedDaemonTestStatusEnv = "AGENTHALO_TEST_CODEX_DAEMON_STATUS"
+	codexSharedDaemonTestStartEnv  = "AGENTHALO_TEST_CODEX_DAEMON_START"
+	codexSharedDaemonTestSleepEnv  = "AGENTHALO_TEST_CODEX_DAEMON_SLEEP"
+	codexSharedDaemonTestExitEnv   = "AGENTHALO_TEST_CODEX_DAEMON_EXIT"
 )
 
 func TestQueryCodexSharedDaemon(t *testing.T) {
@@ -63,6 +63,41 @@ func TestStartCodexSharedDaemonIsExplicitAndBounded(t *testing.T) {
 	t.Setenv(codexSharedDaemonTestStartEnv, `{"status":"started"}`)
 	if err := StartCodexSharedDaemon(context.Background(), binary, time.Second); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestCodexSharedDaemonDoesNotAutostartWithoutExplicitConfig(t *testing.T) {
+	binary := writeCodexSharedDaemonTestBinary(t)
+	t.Setenv(codexSharedDaemonTestExitEnv, "1")
+	// If ensureClient unexpectedly invokes start, this deliberately malformed
+	// response changes the returned error and makes the mutation observable.
+	t.Setenv(codexSharedDaemonTestStartEnv, `not-json`)
+	c := NewCodex("codex", config.ProviderConfig{Extra: map[string]any{
+		"app_server_transport":  "shared_daemon",
+		"shared_daemon_command": binary,
+	}})
+	defer c.Shutdown()
+
+	_, err := c.ensureClient()
+	if err == nil || !strings.Contains(err.Error(), "status query failed") {
+		t.Fatalf("ensureClient error=%v, want status failure without daemon start", err)
+	}
+}
+
+func TestCodexSharedDaemonAutostartSurfacesStartFailure(t *testing.T) {
+	binary := writeCodexSharedDaemonTestBinary(t)
+	t.Setenv(codexSharedDaemonTestExitEnv, "1")
+	t.Setenv(codexSharedDaemonTestStartEnv, `not-json`)
+	c := NewCodex("codex", config.ProviderConfig{Extra: map[string]any{
+		"app_server_transport":    "shared_daemon",
+		"shared_daemon_command":   binary,
+		"shared_daemon_autostart": true,
+	}})
+	defer c.Shutdown()
+
+	_, err := c.ensureClient()
+	if err == nil || !strings.Contains(err.Error(), "invalid start response") {
+		t.Fatalf("ensureClient error=%v, want explicit daemon start failure", err)
 	}
 }
 
@@ -207,14 +242,14 @@ func TestValidCodexSharedDaemonVersion(t *testing.T) {
 }
 
 func TestLiveCodexSharedDaemonResume(t *testing.T) {
-	if os.Getenv("RC_TEST_CODEX_SHARED_DAEMON") != "1" {
-		t.Skip("set RC_TEST_CODEX_SHARED_DAEMON=1 to probe the local managed daemon")
+	if os.Getenv("AGENTHALO_TEST_CODEX_SHARED_DAEMON") != "1" {
+		t.Skip("set AGENTHALO_TEST_CODEX_SHARED_DAEMON=1 to probe the local managed daemon")
 	}
-	threadID := strings.TrimSpace(os.Getenv("RC_TEST_CODEX_SHARED_THREAD"))
+	threadID := strings.TrimSpace(os.Getenv("AGENTHALO_TEST_CODEX_SHARED_THREAD"))
 	if threadID == "" {
-		t.Skip("set RC_TEST_CODEX_SHARED_THREAD to an existing thread UUID")
+		t.Skip("set AGENTHALO_TEST_CODEX_SHARED_THREAD to an existing thread UUID")
 	}
-	binary := strings.TrimSpace(os.Getenv("RC_TEST_CODEX_SHARED_BINARY"))
+	binary := strings.TrimSpace(os.Getenv("AGENTHALO_TEST_CODEX_SHARED_BINARY"))
 	if binary == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -231,7 +266,7 @@ func TestLiveCodexSharedDaemonResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer client.Close()
-	if err := client.Initialize("remote-agent-live-probe"); err != nil {
+	if err := client.Initialize("agenthalo-live-probe"); err != nil {
 		t.Fatal(err)
 	}
 	result, err := client.ThreadResume(threadID, nil, 10*time.Second)
@@ -246,10 +281,10 @@ func TestLiveCodexSharedDaemonResume(t *testing.T) {
 }
 
 func TestLiveCodexSharedDaemonTurn(t *testing.T) {
-	if os.Getenv("RC_TEST_CODEX_SHARED_TURN") != "1" {
-		t.Skip("set RC_TEST_CODEX_SHARED_TURN=1 to create a throwaway thread and deliver a real turn")
+	if os.Getenv("AGENTHALO_TEST_CODEX_SHARED_TURN") != "1" {
+		t.Skip("set AGENTHALO_TEST_CODEX_SHARED_TURN=1 to create a throwaway thread and deliver a real turn")
 	}
-	binary := strings.TrimSpace(os.Getenv("RC_TEST_CODEX_SHARED_BINARY"))
+	binary := strings.TrimSpace(os.Getenv("AGENTHALO_TEST_CODEX_SHARED_BINARY"))
 	if binary == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -257,7 +292,7 @@ func TestLiveCodexSharedDaemonTurn(t *testing.T) {
 		}
 		binary = filepath.Join(home, ".codex", "packages", "standalone", "current", "codex")
 	}
-	const expected = "REMOTE_AGENT_SHARED_DAEMON_OK"
+	const expected = "AGENTHALO_SHARED_DAEMON_OK"
 	cwd := t.TempDir()
 	codex := NewCodex("codex", config.ProviderConfig{
 		AppName: "Codex",
@@ -376,19 +411,19 @@ if [ "$1" != "app-server" ] || [ "$2" != "daemon" ]; then
   exit 97
 fi
 if [ "$3" = "start" ]; then
-  printf '%s' "$RC_TEST_CODEX_DAEMON_START"
+  printf '%s' "$AGENTHALO_TEST_CODEX_DAEMON_START"
   exit 0
 fi
 if [ "$3" != "version" ]; then
   exit 97
 fi
-if [ -n "$RC_TEST_CODEX_DAEMON_SLEEP" ]; then
-  sleep "$RC_TEST_CODEX_DAEMON_SLEEP"
+if [ -n "$AGENTHALO_TEST_CODEX_DAEMON_SLEEP" ]; then
+  sleep "$AGENTHALO_TEST_CODEX_DAEMON_SLEEP"
 fi
-if [ -n "$RC_TEST_CODEX_DAEMON_EXIT" ]; then
-  exit "$RC_TEST_CODEX_DAEMON_EXIT"
+if [ -n "$AGENTHALO_TEST_CODEX_DAEMON_EXIT" ]; then
+  exit "$AGENTHALO_TEST_CODEX_DAEMON_EXIT"
 fi
-printf '%s' "$RC_TEST_CODEX_DAEMON_STATUS"
+printf '%s' "$AGENTHALO_TEST_CODEX_DAEMON_STATUS"
 `
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		return "", fmt.Errorf("write fake Codex: %w", err)

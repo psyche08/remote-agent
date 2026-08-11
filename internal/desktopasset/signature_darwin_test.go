@@ -10,13 +10,14 @@ import (
 
 // The single-artifact deploy model rests on this: a code signature lives inside
 // the Mach-O, so a binary carried through go:embed and written back out is
-// still the signed binary that was notarized. If that were not true, the helper
-// would lose its identity on every update and with it every TCC grant.
+// still the signed binary whose exact bytes are separately submitted for
+// notarization by publish-release.sh. If that were not true, the helper would
+// lose its identity on every update and with it every TCC grant.
 func TestMaterializedHelperKeepsItsSignature(t *testing.T) {
 	if !Embedded() {
 		t.Skip("this build embeds no helper")
 	}
-	path := filepath.Join(t.TempDir(), "remote-agent-desktop")
+	path := filepath.Join(t.TempDir(), "agenthalo-desktop")
 	if _, err := Materialize(path); err != nil {
 		t.Fatalf("Materialize: %v", err)
 	}

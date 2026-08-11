@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs remote-agent-desktop as a per-user LaunchAgent.
+# Installs the AgentHalo desktop helper as a per-user LaunchAgent.
 #
 # It has to be a LaunchAgent, in the user's own GUI session, for two reasons
 # that are not interchangeable with "the agent spawns it":
@@ -19,12 +19,12 @@
 #   ./install.sh --uninstall
 set -euo pipefail
 
-LABEL="com.psyche08.remote-agent-desktop"
+LABEL="dev.linsheng.agenthalo.desktop"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
-SUPPORT_DIR="$HOME/Library/Application Support/remote-agent"
-HELPER="$SUPPORT_DIR/bin/remote-agent-desktop"
+SUPPORT_DIR="$HOME/Library/Application Support/AgentHalo"
+HELPER="$SUPPORT_DIR/bin/agenthalo-desktop"
 SOCKET="$SUPPORT_DIR/desktop.sock"
-LOG="$HOME/Library/Logs/private-services/remote-agent-desktop.log"
+LOG="$HOME/Library/Logs/AgentHalo/agenthalo-desktop.log"
 CONFIG=""
 UNINSTALL=0
 
@@ -49,7 +49,15 @@ fi
 TARGET="gui/$(id -u)"
 
 if [ "$UNINSTALL" = "1" ]; then
-  launchctl bootout "$TARGET/$LABEL" 2>/dev/null || true
+  # launchctl bootout is not a safety handshake: it may kill a helper before a
+  # Locked Use quarantine has relocked and released its shield. The signed agent
+  # must first complete prepare_restart. Once the job is unloaded, removing its
+  # definition and runtime socket is safe and idempotent.
+  if launchctl print "$TARGET/$LABEL" >/dev/null 2>&1; then
+    echo "$LABEL is still loaded; refusing an unsafe uninstall" >&2
+    echo "use the signed AgentHalo update/stop path to complete prepare_restart first" >&2
+    exit 1
+  fi
   rm -f "$PLIST"
   # The socket is a runtime artifact of a process that is now gone; leaving it
   # behind would make a dead helper look reachable until the first connect.
@@ -65,7 +73,24 @@ fi
 # A helper whose signature does not verify cannot hold TCC grants under a
 # stable identity, so it would appear installed and never be able to type.
 if ! codesign --verify --strict "$HELPER" 2>/dev/null; then
-  echo "WARNING: $HELPER has no valid signature; TCC grants will not persist" >&2
+  echo "$HELPER has no valid signature; refusing to register an unstable TCC identity" >&2
+  exit 1
+fi
+HELPER_SIGN_INFO="$(codesign -d --verbose=4 "$HELPER" 2>&1)"
+HELPER_IDENTIFIER="$(printf '%s\n' "$HELPER_SIGN_INFO" | sed -n 's/^Identifier=//p' | head -1)"
+if [ "$HELPER_IDENTIFIER" != "dev.linsheng.agenthalo.desktop" ]; then
+  echo "helper Identifier ${HELPER_IDENTIFIER:-missing} is not dev.linsheng.agenthalo.desktop" >&2
+  exit 1
+fi
+
+# Never replace or rewrite the definition of a live helper from this
+# standalone registration script. A launchctl bootout/kickstart does not
+# promise that the process can finish its shield/grant/relock cleanup. Normal
+# agent updates use the helper's atomic prepare_restart handshake first.
+if launchctl print "$TARGET/$LABEL" >/dev/null 2>&1; then
+  echo "$LABEL is already loaded; refusing an unverified replacement" >&2
+  echo "use the running AgentHalo update path, which performs prepare_restart first" >&2
+  exit 1
 fi
 
 mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")" "$SUPPORT_DIR"
@@ -112,9 +137,28 @@ PLISTEOF
 
 plutil -lint "$PLIST" >/dev/null || { echo "generated plist is not valid" >&2; exit 1; }
 
-launchctl bootout "$TARGET/$LABEL" 2>/dev/null || true
+# The job was proven unloaded above, so any socket at this point is stale.  It
+# must not make a failed bootstrap look healthy.
+rm -f "$SOCKET"
 launchctl bootstrap "$TARGET" "$PLIST"
 launchctl enable "$TARGET/$LABEL"
+
+# `bootstrap` succeeding proves only that launchd accepted the plist.  AMFI or
+# Gatekeeper can still reject the executable asynchronously, which otherwise
+# leaves a crash-looping job and an installer that falsely reports success.
+READY=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if launchctl print "$TARGET/$LABEL" >/dev/null 2>&1 && [ -S "$SOCKET" ]; then
+    READY=1
+    break
+  fi
+  sleep 1
+done
+if [ "$READY" != "1" ]; then
+  echo "$LABEL did not create its socket after launchd bootstrap" >&2
+  echo "check $LOG and the macOS AMFI/Gatekeeper logs; refusing to report a usable helper" >&2
+  exit 1
+fi
 
 echo "==> installed $LABEL"
 echo "    helper: $HELPER"

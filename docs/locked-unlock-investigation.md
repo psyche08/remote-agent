@@ -1,5 +1,17 @@
 # 锁屏自动解锁：真机调查记录
 
+> **2026-08-09 更正：本文是历史调查日志，不再是实现依据。** 文中把
+> `checkAuthWithContinuityHints:username:password:` 推断成“需要由 RemoteAgent
+> 保存并注入登录密码”的结论已被后续二进制、authorizationdb 与代码链核对推翻；
+> `LAContext.setCredential(.applicationPassword)` 只认证独立的 LocalAuthentication
+> context，不能完成 loginwindow 当前的解锁事务。当前实现不保存、不读取、不提交
+> 登录密码，而是让 Apple Authorization Plug-in 在 `system.login.screensaver` 的
+> 1-of-n 分支中核验一次性签名 grant，并通过 loginwindow 的精确 AX 授权控件触发该
+> 决策。当前事实与验收状态以
+> [STATUS-and-TODO.md](../mac/RemoteAgentDesktop/STATUS-and-TODO.md) 为准。
+> 下文真机日志来自更早的开发构建，只证明当时的机制曾被加载；它不证明本次 grant v2、
+> console subject、pending/final proof 或模型工具闭环已经通过当前设备 E2E。
+
 真机环境：macOS 26.5 / 25F71，M4 Pro，屏幕真实锁定。目标：让 agent 在锁屏、无人
 在场时接管这台 Mac。
 
@@ -40,7 +52,11 @@ authorizationhosthelper: Error loading …/StagedPlugins/RemoteAgentLockedUse.bu
 注册——在真机 26.5 上均正确且已执行。** 早先"plug-in 被平台策略拒绝、从未运行"的
 结论作废。
 
-## 零、最终真相（由 24h 全量日志确证，取代本文以下所有早期结论）
+## 零、历史结论（已作废）：曾误判为必须托管密码
+
+> 本节记录当时如何从日志得出错误推断，不能再用于设计或验收。日志证明参照实现的
+> 某条成功路径使用过 password mechanism，不等于 Remote Agent 必须、应该或能够用
+> `LAContext` 把密码注入 loginwindow；当前实现与证据边界见文首勘误和 STATUS 文档。
 
 **Codex 在这台机器上过去 24 小时多次成功完成锁屏操作——24h 内有 5 次"3-mechanism
 完整解锁"。我此前"从无非密码解锁"的结论是错的，错因是一个致命的过滤失误。**
@@ -83,7 +99,7 @@ authd 的链停在 `1 of 1`，永远走不到 `builtin:authenticate`。
 是"用户预先把凭据托付给 Codex，Codex 在收到经认证的远程请求时代为提交"——凭据的
 保管与提交授权由 Codex 账户体系背书。
 
-**要在本仓库复刻，需实现凭据托管 + 程序化提交**：安全地保存用户解锁凭据（Keychain /
+**当时的错误建议（不要实现）：需实现凭据托管 + 程序化提交**：安全地保存用户解锁凭据（Keychain /
 Secure Enclave），在收到经 mTLS/账户认证的远程 turn 时，经
 `checkAuthWithContinuityHints:username:password:` 或 LocalAuthentication remote service
 提交。这是**明确的、有官方先例的实现路径**，非平台不可达——但它涉及在设备上保管用户
@@ -166,20 +182,17 @@ mechanism 是 `CryptoTokenKit:login`（智能卡登录），改动它的风险�
 备用机上先验证，openaliro 亦将"替换该 Apple 拥有的 right 是否可作为产品契约"列为
 需向 Apple DTS 确认的未决项。
 
-## 三、不依赖解锁的可行路径：Accessibility 通道（已实现并真机验证）
+## 三、历史假设：把 Accessibility 当作锁屏操作通道（已否定）
 
-无论解锁那跳何时打通，还有一条**不需要解锁**就满足"锁屏下操作"的路径，且已经跑通：
+早期实验在 `locked=true` 时仍能读到少量应用级结构，一度被误读为
+“AX 可以绕过解锁完成 Locked Use”。后续真机证据已否定这个产品结论：
+锁屏下只有部分应用级菜单结构可读，目标窗口内的 web area、按钮、文本框不可达；
+合成 HID/CGEvent 也不会落到被锁屏隔断的用户桌面。因此这条路径既不能提供
+模型所需的完整 UI 观测，也不能完成坐标/键盘操作，不是当前实现依据。
 
-**Accessibility API 在锁屏下直接触达应用的元素树,不经过被锁屏隔断的 HID /
-window-server 层。** 合成 HID / CGEvent 事件在锁屏下到不了桌面（实测空闲计时器
-不动），AX 走的是应用进程内的 UI 层。真机实测（屏幕 `locked=true`）确认了它的
-**可达范围与边界**——详见第五节:**应用级结构（菜单，111 项）锁屏下可达可操作;
-窗口内容（web area / 按钮 / 文本框）不可达。**
-
-这与 OpenAI 官方文档一致：Codex 有两套 API——desktop API（坐标+合成事件，解锁态用）
-与 window API（`get_app_state`/`click by index`/`set_value`，全 Accessibility 驱动）。
-我们新增的 `ax_read`/`ax_press`/`ax_setvalue` 对应后者。它不解锁、不注入、不依赖
-plug-in。
+当前 `ax_read`/`ax_press`/`ax_setvalue` 只在普通 unlocked desktop，或 Apple
+Authorization Plug-in 已完成临时撤锁、controller 确认 shield/turn lease 后运行。
+它们是操作机制，不是解锁机制。
 
 （实现中修过一个真 bug：AX 树含循环引用——Electron 应用的 child 会指回 application
 元素——未去重的遍历会把节点预算耗在自引用上（早期一次读到 1794 个"元素"实为同一

@@ -1,9 +1,9 @@
-// Package autoupdate keeps a device's remote-agent binary in sync with the
+// Package autoupdate keeps a device's AgentHalo binary in sync with the
 // release published on the relay.
 //
 // 机制(2026-07-03 起):发布方用 deploy/publish-release.sh 把
-// assets/release/{manifest.json,remote-agent-<platform>,update.sh} 发到 relay
-// 的 remotecoding static_dir;设备侧每 5 分钟(api.autoUpdateLoop)执行一次
+// assets/release/{manifest.json,agenthalo-<platform>,update.sh} 发到 relay
+// 的 agenthalo static_dir;设备侧每 5 分钟(api.autoUpdateLoop)执行一次
 // Apply:拉 manifest → 与 healthz 汇报的运行版本对比 → 一致则忽略;不一致则
 // 下载 update.sh + 对应平台二进制,sha256 校验后执行脚本(原子替换二进制并
 // 经 supervisor 重启),再等 healthz 收敛到 manifest 版本。设备上不再 git
@@ -33,7 +33,7 @@ import (
 
 const (
 	DefaultMinInterval = 30 * time.Minute
-	DefaultService     = "remotecoding"
+	DefaultService     = "agenthalo"
 )
 
 // cst — 项目约定所有构建/更新时间戳统一东八区。
@@ -370,7 +370,7 @@ func (o *Options) applyDefaults() {
 		if o.StatePath != "" {
 			o.StagingDir = filepath.Join(filepath.Dir(o.StatePath), "update-staging")
 		} else {
-			o.StagingDir = filepath.Join(os.TempDir(), "remote-agent-update-staging")
+			o.StagingDir = filepath.Join(os.TempDir(), "agenthalo-update-staging")
 		}
 	}
 	if o.MinInterval <= 0 {

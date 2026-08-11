@@ -352,6 +352,9 @@ func (p *PTYProvider) SendPrompt(sessionID string, prompt string) SendResult {
 		session.lastError = "write to PTY failed"
 		session.updatedAt = time.Now()
 		session.mu.Unlock()
+		p.publish(sessionID, map[string]any{
+			"type": "turn", "status": "error", "turn_id": fmt.Sprintf("pty-%d", turn),
+		})
 		message := "write to PTY failed"
 		return SendResult{OK: false, State: "error", Error: &message}
 	}
@@ -435,16 +438,21 @@ func (p *PTYProvider) Interrupt(sessionID string) map[string]any {
 		return map[string]any{"ok": false, "detail": "PTY session process has exited"}
 	}
 	terminal := session.terminal
+	turn := session.turn
 	session.state = "idle"
 	session.updatedAt = time.Now()
 	if session.idleTimer != nil {
 		session.idleTimer.Stop()
 	}
 	session.mu.Unlock()
+	turnID := fmt.Sprintf("pty-%d", turn)
 	if _, err := io.WriteString(terminal, p.interruptSeq); err != nil {
+		p.publish(sessionID, map[string]any{
+			"type": "turn", "status": "error", "turn_id": turnID,
+		})
 		return map[string]any{"ok": false, "detail": "write interrupt to PTY failed"}
 	}
-	p.publish(sessionID, map[string]any{"type": "turn", "status": "completed", "turn_id": nil})
+	p.publish(sessionID, map[string]any{"type": "turn", "status": "completed", "turn_id": turnID})
 	return map[string]any{"ok": true, "detail": "configured PTY interrupt sequence sent"}
 }
 
@@ -522,8 +530,17 @@ func (p *PTYProvider) readSession(session *ptyProviderSession) {
 	} else {
 		session.state = "idle"
 	}
+	turn := session.turn
 	session.mu.Unlock()
-	p.publish(session.id, map[string]any{"type": "turn", "status": "completed", "turn_id": nil})
+	if turn > 0 {
+		status := "completed"
+		if !wasClosing && waitErr != nil {
+			status = "error"
+		}
+		p.publish(session.id, map[string]any{
+			"type": "turn", "status": status, "turn_id": fmt.Sprintf("pty-%d", turn),
+		})
+	}
 }
 
 // pruneExitedSessionsLocked bounds retained preview/history state while
