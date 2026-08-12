@@ -75,7 +75,7 @@ public protocol LockedUseSystem: AnyObject, Sendable {
     func physicalInputObserved() -> Bool
     /// Begins the real loginwindow authorization transaction. The production
     /// implementation wakes the lock screen, locates its password field through
-    /// Accessibility, and confirms that field without supplying a credential.
+    /// Accessibility, and writes one empty value without supplying a credential.
     /// The Authorization Plug-in is the branch that decides whether this exact
     /// transaction may retract the lock. `prepareGrant` runs exactly once only
     /// after the exact field is ready, immediately before empty-value
@@ -83,6 +83,7 @@ public protocol LockedUseSystem: AnyObject, Sendable {
     func requestUnlockAuthorization(
         authorizationFieldReady: @Sendable () -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWritten: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool
     ) throws
     /// Executes a validated action. The result is action-specific (e.g. PNG
@@ -136,6 +137,7 @@ public final class DesktopSystem: LockedUseSystem {
     public func requestUnlockAuthorization(
         authorizationFieldReady: @Sendable () -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWritten: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool
     ) throws {
         // A grant on disk does not itself make loginwindow evaluate the unlock
@@ -145,6 +147,7 @@ public final class DesktopSystem: LockedUseSystem {
         try lockScreenAuthorization.requestAuthorization(
             authorizationFieldReady: authorizationFieldReady,
             prepareGrant: prepareGrant,
+            emptyValueWritten: emptyValueWritten,
             completionReceiptObserved: completionReceiptObserved,
             isLocked: { [self] in try isLocked() })
     }

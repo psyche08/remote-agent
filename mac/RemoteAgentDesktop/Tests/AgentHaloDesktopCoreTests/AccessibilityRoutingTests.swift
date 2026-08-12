@@ -480,43 +480,100 @@ final class AccessibilityRoutingTests: XCTestCase {
         }
     }
 
-    func testConfirmFailureNeverRetriesTheEmptyValueAssignment() {
-        var preparationCount = 0
-        var confirmationCount = 0
-        XCTAssertThrowsError(
-            try SystemLockScreenAuthorizationInteractor.performSingleSubmission(
-                prepareEmptyValue: {
-                    preparationCount += 1
+    func testCredentialFreeFieldReadinessHasOnlyExactFocusAndValuePhases() throws {
+        var events: [String] = []
+        let prepared = SystemLockScreenAuthorizationInteractor
+            .performCredentialFreeFieldReadiness(
+                locateExactField: {
+                    events.append("exact-loginwindow-field")
+                    return "field-token"
                 },
-                confirm: {
-                    confirmationCount += 1
-                    throw LockScreenAuthorizationError("confirm failed")
-                })) { error in
-            XCTAssertEqual(
-                (error as? LockScreenAuthorizationError)?.detail, "confirm failed")
-        }
-        XCTAssertEqual(preparationCount, 1)
-        XCTAssertEqual(confirmationCount, 1)
+                focusAndReadBack: { field in
+                    XCTAssertEqual(field, "field-token")
+                    events.append("focus-readback")
+                },
+                requireEmptyValueSettable: { field in
+                    XCTAssertEqual(field, "field-token")
+                    events.append("empty-value-settable")
+                })
+        XCTAssertEqual(prepared, "field-token")
+        XCTAssertEqual(
+            events,
+            ["exact-loginwindow-field", "focus-readback", "empty-value-settable"])
+
+        events = []
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor
+                .performCredentialFreeFieldReadiness(
+                    locateExactField: {
+                        events.append("exact-loginwindow-field")
+                        return "field-token"
+                    },
+                    focusAndReadBack: { _ in
+                        events.append("focus-readback")
+                        throw LockScreenAuthorizationError("focus readback failed")
+                    },
+                    requireEmptyValueSettable: { _ in
+                        events.append("empty-value-settable")
+                    }))
+        XCTAssertEqual(events, ["exact-loginwindow-field", "focus-readback"])
     }
 
-    func testEmptyValueFailureNeverAttemptsConfirm() {
-        var preparationCount = 0
-        var confirmationCount = 0
+    func testSingleEmptyValueSubmissionWritesExactlyOnceAndNeverRetriesFailure() {
+        var successfulWriteCount = 0
+        var successfulCallbackCount = 0
+        var successfulEvents: [String] = []
+        XCTAssertNoThrow(
+            try SystemLockScreenAuthorizationInteractor
+                .performSingleEmptyValueSubmission(
+                    writeEmptyValue: {
+                        successfulWriteCount += 1
+                        successfulEvents.append("write")
+                    },
+                    didWrite: {
+                        successfulCallbackCount += 1
+                        successfulEvents.append("audit")
+                    }))
+        XCTAssertEqual(successfulWriteCount, 1)
+        XCTAssertEqual(successfulCallbackCount, 1)
+        XCTAssertEqual(successfulEvents, ["write", "audit"])
+
+        var failedWriteCount = 0
+        var failedCallbackCount = 0
         XCTAssertThrowsError(
-            try SystemLockScreenAuthorizationInteractor.performSingleSubmission(
-                prepareEmptyValue: {
-                    preparationCount += 1
-                    throw LockScreenAuthorizationError("empty value failed")
-                },
-                confirm: {
-                    confirmationCount += 1
-                })) { error in
+            try SystemLockScreenAuthorizationInteractor
+                .performSingleEmptyValueSubmission(
+                    writeEmptyValue: {
+                        failedWriteCount += 1
+                        throw LockScreenAuthorizationError("empty value failed")
+                    },
+                    didWrite: { failedCallbackCount += 1 })) { error in
             XCTAssertEqual(
                 (error as? LockScreenAuthorizationError)?.detail,
                 "empty value failed")
         }
-        XCTAssertEqual(preparationCount, 1)
-        XCTAssertEqual(confirmationCount, 0)
+        XCTAssertEqual(failedWriteCount, 1)
+        XCTAssertEqual(failedCallbackCount, 0)
+    }
+
+    func testLockScreenInteractorContainsNoAXActionDiscoveryOrPerformance() throws {
+        let packageDirectory = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let sourceURL = packageDirectory.appendingPathComponent(
+            "Sources/AgentHaloDesktopCore/LockScreenAuthorizationInteractor.swift")
+        let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        for forbidden in [
+            "AXUIElementCopyActionNames",
+            "AXUIElementPerformAction",
+            "kAXConfirmAction",
+            "kAXPressAction",
+        ] {
+            XCTAssertFalse(
+                source.contains(forbidden),
+                "the lock-screen interactor regained forbidden AX action API \(forbidden)")
+        }
     }
 
     func testSubmissionPreflightFailurePublishesNoGrant() {
@@ -530,7 +587,7 @@ final class AccessibilityRoutingTests: XCTestCase {
             try SystemLockScreenAuthorizationInteractor.performGrantGatedSubmission(
                 preflight: { () -> String in
                     throw LockScreenAuthorizationError(
-                        "the exact field exposes no confirmation action")
+                        "the exact field's empty value is not settable")
                 },
                 prepareGrant: {
                     grantPreparationCount += 1
@@ -542,13 +599,13 @@ final class AccessibilityRoutingTests: XCTestCase {
                 submit: { _ in submissionCount += 1 })) { error in
             XCTAssertEqual(
                 (error as? LockScreenAuthorizationError)?.detail,
-                "the exact field exposes no confirmation action")
+                "the exact field's empty value is not settable")
         }
         XCTAssertEqual(grantPreparationCount, 0)
         XCTAssertEqual(submissionCount, 0)
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: grantPath),
-            "failed value/action preflight published ambient grant authority")
+            "failed empty-value readiness published ambient grant authority")
     }
 
     func testLoginwindowReplacementBeforeGrantPublishesAndSubmitsNothing() {
@@ -556,8 +613,8 @@ final class AccessibilityRoutingTests: XCTestCase {
         var submissionCount = 0
         XCTAssertThrowsError(
             try SystemLockScreenAuthorizationInteractor.performGrantGatedSubmission(
-                preflight: { kAXConfirmAction as String },
-                revalidateBeforeGrant: {
+                preflight: { "exact-ready-field" },
+                revalidateBeforeGrant: { _ in
                     throw LockScreenAuthorizationError(
                         "loginwindow instance changed before grant")
                 },
@@ -567,38 +624,71 @@ final class AccessibilityRoutingTests: XCTestCase {
         XCTAssertEqual(submissionCount, 0)
     }
 
-    func testLoginwindowReplacementAfterEmptyWritePerformsNoActionOrRetry() {
-        var emptyWriteCount = 0
-        var actionCount = 0
-        var sameInstance = true
+    func testLoginwindowReplacementAfterGrantBeforeEmptyWriteConsumesNoMutation() {
+        struct PreparedField: Equatable {
+            let applicationInstance: Int
+            let processIdentifier: pid_t
+            let elementInstance: Int
+        }
+        let prepared = PreparedField(
+            applicationInstance: 1, processIdentifier: 41, elementInstance: 7)
+        let samePIDReplacement = PreparedField(
+            applicationInstance: 2, processIdentifier: 41, elementInstance: 8)
+        let current = samePIDReplacement
+        var writeCount = 0
+        var callbackCount = 0
+
         XCTAssertThrowsError(
-            try SystemLockScreenAuthorizationInteractor.performSingleSubmission(
-                prepareEmptyValue: {
-                    XCTAssertTrue(sameInstance)
-                    emptyWriteCount += 1
-                    sameInstance = false
-                },
-                confirm: {
-                    guard sameInstance else {
+            try SystemLockScreenAuthorizationInteractor.writePreparedEmptyValue(
+                prepared,
+                revalidate: { expected in
+                    guard current == expected else {
                         throw LockScreenAuthorizationError(
-                            "loginwindow instance changed before action")
+                            "exact loginwindow instance changed after grant")
                     }
-                    actionCount += 1
-                }))
-        XCTAssertEqual(emptyWriteCount, 1)
-        XCTAssertEqual(actionCount, 0)
+                },
+                write: { _ in writeCount += 1 },
+                didWrite: { callbackCount += 1 })) { error in
+            XCTAssertEqual(
+                (error as? LockScreenAuthorizationError)?.detail,
+                "exact loginwindow instance changed after grant")
+        }
+        XCTAssertEqual(current.processIdentifier, prepared.processIdentifier)
+        XCTAssertEqual(writeCount, 0)
+        XCTAssertEqual(callbackCount, 0)
     }
 
-    func testPreparedSubmissionCallsGrantExactlyOnceBeforeMutation() throws {
+    func testPreparedSubmissionOrdersReadinessRevalidationGrantAndSingleEmptyWrite() throws {
         var events: [String] = []
         try SystemLockScreenAuthorizationInteractor.performGrantGatedSubmission(
             preflight: {
-                events.append("preflight")
-                return kAXConfirmAction as String
+                events.append("exact-field-focus-readback-value-settable")
+                return "exact-ready-field"
+            },
+            revalidateBeforeGrant: { field in
+                XCTAssertEqual(field, "exact-ready-field")
+                events.append("identity-input-lock-revalidation")
             },
             prepareGrant: { events.append("grant") },
-            submit: { action in events.append("submit:\(action)") })
+            submit: { field in
+                XCTAssertEqual(field, "exact-ready-field")
+                try SystemLockScreenAuthorizationInteractor
+                    .performSingleEmptyValueSubmission(
+                        writeEmptyValue: {
+                            events.append("single-empty-value-write")
+                        },
+                        didWrite: {
+                            events.append("empty-value-written-audit")
+                        })
+            })
         XCTAssertEqual(
-            events, ["preflight", "grant", "submit:\(kAXConfirmAction as String)"])
+            events,
+            [
+                "exact-field-focus-readback-value-settable",
+                "identity-input-lock-revalidation",
+                "grant",
+                "single-empty-value-write",
+                "empty-value-written-audit",
+            ])
     }
 }

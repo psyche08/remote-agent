@@ -655,6 +655,11 @@ public final class LockedUseController: @unchecked Sendable {
                                 event: "grant_published", turnID: turnID,
                                 noncePrefix: Self.noncePrefix(minted.1.nonce))
                         },
+                        emptyValueWritten: {
+                            self.audit(
+                                event: "authorization_empty_value_written",
+                                turnID: turnID)
+                        },
                         completionReceiptObserved: {
                             guard let payload = attempt.payload else {
                                 throw LockedUseError.systemFailure(

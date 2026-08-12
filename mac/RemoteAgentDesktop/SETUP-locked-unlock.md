@@ -19,12 +19,14 @@ element 且系统保持 locked；complete 后才能接受 field lifecycle comple
 字段都回验同一 PID，绝不信任 system-wide focused application，也不 activate/frontmost 进程。
 搜索按 focused UI element、focused window、windows、application root 去重后做有界 BFS，不使用
 role/title fallback，也不读取字段值。随后在最长 8 秒的不授权、pre-submission 阶段查找并 focus
-exact `UserPasswordTextField`，并等待空 `AXValue` 可写性和
-exact AXConfirm/AXPress action 同时 ready；这期间磁盘上没有 grant。全部 ready 后先记录
+exact `UserPasswordTextField`，读回 focus，并等待空 `AXValue` 可写；这期间磁盘上没有 grant。
+全部 ready 后先记录
 `authorization_field_ready`，
 controller callback 重新核对 opening owner、真人输入、locked state 和 primary console user，
-再按当前时间 mint/write 10 秒 grant，随后只执行一次空 `AXValue` + 预选的 AXConfirm/AXPress action。callback 前取消、
-真人输入或 discovery 失败不会发布 grant；callback 后 AX 失败不会重新 mint、rewrite 或 submit。
+再按当前时间 mint/write 10 秒 grant，随后只执行一次空 `AXValue`，不发现或执行 secure-field AX
+action；成功写入立即记录不含 nonce/secret 的 `authorization_empty_value_written`。callback 前取消、
+真人输入或 discovery 失败不会发布 grant；callback 后 AX 失败不会重新 mint、rewrite 或 submit，
+proof/lifecycle 不确定仍进入原有 fail-closed/quarantine 路径。
 
 ## 0. 前提与恢复路径
 
@@ -67,6 +69,18 @@ authorizationdb 和 AgentHalo 版本以 [STATUS-and-TODO.md](STATUS-and-TODO.md)
   authorizationdb 写入或真实锁屏解锁 E2E。
 
 正式部署仍必须在具有有效 Developer ID 的目标 Mac 上完成本文后续步骤和真机门禁。
+
+### m4pro 当前复测点（2026-08-12）
+
+`AgentHalo.7`（`f6941d2`）已经正式签名、公证并部署。其真机尝试已出现
+`authorization_field_ready -> grant_published`，证明 exact loginwindow PID/root/field 路由生效；
+但空值写入后追加 AXConfirm/AXPress 的组合路径中 field 消失，未出现可归因的 authd transaction，也没有
+pending/final/complete proof。任务安全结束为 `needs_manual` / `delivery_outcome=unknown`，无 CLI
+fallback 或重复输入，grant/window/shield 已收口且机器保持锁定。
+
+`AgentHalo.8` 源码把触发面收窄为 grant 后唯一一次空 `AXValue` 写入，并增加
+`authorization_empty_value_written` 审计。它**尚待正式签名、公证、部署和真实锁屏复测**；本文不预判
+空写一定能触发目标 macOS，旧 `remote-agent` 在全套 E2E 门禁通过前继续保留。
 
 ## 1. 配置设备能力
 
@@ -284,10 +298,11 @@ Claude 是主验收路径：
   坐标或旧截图坐标混入当前观察；
 - 模型至少成功执行一次 `press`/`set_value` 和一次键鼠动作；
 - Claude transcript 精确显示 question→answer，并分别完成 exact `Allow once` 与 `Deny`；
-- helper audit 出现同一 turn 的 `grant_published`、`grant_consumed`、`window_opened`、
-  `window_closed`；
+- helper audit 出现同一 turn 的 `grant_published`、`authorization_empty_value_written`、
+  `grant_consumed`、`window_opened`、`window_closed`；
 - `grant_published` 必须晚于 wake 后 exact field ready；较慢的 loginwindow UI discovery 不得占用
-  grant TTL；同一 turn 的 `authorization_field_ready` 必须早于 `grant_published`；
+  grant TTL；同一 turn 必须满足 `authorization_field_ready -> grant_published ->
+  authorization_empty_value_written`，且 empty-write marker 只能出现一次；
   `authorization_request_returned` 失败项必须带不含 nonce/secret 的诊断 `reason`；
 - root-owned `pending`、`final`、`complete` 均匹配同一 nonce，且日志/时序显示
   complete 之前 exact field 保持同一且系统保持 locked；

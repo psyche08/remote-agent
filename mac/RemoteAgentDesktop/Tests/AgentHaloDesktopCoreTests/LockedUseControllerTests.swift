@@ -124,6 +124,7 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
     func requestUnlockAuthorization(
         authorizationFieldReady: @Sendable () -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWritten: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool
     ) throws {
         mutex.lock()
@@ -153,6 +154,7 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
         let failureAfterPreparation = authorizationFailureAfterPreparation
         mutex.unlock()
         if let failureAfterPreparation { throw failureAfterPreparation }
+        emptyValueWritten()
 
         let grantPath = (directory as NSString)
             .appendingPathComponent(GrantContract.fileName)
@@ -514,6 +516,7 @@ final class UnavailableSystem: LockedUseSystem, @unchecked Sendable {
     func requestUnlockAuthorization(
         authorizationFieldReady: @Sendable () -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWritten: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool
     ) throws { throw LockedUseError.unsupported }
     func run(_ action: Action) throws -> DesktopService.ActionResult {
@@ -1383,10 +1386,17 @@ final class LockedUseControllerTests: XCTestCase {
             openDone.close()
         }
         XCTAssertTrue(system.receiptPublished.wait(timeout: 2))
+        XCTAssertTrue(
+            controller.auditEntries().contains {
+                $0.event == "authorization_empty_value_written" &&
+                    $0.noncePrefix == nil
+            },
+            "the successful credential-free write was not audited before proof wait")
 
-        // Apple Watch/a person wins before this mechanism instance reaches its
-        // exact terminal. The exact field disappears with that unrelated
-        // unlock, while this grant's own visible transition remains delayed.
+        // The empty SetValue has succeeded and final exists, but completion is
+        // still held. Apple Watch/a person now wins before this mechanism
+        // reaches its exact terminal. The exact field disappears with that
+        // unrelated unlock, while this grant's own transition remains delayed.
         system.setAuthorizationUIState(fieldValid: false, locked: false)
         DispatchQueue.global().async {
             closeOutcomes.add(
@@ -1419,6 +1429,11 @@ final class LockedUseControllerTests: XCTestCase {
             controller.auditEntries().contains { $0.event == "quarantine_resolved" })
         XCTAssertFalse(
             controller.auditEntries().contains { $0.event == "window_opened" })
+        XCTAssertFalse(
+            controller.auditEntries().contains {
+                $0.event == "authorization_ui_completed"
+            },
+            "field loss before complete was incorrectly accepted as UI completion")
     }
 
     func testWithdrawalWaitsForVerifierAndRechecksProofAfterGrantDeadline() {
@@ -1964,6 +1979,20 @@ extension LockedUseControllerTests {
         XCTAssertEqual(system.grantPreparationCallbackCount, 1)
         XCTAssertEqual(
             controller.auditEntries().filter { $0.event == "grant_published" }.count, 1)
+        let authorizationEvents = controller.auditEntries().map(\.event)
+        guard let fieldReadyIndex = authorizationEvents.firstIndex(
+            of: "authorization_field_ready"),
+            let grantIndex = authorizationEvents.firstIndex(of: "grant_published"),
+            let emptyWriteIndex = authorizationEvents.firstIndex(
+                of: "authorization_empty_value_written") else {
+            return XCTFail("the authorization trigger audit sequence is incomplete")
+        }
+        XCTAssertLessThan(fieldReadyIndex, grantIndex)
+        XCTAssertLessThan(grantIndex, emptyWriteIndex)
+        XCTAssertEqual(
+            authorizationEvents.filter { $0 == "authorization_empty_value_written" }.count,
+            1,
+            "the successful empty-value trigger was not audited exactly once")
         let payload = try? XCTUnwrap(system.lastGrantPayload)
         XCTAssertGreaterThanOrEqual(payload?.issuedAt ?? 0, fieldReadyReleasedAt)
         XCTAssertEqual(
@@ -1979,7 +2008,7 @@ extension LockedUseControllerTests {
         let system = FakeSystem()
         system.setAuthorizationFailureBeforePreparation(
             LockScreenAuthorizationError(
-                "lock-screen value/action readiness did not complete"))
+                "lock-screen empty-value readiness did not complete"))
         let controller = makeController(system: system)
 
         XCTAssertThrowsError(
@@ -1995,7 +2024,7 @@ extension LockedUseControllerTests {
         let returned = controller.auditEntries().last {
             $0.event == "authorization_request_returned"
         }
-        XCTAssertTrue(returned?.reason?.contains("value/action readiness") == true)
+        XCTAssertTrue(returned?.reason?.contains("empty-value readiness") == true)
         let grantPath = (system.grantDirectory as NSString)
             .appendingPathComponent(GrantContract.fileName)
         XCTAssertFalse(FileManager.default.fileExists(atPath: grantPath))
@@ -2049,6 +2078,12 @@ extension LockedUseControllerTests {
         XCTAssertEqual(
             controller.auditEntries().filter { $0.event == "grant_published" }.count, 1,
             "an ambiguous AX failure reminted or rewrote grant authority")
+        XCTAssertEqual(
+            controller.auditEntries().filter {
+                $0.event == "authorization_empty_value_written"
+            }.count,
+            0,
+            "a failed empty assignment was reported as a successful trigger")
         let returned = controller.auditEntries().last {
             $0.event == "authorization_request_returned"
         }

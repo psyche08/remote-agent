@@ -159,17 +159,22 @@ if grep -q 'UserPasswordTextField' "$INTERACTOR" 2>/dev/null && \
    grep -q 'discoveryTimeout: TimeInterval = 8' "$INTERACTOR" 2>/dev/null && \
    grep -q 'try prepareGrant()' "$INTERACTOR" 2>/dev/null && \
    grep -q 'submissionDeadline' "$INTERACTOR" 2>/dev/null && \
-   grep -q 'kAXConfirmAction' "$INTERACTOR" 2>/dev/null && \
    grep -q 'preflightEmptySubmission' "$INTERACTOR" 2>/dev/null && \
-   grep -q 'confirmationAction' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'performCredentialFreeFieldReadiness' "$INTERACTOR" 2>/dev/null && \
    grep -q 'performGrantGatedSubmission' "$INTERACTOR" 2>/dev/null && \
    grep -q 'writeEmptySubmission' "$INTERACTOR" 2>/dev/null && \
-   grep -q 'performSingleSubmission' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'performSingleEmptyValueSubmission' "$INTERACTOR" 2>/dev/null && \
    grep -q 'AXUIElementIsAttributeSettable' "$INTERACTOR" 2>/dev/null && \
    grep -q 'kAXValueAttribute as CFString, "" as CFString' "$INTERACTOR" 2>/dev/null; then
   pass "exact-loginwindow PID, bounded field search, pregrant gate, and single empty-value submission wiring present"
 else
   fail "the bounded exact-PID two-phase credential-free loginwindow AX authorization interactor is missing"
+fi
+if grep -qE 'AXUIElementCopyActionNames|AXUIElementPerformAction|kAXConfirmAction|kAXPressAction' \
+     "$INTERACTOR" 2>/dev/null; then
+  fail "lock-screen authorization discovers or performs an AX action after the empty-value trigger"
+else
+  pass "lock-screen authorization contains no AX action discovery or performance path"
 fi
 if grep -q 'kAXFocusedApplicationAttribute' "$INTERACTOR" 2>/dev/null || \
    grep -qE '\.activate[[:space:]]*\(|activateIgnoringOtherApps|SetFrontProcess' "$INTERACTOR" 2>/dev/null; then
