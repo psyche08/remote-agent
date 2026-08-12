@@ -9,6 +9,7 @@ import Foundation
 public protocol LockScreenAuthorizationRequesting: Sendable {
     func requestAuthorization(
         authorizationFieldReady: @Sendable () -> Void,
+        releaseRemoteUserActivity: @Sendable () throws -> Void,
         prepareGrant: @Sendable () throws -> Void,
         emptyValueWritten: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool,
@@ -298,11 +299,15 @@ public final class SystemLockScreenAuthorizationInteractor:
     static func performGrantGatedSubmission<PreparedField>(
         preflight: () throws -> PreparedField,
         revalidateBeforeGrant: (PreparedField) throws -> Void = { _ in },
+        authorizationFieldReady: () -> Void = {},
+        releaseRemoteUserActivity: () throws -> Void = {},
         prepareGrant: () throws -> Void,
         submit: (PreparedField) throws -> Void
     ) throws {
         let preparedField = try preflight()
         try revalidateBeforeGrant(preparedField)
+        authorizationFieldReady()
+        try releaseRemoteUserActivity()
         try prepareGrant()
         try submit(preparedField)
     }
@@ -327,6 +332,7 @@ public final class SystemLockScreenAuthorizationInteractor:
 
     public func requestAuthorization(
         authorizationFieldReady: @Sendable () -> Void,
+        releaseRemoteUserActivity: @Sendable () throws -> Void,
         prepareGrant: @Sendable () throws -> Void,
         emptyValueWritten: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool,
@@ -387,13 +393,13 @@ public final class SystemLockScreenAuthorizationInteractor:
                     expected: preparedField.processIdentifier,
                     deadline: deadline)
             },
-            prepareGrant: {
-                // Called exactly once only after every pregrant readiness
-                // check passed. The controller revalidates the turn and mints
-                // from now inside this callback.
-                authorizationFieldReady()
-                try prepareGrant()
-            },
+            // Keep the remote user-activity assertion alive through exact
+            // field discovery, focus readback, value readiness, and identity
+            // revalidation. Then synchronously release it before the
+            // controller is allowed to mint or write any grant.
+            authorizationFieldReady: authorizationFieldReady,
+            releaseRemoteUserActivity: releaseRemoteUserActivity,
+            prepareGrant: prepareGrant,
             submit: { preparedField in
                 // Freshly bound after grant preparation, so slow wake,
                 // discovery, focus, and readiness checks consume none of this

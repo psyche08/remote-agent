@@ -186,99 +186,6 @@ public final class DesktopService: @unchecked Sendable {
         lock.unlock()
     }
 
-    /// Posts a single synthetic event to make the login window notice user
-    /// activity.
-    ///
-    /// Publishing a grant does not make macOS evaluate anything. The unlock
-    /// begins when loginwindow sees the user-activity state go active — its own
-    /// log calls it "user event received, start an unlock with 'active user' as
-    /// the reason" — and only then is the authorization right evaluated, which
-    /// is where a grant can authorize anything at all.
-    ///
-    /// What matters is the *transition*, not the event: a machine already
-    /// considered active produces no transition and no unlock. The controller
-    /// requires the device to be idle before opening a window, so by the time
-    /// this runs the state is inactive and this one event flips it.
-    ///
-    /// It is marked as ours like any other synthetic post, so the presence
-    /// safeguard does not read the agent knocking on the door as a person
-    /// arriving at it.
-    public func provokeUnlockAttempt() throws {
-        guard let cursorEvent = CGEvent(source: nil) else {
-            throw ActionError("could not read the current pointer position")
-        }
-        let current = cursorEvent.location
-        // Active displays may be reported as an empty list while the screens
-        // are asleep — precisely the unattended Locked Use case. Online
-        // display geometry remains available and is enough to constrain this
-        // one wake move without changing capture/pointer active-display rules.
-        let displayFrames = try onlineDisplayFrames()
-        let position = try Self.wakeProbePoint(
-            current: current, displayFrames: displayFrames)
-        let source = try eventSource()
-        // A move rather than a click or a keystroke: at the login window a
-        // click lands somewhere and a keystroke lands in the password field.
-        // A move is the least the system can be asked to notice.
-        guard let event = CGEvent(
-            mouseEventSource: source, mouseType: .mouseMoved,
-            mouseCursorPosition: position, mouseButton: .left) else {
-            throw ActionError("could not create the lock-screen wake event")
-        }
-        // Core Graphics owns the final event coordinate. Re-read it before
-        // attributing or posting anything: a rounded/no-op coordinate or a
-        // move that escaped the cursor's exact display is not a valid wake
-        // probe and must expose no grant window.
-        let encodedPosition = event.location
-        guard encodedPosition == position, encodedPosition != current,
-              let currentDisplay = displayFrames.first(where: {
-                  Self.displayFrame($0, contains: current)
-              }),
-              Self.displayFrame(currentDisplay, contains: encodedPosition) else {
-            throw ActionError("lock-screen wake event did not preserve its display")
-        }
-        // Attribute the post only once an event is ready. On every successful
-        // path this remains ordered before InputGuard's marker and the HID
-        // post; failures do not leave behind a synthetic-input timestamp for
-        // an event that never existed.
-        markSyntheticPost()
-        postAgentEvent(event)
-    }
-
-    /// Selects a one-point move that cannot collapse into the current cursor
-    /// position. Reposting the old fixed `(1, 1)` coordinate becomes a spatial
-    /// no-op after the first attempt, and loginwindow then sees no inactive to
-    /// active transition even though TCC accepts the event.
-    ///
-    /// The cursor and destination must be on the same exact display. A cursor
-    /// reported in a layout gap, invalid geometry, or a display too narrow to
-    /// admit a one-point move fails closed rather than warping across screens.
-    static func wakeProbePoint(
-        current: CGPoint, displayFrames: [CGRect]
-    ) throws -> CGPoint {
-        guard current.x.isFinite, current.y.isFinite,
-              validDisplayBounds(displayFrames) != nil else {
-            throw ActionError("could not choose a lock-screen wake position")
-        }
-
-        guard let currentDisplay = displayFrames.first(where: {
-            Self.displayFrame($0, contains: current)
-        }) else {
-            throw ActionError("could not choose a lock-screen wake position")
-        }
-        let candidates = [
-            CGPoint(x: current.x + 1, y: current.y),
-            CGPoint(x: current.x - 1, y: current.y),
-            CGPoint(x: current.x, y: current.y + 1),
-            CGPoint(x: current.x, y: current.y - 1),
-        ]
-        guard let point = candidates.first(where: {
-            $0 != current && Self.displayFrame(currentDisplay, contains: $0)
-        }) else {
-            throw ActionError("online display cannot admit a one-point wake move")
-        }
-        return point
-    }
-
     // MARK: - Display shield
 
     public func engageShield() -> (engaged: Bool, displays: Int) {
@@ -421,32 +328,6 @@ public final class DesktopService: @unchecked Sendable {
         let frames = displayIDs.prefix(Int(filled)).map(CGDisplayBounds)
         guard Self.validDisplayBounds(frames) != nil else {
             throw ActionError("active display geometry is invalid")
-        }
-        return frames
-    }
-
-    private func onlineDisplayFrames() throws -> [CGRect] {
-        var count: UInt32 = 0
-        guard CGGetOnlineDisplayList(0, nil, &count) == .success, count > 0 else {
-            throw ActionError("could not read online display geometry")
-        }
-        var displayIDs = [CGDirectDisplayID](repeating: 0, count: Int(count))
-        var filled: UInt32 = 0
-        let result = displayIDs.withUnsafeMutableBufferPointer { buffer in
-            CGGetOnlineDisplayList(count, buffer.baseAddress, &filled)
-        }
-        guard result == .success, filled > 0, filled <= count else {
-            throw ActionError("could not read online display geometry")
-        }
-        // Mirrored outputs can report identical bounds. They are one pointer
-        // coordinate space, so retain each exact frame only once.
-        var frames: [CGRect] = []
-        for displayID in displayIDs.prefix(Int(filled)) {
-            let frame = CGDisplayBounds(displayID)
-            if !frames.contains(frame) { frames.append(frame) }
-        }
-        guard Self.validDisplayBounds(frames) != nil else {
-            throw ActionError("online display geometry is invalid")
         }
         return frames
     }

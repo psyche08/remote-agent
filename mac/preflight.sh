@@ -475,8 +475,10 @@ if [ "$FAILED" -eq 0 ]; then
 
   Next, in order:
     1. Re-run with --check-shield --check-lock to exercise the disruptive paths.
-    2. With locked_use still off, start a new Codex turn and verify
-       get_app_state -> one mutation -> get_app_state on the ordinary desktop.
+    2. Start a fresh Claude logical session and verify the primary
+       desktop_computer_use route with get_app_state -> one mutation ->
+       get_app_state on the ordinary desktop. The Claude CLI is only a
+       pre-mutation capability fallback.
     3. Follow mac/RemoteAgentDesktop/SETUP-locked-unlock.md from the signing
        checks onward. Install the plug-in on a spare Mac or VM first: it changes
        the system.login.screensaver authorization right.

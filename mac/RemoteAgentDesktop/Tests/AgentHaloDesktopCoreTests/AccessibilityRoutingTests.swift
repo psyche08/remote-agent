@@ -624,6 +624,66 @@ final class AccessibilityRoutingTests: XCTestCase {
         XCTAssertEqual(submissionCount, 0)
     }
 
+    func testRemoteActivityStaysAliveThroughFieldReadyAndReleasesBeforeGrant() throws {
+        var events: [String] = []
+        var activityAlive = true
+
+        try SystemLockScreenAuthorizationInteractor.performGrantGatedSubmission(
+            preflight: {
+                events.append("exact-field-ready")
+                return "prepared-field"
+            },
+            revalidateBeforeGrant: { _ in
+                XCTAssertTrue(activityAlive)
+                events.append("field-identity-revalidated")
+            },
+            authorizationFieldReady: {
+                XCTAssertTrue(activityAlive)
+                events.append("field-ready-audit")
+            },
+            releaseRemoteUserActivity: {
+                XCTAssertTrue(activityAlive)
+                activityAlive = false
+                events.append("remote-activity-released")
+            },
+            prepareGrant: {
+                XCTAssertFalse(activityAlive)
+                events.append("grant")
+            },
+            submit: { _ in events.append("empty-value-write") })
+
+        XCTAssertEqual(
+            events,
+            [
+                "exact-field-ready", "field-identity-revalidated",
+                "field-ready-audit", "remote-activity-released", "grant",
+                "empty-value-write",
+            ])
+    }
+
+    func testRemoteActivityReleaseFailurePublishesAndWritesNothing() {
+        var grantCount = 0
+        var writeCount = 0
+
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor
+                .performGrantGatedSubmission(
+                    preflight: { "prepared-field" },
+                    authorizationFieldReady: {},
+                    releaseRemoteUserActivity: {
+                        throw LockScreenAuthorizationError(
+                            "remote activity release failed")
+                    },
+                    prepareGrant: { grantCount += 1 },
+                    submit: { _ in writeCount += 1 })) { error in
+            XCTAssertEqual(
+                (error as? LockScreenAuthorizationError)?.detail,
+                "remote activity release failed")
+        }
+        XCTAssertEqual(grantCount, 0)
+        XCTAssertEqual(writeCount, 0)
+    }
+
     func testLoginwindowReplacementAfterGrantBeforeEmptyWriteConsumesNoMutation() {
         struct PreparedField: Equatable {
             let applicationInstance: Int

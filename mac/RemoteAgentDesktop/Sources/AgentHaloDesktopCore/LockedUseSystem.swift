@@ -98,15 +98,28 @@ public protocol LockedUseSystem: AnyObject, Sendable {
 public final class DesktopSystem: LockedUseSystem {
     private let desktop: DesktopService
     private let lockScreenAuthorization: LockScreenAuthorizationRequesting
+    private let remoteUserActivityPowerAPI: RemoteUserActivityPowerAPI
     private let observedLockState = ObservedLockStateGeneration()
 
-    public init(
+    public convenience init(
         desktop: DesktopService,
         lockScreenAuthorization: LockScreenAuthorizationRequesting =
             SystemLockScreenAuthorizationInteractor()
     ) {
+        self.init(
+            desktop: desktop,
+            lockScreenAuthorization: lockScreenAuthorization,
+            remoteUserActivityPowerAPI: .system)
+    }
+
+    init(
+        desktop: DesktopService,
+        lockScreenAuthorization: LockScreenAuthorizationRequesting,
+        remoteUserActivityPowerAPI: RemoteUserActivityPowerAPI
+    ) {
         self.desktop = desktop
         self.lockScreenAuthorization = lockScreenAuthorization
+        self.remoteUserActivityPowerAPI = remoteUserActivityPowerAPI
     }
 
     public func isLocked() throws -> Bool { try lockStateSnapshot().isLocked }
@@ -141,15 +154,60 @@ public final class DesktopSystem: LockedUseSystem {
         completionReceiptObserved: @Sendable () throws -> Bool
     ) throws {
         // A grant on disk does not itself make loginwindow evaluate the unlock
-        // right. Wake the lock screen first, then drive its own authorization
-        // control. No password is read, stored, or injected on this path.
-        try desktop.provokeUnlockAttempt()
-        try lockScreenAuthorization.requestAuthorization(
-            authorizationFieldReady: authorizationFieldReady,
-            prepareGrant: prepareGrant,
-            emptyValueWritten: emptyValueWritten,
-            completionReceiptObserved: completionReceiptObserved,
-            isLocked: { [self] in try isLocked() })
+        // right. Declare exactly one public remote user-activity assertion to
+        // power the display and stage loginwindow, then keep that lease alive
+        // only through credential-free exact-field readiness. No password is
+        // read, stored, or injected on this path.
+        let activity = try desktop.beginRemoteUserActivity(
+            using: remoteUserActivityPowerAPI)
+        do {
+            try lockScreenAuthorization.requestAuthorization(
+                authorizationFieldReady: authorizationFieldReady,
+                releaseRemoteUserActivity: { try activity.release() },
+                prepareGrant: {
+                    // Do not rely solely on callback ordering inside a
+                    // protocol conformer. The lease itself must atomically
+                    // prove a successful release before ambient authority can
+                    // be minted or written.
+                    try activity.requireReleasedBeforeGrant()
+                    try prepareGrant()
+                },
+                emptyValueWritten: emptyValueWritten,
+                completionReceiptObserved: completionReceiptObserved,
+                isLocked: { [self] in try isLocked() })
+        } catch {
+            let operationError = error
+            do {
+                try activity.release()
+            } catch {
+                let cleanupError = error
+                // A release callback can itself be the operation failure. Its
+                // idempotent cleanup call replays the same terminal error; do
+                // not turn that into a misleading duplicated diagnostic.
+                if let operation = operationError as? RemoteUserActivityError,
+                   let cleanup = cleanupError as? RemoteUserActivityError,
+                   operation == cleanup {
+                    throw operationError
+                }
+                throw LockedUseError.systemFailure(
+                    "lock-screen authorization failed: " +
+                    Self.boundedErrorDetail(operationError) +
+                    "; remote user-activity cleanup also failed: " +
+                    Self.boundedErrorDetail(cleanupError))
+            }
+            throw operationError
+        }
+        // A conformer returning without invoking the release gate must not
+        // silently leak the assertion. This also propagates a release failure
+        // on the otherwise-successful body path.
+        try activity.release()
+    }
+
+    private static func boundedErrorDetail(_ error: Error) -> String {
+        let printable = String(describing: error).unicodeScalars.map { scalar in
+            CharacterSet.controlCharacters.contains(scalar) ? " " : String(scalar)
+        }.joined()
+        return String(printable.prefix(240))
     }
 
     public func releaseShield() throws { desktop.releaseShield() }

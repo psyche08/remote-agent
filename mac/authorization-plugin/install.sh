@@ -226,9 +226,9 @@ fi
 #
 # system.login.screensaver is a `rule` class right whose rule list is evaluated
 # k-of-n with k = 1: the first branch that authorizes wins, and
-# `use-login-window-ui` — the password prompt — is the last branch. So the
-# mechanism goes into its own evaluate-mechanisms rule, and that rule's name
-# goes into the list ahead of the password branch.
+# `use-login-window-ui` — the password prompt — remains available. So the
+# mechanism goes into its own evaluate-mechanisms rule, and that exact rule is
+# deduplicated into list index zero without moving or removing any other rule.
 #
 # Writing a `mechanisms` key onto a rule-class right, which is what this script
 # used to do, is silently discarded: the plug-in installs, the script reports
@@ -291,18 +291,13 @@ if kind == "rule":
     if not isinstance(rules, list) or "use-login-window-ui" not in rules:
         sys.stderr.write("rule-class right has no use-login-window-ui password fallback\n")
         sys.exit(2)
-    first_product = next((i for i, value in enumerate(rules) if value == rule_name), None)
+    # k-of-n=1 is evaluated in list order. AgentHalo is the product's primary
+    # Computer Use + Locked Use path, so remove every stale duplicate and put
+    # the exact rule first. The comprehension preserves every other plug-in and
+    # the password fallback in their original relative order. Re-running this
+    # transformation therefore produces the same list byte-for-byte.
     retained = [value for value in rules if value != rule_name]
-    password_at = retained.index("use-login-window-ui")
-    if first_product is None:
-        at = password_at
-    else:
-        # Preserve an existing AgentHalo branch's relative position when safe,
-        # forcing the migrated branch ahead of the password fallback.
-        before_product = sum(1 for value in rules[:first_product] if value != rule_name)
-        at = min(before_product, password_at)
-    retained.insert(at, rule_name)
-    right["rule"] = retained
+    right["rule"] = [rule_name] + retained
 elif kind == "evaluate-mechanisms":
     mechanisms = right.get("mechanisms", [])
     if not isinstance(mechanisms, list):
@@ -330,38 +325,52 @@ fi
 security authorizationdb write "$RIGHT" < "$TMP.new"
 echo "==> registered $RULE_NAME in $RIGHT"
 
-# Confirm the live right has exactly one AgentHalo branch and that the ordinary
-# password path remains reachable.
+# Confirm the live right has exactly one index-zero AgentHalo branch, that the
+# ordinary password path remains reachable, and that authorizationdb retained
+# every other branch/mechanism in its original relative order.
 if ! security authorizationdb read "$RIGHT" > "$TMP.current" 2>/dev/null; then
   echo "could not read $RIGHT after registration; keeping the installed bundle for recovery" >&2
   exit 1
 fi
-if ! /usr/bin/python3 - "$TMP.current" "$RULE_NAME" "$MECHANISM" <<'PYEOF'
+if ! /usr/bin/python3 - "$TMP.current" "$TMP" "$RULE_NAME" "$MECHANISM" <<'PYEOF'
 import plistlib, sys
-path, rule_name, mechanism = sys.argv[1:4]
-with open(path, "rb") as f:
+current_path, original_path, rule_name, mechanism = sys.argv[1:5]
+with open(current_path, "rb") as f:
     right = plistlib.load(f)
+with open(original_path, "rb") as f:
+    original = plistlib.load(f)
 kind = right.get("class")
 if kind == "rule":
     rules = right.get("rule", [])
+    original_rules = original.get("rule", [])
+    expected = ([rule_name]
+                + [value for value in original_rules if value != rule_name])
     ok = (isinstance(rules, list)
+          and isinstance(original_rules, list)
           and rules.count(rule_name) == 1
+          and rules[0] == rule_name
           and "use-login-window-ui" in rules
-          and rules.index(rule_name) < rules.index("use-login-window-ui"))
+          and rules == expected)
 elif kind == "evaluate-mechanisms":
     mechanisms = right.get("mechanisms", [])
+    original_mechanisms = original.get("mechanisms", [])
+    expected = ([mechanism]
+                + [value for value in original_mechanisms if value != mechanism])
     ok = (isinstance(mechanisms, list)
+          and isinstance(original_mechanisms, list)
           and mechanisms.count(mechanism) == 1
-          and any(value != mechanism for value in mechanisms))
+          and mechanisms[0] == mechanism
+          and any(value != mechanism for value in mechanisms)
+          and mechanisms == expected)
 else:
     ok = False
 raise SystemExit(0 if ok else 1)
 PYEOF
 then
-  echo "$RIGHT did not retain the exact AgentHalo branch and password fallback" >&2
+  echo "$RIGHT did not retain AgentHalo first, the password fallback, and every other authorization branch" >&2
   exit 1
 fi
-echo "==> verified: exactly one AgentHalo branch is present in $RIGHT"
+echo "==> verified: exactly one index-zero AgentHalo branch is present in $RIGHT"
 
 echo
 echo "==> done."

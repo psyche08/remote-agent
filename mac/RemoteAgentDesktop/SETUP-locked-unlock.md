@@ -14,19 +14,19 @@ Apple Authorization Plug-in 对短时、单次、签名 grant 作出 Allow；普
 `MechanismDestroy` 写入。complete 前 loginwindow password field 必须保持同一 AX
 element 且系统保持 locked；complete 后才能接受 field lifecycle completion + unlocked。
 
-锁屏 wake 和 loginwindow UI ready 是两个时刻。helper 先读取当前 CG cursor，并只向同一 online
-display 内严格不同的 `+/-1` 点发送一次 agent-marked `mouseMoved`；cursor 若落在显示器布局空洞或
-不属于任何 online display 则失败关闭。wake 使用 online-display geometry，因此显示器睡眠、active display
-列表为空时仍能产生这一次移动；它不点击、不按键、不重试，cursor/display/event 任一不可读都显式失败，且不会
-发布 grant。随后 helper 只从唯一的 exact
+锁屏 wake 和 loginwindow UI ready 是两个时刻。helper 只调用一次 Apple 公开
+`IOPMAssertionDeclareUserActivity`，固定传入长度小于 128 的 AgentHalo name 与
+`kIOPMUserActiveRemote`；它不发送 wake CGEvent，不读 cursor/display geometry，不点击、不按键、
+不重申也不切换 Local。只有 declare success 且返回非 null assertion ID 才继续；否则失败关闭且
+0 grant。随后 helper 只从唯一的 exact
 `com.apple.loginwindow` system bundle/executable 对应 PID 创建 AX application root；root、搜索种子和
 字段都回验同一 PID，绝不信任 system-wide focused application，也不 activate/frontmost 进程。
 搜索按 focused UI element、focused window、windows、application root 去重后做有界 BFS，不使用
 role/title fallback，也不读取字段值。随后在最长 8 秒的不授权、pre-submission 阶段查找并 focus
-exact `UserPasswordTextField`，读回 focus，并等待空 `AXValue` 可写；这期间磁盘上没有 grant。
-全部 ready 后先记录
-`authorization_field_ready`，
-controller callback 重新核对 opening owner、真人输入、locked state 和 primary console user，
+exact `UserPasswordTextField`，读回 focus，并等待空 `AXValue` 可写；这期间 remote user-activity
+lease 保持 active，磁盘上没有 grant。全部 ready 且 identity 回验后先记录
+`authorization_field_ready`，再同步 release 同一 assertion ID；release 失败直接返回且 0 grant。
+release 成功后 controller callback 重新核对 opening owner、真人输入、locked state 和 primary console user，
 再按当前时间 mint/write 10 秒 grant，随后只执行一次空 `AXValue`，不发现或执行 secure-field AX
 action；成功写入立即记录不含 nonce/secret 的 `authorization_empty_value_written`。callback 前取消、
 真人输入或 discovery 失败不会发布 grant；callback 后 AX 失败不会重新 mint、rewrite 或 submit，
@@ -89,11 +89,15 @@ fallback 或重复输入，grant/window/shield 已收口且机器保持锁定。
 active-user unlock UI。A8 固定向 `(1, 1)` 移动，首次后重复坐标会成为空间 no-op；这是由固定坐标源码
 和重复无 transition 时序得出的高可信推断，不是统一日志直接记录的 cursor 坐标。
 
-`AgentHalo.9` 源码改为当前 cursor→同一 online display 内严格不同的一点移动，并让
-cursor/display/event 创建失败显式返回；它不依赖睡眠时可能为空的 active-display 列表，仍只有一次
-无凭据 `mouseMoved`，没有 click/key/retry。它**尚待正式签名、公证、部署和真实锁屏复测**；本文不预判
-wake 后的单次空写一定能触发目标 macOS，旧 `remote-agent` 在全套 E2E 门禁
-通过前继续保留。
+`AgentHalo.9`（`d5c2e92`）的 different-point single-move wake 已正式签名、公证、部署并
+进行 fresh locked 复测。TCC 接受 PostEvent，但 powerd/loginwindow 仍无 active-user transition，
+0 次 field-ready/grant/proof；任务以 `needs_manual` / `delivery_outcome=unknown` 安全结束，
+没有 CLI fallback 或重复输入，机器保持 locked。
+
+`AgentHalo.10` 源码已改为上述 public Remote user-activity lease；declare/release 任一失败都是
+0 grant，任何 discovery/error/cancel/return 都对同一 ID 执行幂等清理。它**尚待正式签名、公证、
+部署和真实锁屏复测**；本文不预判 wake 后的单次空写一定能触发目标 macOS，
+旧 `remote-agent` 在全套 E2E 门禁通过前继续保留。
 
 ## 1. 配置设备能力
 
@@ -238,7 +242,8 @@ security authorizationdb read system.login.screensaver \
 - `dev.linsheng.agenthalo.locked-use`
 - `use-login-window-ui`
 
-前者必须位于正常密码分支之前。不要删除或替换正常密码分支。
+前者必须唯一且位于整个数组的 index 0；正常密码分支必须继续存在。安装器不得删除 OpenAI
+Codex 或任何其他插件规则，并保持所有非 AgentHalo 规则原有的相对顺序。
 子规则还必须显示 `shared = false` 和 `timeout = 0`；否则一次成功可能进入 Authorization
 Services credential cache，破坏 one-grant/one-unlock 约束。
 
@@ -313,7 +318,7 @@ Claude 是主验收路径：
 - Claude transcript 精确显示 question→answer，并分别完成 exact `Allow once` 与 `Deny`；
 - helper audit 出现同一 turn 的 `grant_published`、`authorization_empty_value_written`、
   `grant_consumed`、`window_opened`、`window_closed`；
-- `grant_published` 必须晚于 wake 后 exact field ready；较慢的 loginwindow UI discovery 不得占用
+- `grant_published` 必须晚于 exact field ready 与 remote user-activity assertion release 成功；较慢的 loginwindow UI discovery 不得占用
   grant TTL；同一 turn 必须满足 `authorization_field_ready -> grant_published ->
   authorization_empty_value_written`，且 empty-write marker 只能出现一次；
   `authorization_request_returned` 失败项必须带不含 nonce/secret 的诊断 `reason`；

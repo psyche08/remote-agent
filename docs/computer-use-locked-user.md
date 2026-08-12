@@ -169,11 +169,17 @@ dev.linsheng.agenthalo.locked-use
   tries = 1
 ```
 
-再把子规则放在 `use-login-window-ui` 普通密码分支之前。结果是：
+再对精确 AgentHalo 子规则去重并把它固定放在整个 `rule` 列表的 index 0，使
+Computer Use + Locked Use 成为第一求值分支。其他插件规则和
+`use-login-window-ui` 普通密码分支一个不删、相对顺序不变。结果是：
 
 - 有效 grant：AgentHalo 分支 Allow，本次解锁获得授权；
 - 无效/缺失 grant：该分支 Deny，求值继续到正常登录窗口；
 - 正常密码分支永远保留，因此安装后仍可人工解锁。
+
+安装后的 live readback 必须同时证明：AgentHalo 子规则只出现一次且位于 index 0、
+`use-login-window-ui` 仍存在，并且安装前所有非 AgentHalo 规则仍以原相对顺序存在。
+重复执行安装器必须得到完全相同的 rule 顺序。
 
 安装器仍显式写入 `timeout=0`。macOS 26.5.2 的 `authd` 在回读这个
 `evaluate-mechanisms` rule 时会省略该键，因此安装器和 preflight 只接受“键缺失”或
