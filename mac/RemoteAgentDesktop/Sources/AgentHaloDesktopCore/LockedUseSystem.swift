@@ -143,7 +143,7 @@ public final class DesktopSystem: LockedUseSystem {
         // A grant on disk does not itself make loginwindow evaluate the unlock
         // right. Wake the lock screen first, then drive its own authorization
         // control. No password is read, stored, or injected on this path.
-        desktop.provokeUnlockAttempt()
+        try desktop.provokeUnlockAttempt()
         try lockScreenAuthorization.requestAuthorization(
             authorizationFieldReady: authorizationFieldReady,
             prepareGrant: prepareGrant,

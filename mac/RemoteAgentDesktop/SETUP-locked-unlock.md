@@ -14,7 +14,11 @@ Apple Authorization Plug-in 对短时、单次、签名 grant 作出 Allow；普
 `MechanismDestroy` 写入。complete 前 loginwindow password field 必须保持同一 AX
 element 且系统保持 locked；complete 后才能接受 field lifecycle completion + unlocked。
 
-锁屏 wake 和 loginwindow UI ready 是两个时刻。helper 先 wake，再只从唯一的 exact
+锁屏 wake 和 loginwindow UI ready 是两个时刻。helper 先读取当前 CG cursor，并只向同一 online
+display 内严格不同的 `+/-1` 点发送一次 agent-marked `mouseMoved`；cursor 若落在显示器布局空洞或
+不属于任何 online display 则失败关闭。wake 使用 online-display geometry，因此显示器睡眠、active display
+列表为空时仍能产生这一次移动；它不点击、不按键、不重试，cursor/display/event 任一不可读都显式失败，且不会
+发布 grant。随后 helper 只从唯一的 exact
 `com.apple.loginwindow` system bundle/executable 对应 PID 创建 AX application root；root、搜索种子和
 字段都回验同一 PID，绝不信任 system-wide focused application，也不 activate/frontmost 进程。
 搜索按 focused UI element、focused window、windows、application root 去重后做有界 BFS，不使用
@@ -78,9 +82,18 @@ authorizationdb 和 AgentHalo 版本以 [STATUS-and-TODO.md](STATUS-and-TODO.md)
 pending/final/complete proof。任务安全结束为 `needs_manual` / `delivery_outcome=unknown`，无 CLI
 fallback 或重复输入，grant/window/shield 已收口且机器保持锁定。
 
-`AgentHalo.8` 源码把触发面收窄为 grant 后唯一一次空 `AXValue` 写入，并增加
-`authorization_empty_value_written` 审计。它**尚待正式签名、公证、部署和真实锁屏复测**；本文不预判
-空写一定能触发目标 macOS，旧 `remote-agent` 在全套 E2E 门禁通过前继续保留。
+`AgentHalo.8`（`320ceb0`）把 postgrant 触发面收窄为唯一一次空 `AXValue` 写入，已正式签名、公证并
+部署。第一次 fresh locked 尝试被真实 USB 鼠标输入正确抑制；清除 suppression 后的两次 clean fresh
+尝试均未出现 password field，0 次 field-ready/grant/proof。统一日志确认 helper 的 PostEvent 获 TCC
+允许，但 loginwindow 没有收到 inactive→active user-activity transition；随后另一外部事件立即触发
+active-user unlock UI。A8 固定向 `(1, 1)` 移动，首次后重复坐标会成为空间 no-op；这是由固定坐标源码
+和重复无 transition 时序得出的高可信推断，不是统一日志直接记录的 cursor 坐标。
+
+`AgentHalo.9` 源码改为当前 cursor→同一 online display 内严格不同的一点移动，并让
+cursor/display/event 创建失败显式返回；它不依赖睡眠时可能为空的 active-display 列表，仍只有一次
+无凭据 `mouseMoved`，没有 click/key/retry。它**尚待正式签名、公证、部署和真实锁屏复测**；本文不预判
+wake 后的单次空写一定能触发目标 macOS，旧 `remote-agent` 在全套 E2E 门禁
+通过前继续保留。
 
 ## 1. 配置设备能力
 

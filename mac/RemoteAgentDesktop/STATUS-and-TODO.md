@@ -51,8 +51,11 @@ Codex resume 仍不能安全补发 thread-only dynamic tools，因此失败关�
 已经实现并进入 m4pro 真机验收；AgentHalo.7 已证明 exact loginwindow process/root 能找到并准备
 真实字段，但“空值写入后再执行 AXConfirm/AXPress”的组合路径没有启动可归因的 authd transaction；
 现有日志不能在 empty write、AX action 与异步 focus 尾效应之间作因果区分。
-AgentHalo.8 源码因此收窄为唯一一次空 `AXValue` 写入，尚待签名、部署和真机 E2E，不能把 Claude
-Locked Use 写成已验收完成。
+AgentHalo.8 因此把 postgrant 触发面收窄为唯一一次空 `AXValue` 写入，并已正式签名、公证、部署；
+两次无现场输入的 fresh locked 尝试均在 pregrant discovery 阶段安全失败。统一日志证明 helper 的
+PostEvent 已获 TCC 允许，但 loginwindow 没有收到 inactive→active user-activity transition，因而没有
+显示 password field、也没有发布 grant。AgentHalo.9 源码已把固定 `(1, 1)` 改为从当前光标计算同一
+显示器内必然不同的一点移动；尚待正式构建和目标机复测，不能把 Claude Locked Use 写成已验收完成。
 
 ### 2. Apple Authorization Plug-in 解锁链
 
@@ -89,7 +92,7 @@ Locked Use 写成已验收完成。
   去重后做深度/节点有界 BFS，每个候选和最终字段都必须仍归属同一 PID；不使用 role/title fallback；
   从首次空值尝试起使用新的短 AX deadline，成功写入后立即记录无 nonce/secret 的
   `authorization_empty_value_written`；任一步 AX 失败都直接返回，不会在同一 request 内重写或追加
-  action。该顺序是 AgentHalo.8 的待验真机诊断实现，不代表对其他产品内部调用序列的声明；
+  action。该顺序是 AgentHalo.8/9 的待验真机诊断实现，不代表对其他产品内部调用序列的声明；
   是否足以触发目标系统仍以真实锁屏 E2E 为准。Apple public API 未保证 `MechanismDestroy` 晚于 loginwindow
   的可见解锁副作用，所以 complete → unlock 顺序仍是目标机 E2E 门禁。
 
@@ -153,7 +156,7 @@ git diff --check
 
 2026-08-12 当前工作树的实际结果：
 
-- Swift 全量测试 `179/179` 通过；
+- Swift 全量测试 `188/188` 通过；
 - Go 全量 `go test -count=1 ./...`、全量 race `go test -race -count=1 ./...` 与
   `go vet ./...` 通过；
 - Authorization Plug-in ad-hoc build/sign/verify 通过（仅编译验证，禁止部署）；
@@ -167,8 +170,8 @@ git diff --check
 
 截至 2026-08-12，m4pro 的实际状态：
 
-- Developer ID 正式构建已完成签名和 Apple 公证；当前 `AgentHalo.7` main/helper（commit
-  `f6941d2`）已部署，main identifier=`dev.linsheng.agenthalo`、helper
+- Developer ID 正式构建已完成签名和 Apple 公证；当前 `AgentHalo.8` main/helper（commit
+  `320ceb0`）已部署，main identifier=`dev.linsheng.agenthalo`、helper
   identifier=`dev.linsheng.agenthalo.desktop`、Team=`89LGY6BD53`，签名校验通过；
 - 正式签名的 `AgentHaloLockedUse` Plug-in 已安装并通过签名校验；
   `system.login.screensaver` 已链接独立的 `dev.linsheng.agenthalo.locked-use` 子 rule，正常
@@ -210,10 +213,24 @@ git diff --check
   complete proofs 全部未出现，精确时段也没有可归因的 authd transaction；grant 到期后已撤销，
   window/shield 关闭，helper 保持 armed/active 且机器保持 locked；
 - A7 的 postgrant 路径在单次空 `AXValue` 后又执行了未被参照实现证明的 AXConfirm/AXPress；现场
-  字段消失却未启动 authd/Plug-in proof 链，无法把该组合归因为有效触发。待发布的 `AgentHalo.8`
-  仅保留 grant 后单次空 `AXValue` 写入，并新增 `authorization_empty_value_written` 审计分界；不放宽
-  pending/final/complete、same-field、locked-state、quarantine 或 no-retry 约束。**A8 尚待正式签名、
-  公证、部署和真实锁屏 E2E，不能预判空写一定成功**；
+  字段消失却未启动 authd/Plug-in proof 链，无法把该组合归因为有效触发。`AgentHalo.8` 仅保留 grant
+  后单次空 `AXValue` 写入，并新增 `authorization_empty_value_written` 审计分界；它已正式签名、公证、
+  部署；
+- A8 第一次 fresh locked 尝试被现场 USB 鼠标输入正确抑制并安全结束，不得重试相同 operation。清除
+  suppression 后的两次 fresh session/operation 均保持 `desktop_computer_use`、没有 CLI fallback 或
+  重复输入；helper 最长 8 秒未找到 exact password field，0 次 `authorization_field_ready`、0 次
+  `grant_published`、0 个 proof。同期 TCC 日志确认 CGEvent PostEvent 获准，但 loginwindow 没有记录
+  active-user transition；之后另一外部事件立即产生 `user event received, start an unlock` 并显示字段，
+  证明阻塞点在 wake，而不是 exact-field 搜索。现有 wake 总向 `(1, 1)` 发 `mouseMoved`，首次后光标已在
+  该点，后续 post 可成为空间 no-op；这是由固定坐标源码和重复无 transition 时序得出的高可信推断，
+  不是统一日志直接记录的 cursor 坐标；
+- 待发布的 `AgentHalo.9` 改为先读取当前 CG cursor，在其所在 online display 内选择严格不同的
+  `+/-1` 点；cursor 位于布局空洞或不属于任何 online display 时失败关闭。wake 不依赖显示器睡眠时可能
+  为空的 active-display 列表。全路径仍只 post 一次 agent-marked
+  `mouseMoved`，不点击、不按键、不重试；cursor/display/event 任一不可读就显式失败，且失败前不记录
+  synthetic-post timestamp、不进入 field discovery、更不会发布 grant。它不放宽 pending/final/
+  complete、same-field、locked-state、quarantine 或 no-retry 约束。**A9 尚待正式签名、公证、部署和
+  真实锁屏 E2E，不能预判 wake 后的单次空写一定成功**；
 - 旧 `remote-agent` 仍保留运行，只有下列真实 E2E 全部通过后才执行最终删除/切流。
 
 因此安装、签名、公证和基础启动门禁已经落地，但**不能诚实地把“锁定 → 无人值守授权解锁 →
@@ -250,8 +267,9 @@ Claude 截图/问答/授权/操作 → 重锁”标记为已通过**。完整操
 1. **没有独立 root deadman。** helper 遭 `SIGKILL`、内核崩溃或 WindowServer 故障时，进程内遮罩和监控会一起消失；launchd 重启后的 startup scrub 会重锁，但中间仍可能有暴露窗口。面向不可信本地环境的正式版本应增加独立特权 guardian/heartbeat。
 2. **Codex resume 仍不支持 dynamic-tool 闭环；Claude 尚未完成真机 E2E。** Claude Desktop-first
    route、durable operation tombstone、问答和一次性授权操作已经实现；AgentHalo.7 已完成 exact
-   loginwindow PID/root 部署验证，但未启动 authd proof 链，AgentHalo.8 的 single-empty-write trigger
-   仍需重签部署和锁屏验证。任何 Desktop mutation 之后都禁止切到 CLI；不能把 `needs_manual`
+   loginwindow PID/root 部署验证，AgentHalo.8 已部署 single-empty-write trigger，但固定坐标 wake
+   没有形成 loginwindow 所需的 active-user transition。AgentHalo.9 的 different-point wake 仍需
+   正式构建部署和锁屏验证。任何 Desktop mutation 之后都禁止切到 CLI；不能把 `needs_manual`
    当作可重试发送。
 3. **ScreenCaptureKit、loginwindow AX 与 authorizationdb 都是系统版本敏感边界。** 单元测试不能替代目标 macOS 版本上的真实锁屏验收。
 4. **Authorization Plug-in 分发仍是管理员操作。** 自动更新不能在没有明确管理员授权时静默改 authorizationdb。
@@ -260,7 +278,6 @@ Claude 截图/问答/授权/操作 → 重锁”标记为已通过**。完整操
 7. **post-terminal 解锁归因没有公开的因果回调。** 代码已对 `receipt.complete` 前的 field 变化/提前解锁永久失败关闭；但 complete 后的 Apple Watch/另一 authorization transaction 可以产生与本 transaction 相同的 `field disappeared + unlocked` 快照。Apple Authorization Plug-in 公开 API 不提供把 loginwindow 可见撤锁绑定到 nonce 的 transaction ID。在每个目标 macOS 版本的真机竞态验收通过，或实现独立 guardian/client completion 之前，无人值守环境必须确保 alternate unlock 不可用/不在场；当前不声称已对该竞态提供生产保证。
 8. **锁状态 generation 只对已观测边沿 sticky。** 已开窗口和普通 unlocked 操作都在入口/出口比对 generation，watcher 观测到重锁后即使又 unlocked 也会撤权并丢弃结果。但 macOS 没有向该用户会话 helper 提供文档化、无损的 lock-transition notification；完全落在两次 `CGSession` probe 之间的极短 locked→unlocked 边沿仍不可观测。真机验收必须覆盖这类竞态；不能把当前轮询表述为与 WindowServer 原子同步。
 
-在上述真实 E2E 门禁打勾前，状态应写为：**AgentHalo.7（f6941d2）已正式部署；exact loginwindow
-field readiness 与 grant 已通过，但 A7 的 empty-write + AX action 组合未启动 authd/proof 链并安全
-失败；AgentHalo.8 single-empty-write trigger 待签名部署和复测；旧 remote-agent 继续保留**，而不是
-“生产完成”。
+在上述真实 E2E 门禁打勾前，状态应写为：**AgentHalo.8（320ceb0）已正式部署；A8 的两次 clean
+尝试因固定坐标 wake 未产生 active-user transition 而在 pregrant 阶段安全失败；AgentHalo.9
+different-point single-move wake 待正式构建部署和复测；旧 remote-agent 继续保留**，而不是“生产完成”。
