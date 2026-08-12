@@ -1,4 +1,5 @@
 import ApplicationServices
+import AppKit
 import Foundation
 
 /// The narrow boundary used by `DesktopSystem` to begin loginwindow's own
@@ -38,6 +39,10 @@ public struct LockScreenAuthorizationError: Error, Equatable, CustomStringConver
 public final class SystemLockScreenAuthorizationInteractor:
     LockScreenAuthorizationRequesting, @unchecked Sendable
 {
+    static let loginwindowBundleIdentifier = "com.apple.loginwindow"
+    static let loginwindowBundlePath = "/System/Library/CoreServices/loginwindow.app"
+    static let loginwindowExecutablePath =
+        "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow"
     static let passwordFieldIdentifier = "UserPasswordTextField"
     private static let pollInterval: TimeInterval = 0.05
     /// Wake-to-ready is not instantaneous on real hardware. Discovery/focus is
@@ -61,6 +66,148 @@ public final class SystemLockScreenAuthorizationInteractor:
     private static let maximumNodes = 512
 
     public init() {}
+
+    /// A value-only snapshot is the selection seam for the privileged target.
+    /// Production fills it from `NSRunningApplication`; tests can prove every
+    /// rejection without launching or impersonating loginwindow.
+    struct RunningApplicationIdentity: Equatable, Sendable {
+        let bundleIdentifier: String?
+        let bundlePath: String?
+        let executablePath: String?
+        let isTerminated: Bool
+        let processIdentifier: pid_t
+    }
+
+    private struct LocatedPasswordField {
+        let element: AXUIElement
+        let application: NSRunningApplication
+        let processIdentifier: pid_t
+    }
+
+    /// Only one live process with all three immutable identity handles may be
+    /// used. A bundle identifier alone is not an ownership boundary, and a
+    /// best-effort choice among multiple exact processes would be ambiguous.
+    static func exactLoginwindow<Application>(
+        from applications: [Application],
+        identity: (Application) -> RunningApplicationIdentity
+    ) throws -> Application {
+        let matches = applications.filter {
+            let value = identity($0)
+            return !value.isTerminated &&
+                value.processIdentifier > 0 &&
+                value.bundleIdentifier == loginwindowBundleIdentifier &&
+                value.bundlePath == loginwindowBundlePath &&
+                value.executablePath == loginwindowExecutablePath
+        }
+        guard !matches.isEmpty else {
+            throw LockScreenAuthorizationError(
+                "the exact live macOS loginwindow process was not found")
+        }
+        guard matches.count == 1 else {
+            throw LockScreenAuthorizationError(
+                "multiple exact live macOS loginwindow processes were found")
+        }
+        return matches[0]
+    }
+
+    static func exactLoginwindowProcessIdentifier(
+        from applications: [RunningApplicationIdentity]
+    ) throws -> pid_t {
+        try exactLoginwindow(from: applications, identity: { $0 }).processIdentifier
+    }
+
+    /// PID equality is insufficient because a restarted process can reuse a
+    /// PID. Production supplies `NSRunningApplication.isEqual`; tests supply a
+    /// fake instance token and exercise same-PID replacement explicitly.
+    @discardableResult
+    static func requireSameExactLoginwindow<Application>(
+        _ expected: Application,
+        from applications: [Application],
+        identity: (Application) -> RunningApplicationIdentity,
+        isSameInstance: (Application, Application) -> Bool
+    ) throws -> Application {
+        let current = try exactLoginwindow(
+            from: applications, identity: identity)
+        let expectedIdentity = identity(expected)
+        let currentIdentity = identity(current)
+        guard isSameInstance(expected, current),
+              expectedIdentity.processIdentifier > 0,
+              currentIdentity.processIdentifier == expectedIdentity.processIdentifier else {
+            throw LockScreenAuthorizationError(
+                "the exact macOS loginwindow process instance changed during authorization")
+        }
+        return current
+    }
+
+    static func requireExactProcessIdentifier(
+        actual: pid_t,
+        expected: pid_t,
+        elementDescription: String
+    ) throws {
+        guard actual > 0, actual == expected else {
+            throw LockScreenAuthorizationError(
+                "the \(elementDescription) Accessibility element is not owned by the exact loginwindow process")
+        }
+    }
+
+    /// Seed order is part of the routing contract. Values may repeat across AX
+    /// attributes, so de-duplicate them before the bounded traversal.
+    static func orderedSearchSeeds<Node>(
+        focusedUIElement: Node?,
+        focusedWindow: Node?,
+        windows: [Node],
+        applicationRoot: Node,
+        areEqual: (Node, Node) -> Bool
+    ) -> [Node] {
+        var result: [Node] = []
+        let candidates = [focusedUIElement, focusedWindow] +
+            windows.map(Optional.some) + [Optional.some(applicationRoot)]
+        for candidate in candidates {
+            guard let candidate,
+                  !result.contains(where: { areEqual($0, candidate) }) else {
+                continue
+            }
+            result.append(candidate)
+        }
+        return result
+    }
+
+    /// The production AX walk and the fake-graph tests use the same bounded
+    /// algorithm. A foreign-PID focused element is ignored as a whole; it can
+    /// neither match the exact identifier nor introduce descendants into the
+    /// trusted loginwindow search.
+    static func exactPasswordField<Node>(
+        seeds: [Node],
+        expectedProcessIdentifier: pid_t,
+        maximumDepth: Int = maximumDepth,
+        maximumNodes: Int = maximumNodes,
+        areEqual: (Node, Node) -> Bool,
+        processIdentifier: (Node) throws -> pid_t,
+        identifier: (Node) throws -> String?,
+        children: (Node) throws -> [Node]
+    ) rethrows -> Node? {
+        var queue = seeds.map { (node: $0, depth: 0) }
+        var visited: [Node] = []
+        var examined = 0
+        while !queue.isEmpty, examined < maximumNodes {
+            let item = queue.removeFirst()
+            if visited.contains(where: { areEqual($0, item.node) }) { continue }
+            visited.append(item.node)
+            examined += 1
+
+            guard try processIdentifier(item.node) == expectedProcessIdentifier else {
+                continue
+            }
+            if try identifier(item.node) == passwordFieldIdentifier {
+                return item.node
+            }
+            guard item.depth < maximumDepth else { continue }
+            for child in try children(item.node) {
+                queue.append((node: child, depth: item.depth + 1))
+            }
+        }
+        return nil
+    }
 
     static func requireResponsive(_ status: AXError, operation: String) throws {
         if status == .cannotComplete {
@@ -117,10 +264,12 @@ public final class SystemLockScreenAuthorizationInteractor:
     /// authority, and keeps that invariant testable without live loginwindow.
     static func performGrantGatedSubmission<Action>(
         preflight: () throws -> Action,
+        revalidateBeforeGrant: () throws -> Void = {},
         prepareGrant: () throws -> Void,
         submit: (Action) throws -> Void
     ) throws {
         let preparedAction = try preflight()
+        try revalidateBeforeGrant()
         try prepareGrant()
         try submit(preparedAction)
     }
@@ -156,17 +305,26 @@ public final class SystemLockScreenAuthorizationInteractor:
 
         let deadline = Date().addingTimeInterval(Self.discoveryTimeout)
         var lastFailure = "the macOS lock-screen password field was not found"
-        var focusedField: AXUIElement?
+        var focusedField: LocatedPasswordField?
         var selectedAction: String?
         while Date() <= deadline {
             do {
                 let field = try passwordField(deadline: deadline)
-                try focus(field, deadline: deadline)
+                try focus(
+                    field.element,
+                    expectedProcessIdentifier: field.processIdentifier,
+                    deadline: deadline)
                 // loginwindow can expose the field before its value/action
                 // surface is ready. Treat all of that as one pregrant polling
                 // phase so staged UI readiness cannot cause an early failure.
-                try preflightEmptySubmission(field, deadline: deadline)
-                let action = try confirmationAction(field, deadline: deadline)
+                try preflightEmptySubmission(
+                    field.element,
+                    expectedProcessIdentifier: field.processIdentifier,
+                    deadline: deadline)
+                let action = try confirmationAction(
+                    field.element,
+                    expectedProcessIdentifier: field.processIdentifier,
+                    deadline: deadline)
                 focusedField = field
                 selectedAction = action
                 break
@@ -186,8 +344,15 @@ public final class SystemLockScreenAuthorizationInteractor:
         // readiness query is allowed, and no failure is retried.
         try Self.performGrantGatedSubmission(
             preflight: { selectedAction },
+            revalidateBeforeGrant: {
+                try self.requireSameLoginwindowApplication(focusedField.application)
+                try self.requireProcessIdentifier(
+                    focusedField.element,
+                    expected: focusedField.processIdentifier,
+                    deadline: deadline)
+            },
             prepareGrant: {
-                // Called exactly once only after every read-only readiness
+                // Called exactly once only after every pregrant readiness
                 // check passed. The controller revalidates the turn and mints
                 // from now inside this callback.
                 authorizationFieldReady()
@@ -202,11 +367,17 @@ public final class SystemLockScreenAuthorizationInteractor:
                 try Self.performSingleSubmission(
                     prepareEmptyValue: {
                         try self.writeEmptySubmission(
-                            focusedField, deadline: submissionDeadline)
+                            focusedField.element,
+                            expectedApplication: focusedField.application,
+                            expectedProcessIdentifier: focusedField.processIdentifier,
+                            deadline: submissionDeadline)
                     },
                     confirm: {
                         try self.performConfirmation(
-                            focusedField, action: selectedAction,
+                            focusedField.element,
+                            expectedApplication: focusedField.application,
+                            expectedProcessIdentifier: focusedField.processIdentifier,
+                            action: selectedAction,
                             deadline: submissionDeadline)
                     })
             })
@@ -219,7 +390,7 @@ public final class SystemLockScreenAuthorizationInteractor:
             isLocked: isLocked)
     }
 
-    private func passwordField(deadline: Date) throws -> AXUIElement {
+    private func passwordField(deadline: Date) throws -> LocatedPasswordField {
         guard let field = try passwordFieldIfPresent(deadline: deadline) else {
             throw LockScreenAuthorizationError(
                 "the macOS lock-screen password field was not found")
@@ -227,47 +398,70 @@ public final class SystemLockScreenAuthorizationInteractor:
         return field
     }
 
-    private func passwordFieldIfPresent(deadline: Date) throws -> AXUIElement? {
-        let system = AXUIElementCreateSystemWide()
-        try Self.configureTimeout(system, deadline: deadline)
-        try Self.before(deadline, operation: "locating the lock-screen application")
-        var focused: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(
-            system, kAXFocusedApplicationAttribute as CFString, &focused)
-        try Self.requireResponsive(result, operation: "locating the lock-screen application")
-        guard result == .success, let application = focused else {
-            throw LockScreenAuthorizationError(
-                "the focused macOS lock-screen application is unavailable (AX error \(result.rawValue))")
+    private func passwordFieldIfPresent(
+        deadline: Date,
+        expectedProcessIdentifier: pid_t? = nil
+    ) throws -> LocatedPasswordField? {
+        try Self.before(deadline, operation: "locating the exact loginwindow process")
+        let runningApplications = runningLoginwindowApplications()
+        let application = try Self.exactLoginwindow(
+            from: runningApplications,
+            identity: Self.runningApplicationIdentity)
+        let processIdentifier = application.processIdentifier
+        if let expectedProcessIdentifier {
+            guard processIdentifier == expectedProcessIdentifier else {
+                throw LockScreenAuthorizationError(
+                    "the exact macOS loginwindow process changed during authorization")
+            }
         }
-        let root = unsafeDowncast(application, to: AXUIElement.self)
+        let root = AXUIElementCreateApplication(processIdentifier)
         try Self.configureTimeout(root, deadline: deadline)
+        try requireProcessIdentifier(
+            root, expected: processIdentifier, deadline: deadline)
 
-        var queue: [(element: AXUIElement, depth: Int)] = [(root, 0)]
-        var visited: [AXUIElement] = []
-        var examined = 0
-        while !queue.isEmpty, examined < Self.maximumNodes {
-            try Self.before(deadline, operation: "locating the lock-screen authorization field")
-            let item = queue.removeFirst()
-            if visited.contains(where: { CFEqual($0, item.element) }) { continue }
-            visited.append(item.element)
-            examined += 1
-
-            if try string(
-                item.element, kAXIdentifierAttribute as String, deadline: deadline) ==
-                Self.passwordFieldIdentifier
-            {
-                return item.element
-            }
-            guard item.depth < Self.maximumDepth else { continue }
-            for child in try children(item.element, deadline: deadline) {
-                queue.append((child, item.depth + 1))
-            }
-        }
-        return nil
+        let focusedUIElement = try element(
+            root, kAXFocusedUIElementAttribute as String, deadline: deadline)
+        let focusedWindow = try element(
+            root, kAXFocusedWindowAttribute as String, deadline: deadline)
+        let windows = try elements(
+            root, kAXWindowsAttribute as String, deadline: deadline)
+        let seeds = Self.orderedSearchSeeds(
+            focusedUIElement: focusedUIElement,
+            focusedWindow: focusedWindow,
+            windows: windows,
+            applicationRoot: root,
+            areEqual: { CFEqual($0, $1) })
+        let field = try Self.exactPasswordField(
+            seeds: seeds,
+            expectedProcessIdentifier: processIdentifier,
+            areEqual: { CFEqual($0, $1) },
+            processIdentifier: {
+                try self.processIdentifier($0, deadline: deadline)
+            },
+            identifier: {
+                try Self.before(
+                    deadline,
+                    operation: "locating the lock-screen authorization field")
+                return try self.string(
+                    $0, kAXIdentifierAttribute as String, deadline: deadline)
+            },
+            children: {
+                try Self.before(
+                    deadline,
+                    operation: "locating the lock-screen authorization field")
+                return try self.children($0, deadline: deadline)
+            })
+        guard let field else { return nil }
+        try requireProcessIdentifier(
+            field, expected: processIdentifier, deadline: deadline)
+        return LocatedPasswordField(
+            element: field,
+            application: application,
+            processIdentifier: processIdentifier)
     }
 
     private func waitForTransactionCompletion(
-        field: AXUIElement,
+        field: LocatedPasswordField,
         completionReceiptObserved: @Sendable () throws -> Bool,
         isLocked: @Sendable () throws -> Bool
     ) throws {
@@ -309,15 +503,26 @@ public final class SystemLockScreenAuthorizationInteractor:
     }
 
     private func samePasswordFieldIsReachable(
-        _ expected: AXUIElement, deadline: Date
+        _ expected: LocatedPasswordField, deadline: Date
     ) throws -> Bool {
-        guard let current = try passwordFieldIfPresent(deadline: deadline) else {
+        try requireSameLoginwindowApplication(expected.application)
+        guard let current = try passwordFieldIfPresent(
+            deadline: deadline,
+            expectedProcessIdentifier: expected.processIdentifier) else {
             return false
         }
-        return CFEqual(current, expected)
+        return current.application.isEqual(expected.application) &&
+            current.processIdentifier == expected.processIdentifier &&
+            CFEqual(current.element, expected.element)
     }
 
-    private func focus(_ field: AXUIElement, deadline: Date) throws {
+    private func focus(
+        _ field: AXUIElement,
+        expectedProcessIdentifier: pid_t,
+        deadline: Date
+    ) throws {
+        try requireProcessIdentifier(
+            field, expected: expectedProcessIdentifier, deadline: deadline)
         try Self.configureTimeout(field, deadline: deadline)
         try Self.before(deadline, operation: "focusing the lock-screen authorization field")
         var settable = DarwinBoolean(false)
@@ -352,8 +557,12 @@ public final class SystemLockScreenAuthorizationInteractor:
     }
 
     private func confirmationAction(
-        _ field: AXUIElement, deadline: Date
+        _ field: AXUIElement,
+        expectedProcessIdentifier: pid_t,
+        deadline: Date
     ) throws -> String {
+        try requireProcessIdentifier(
+            field, expected: expectedProcessIdentifier, deadline: deadline)
         try Self.configureTimeout(field, deadline: deadline)
         try Self.before(deadline, operation: "reading lock-screen authorization actions")
         var values: CFArray?
@@ -382,12 +591,19 @@ public final class SystemLockScreenAuthorizationInteractor:
     }
 
     private func performConfirmation(
-        _ field: AXUIElement, action: String, deadline: Date
+        _ field: AXUIElement,
+        expectedApplication: NSRunningApplication,
+        expectedProcessIdentifier: pid_t,
+        action: String,
+        deadline: Date
     ) throws {
         guard action == kAXConfirmAction as String || action == kAXPressAction as String else {
             throw LockScreenAuthorizationError(
                 "the prepared lock-screen authorization action is invalid")
         }
+        try requireSameLoginwindowApplication(expectedApplication)
+        try requireProcessIdentifier(
+            field, expected: expectedProcessIdentifier, deadline: deadline)
         try Self.before(deadline, operation: "submitting lock-screen authorization")
         let result = AXUIElementPerformAction(field, action as CFString)
         try Self.requireResponsive(result, operation: "submitting lock-screen authorization")
@@ -398,8 +614,12 @@ public final class SystemLockScreenAuthorizationInteractor:
     }
 
     private func preflightEmptySubmission(
-        _ field: AXUIElement, deadline: Date
+        _ field: AXUIElement,
+        expectedProcessIdentifier: pid_t,
+        deadline: Date
     ) throws {
+        try requireProcessIdentifier(
+            field, expected: expectedProcessIdentifier, deadline: deadline)
         try Self.configureTimeout(field, deadline: deadline)
         try Self.before(
             deadline,
@@ -412,7 +632,10 @@ public final class SystemLockScreenAuthorizationInteractor:
     }
 
     private func writeEmptySubmission(
-        _ field: AXUIElement, deadline: Date
+        _ field: AXUIElement,
+        expectedApplication: NSRunningApplication,
+        expectedProcessIdentifier: pid_t,
+        deadline: Date
     ) throws {
         // This is a deliberately credential-free empty public AX assignment,
         // not a sentinel. Never copy/read the secure field's current value.
@@ -420,11 +643,99 @@ public final class SystemLockScreenAuthorizationInteractor:
         // may trigger authorization and therefore must never be retried.
         // If loginwindow cannot acknowledge this edit, do not perform either
         // AXConfirm or AXPress: the authorization request is not attributable.
+        // This is the first postgrant mutation. Re-resolve the unique exact
+        // AppKit identity as well as the AX field owner immediately before it;
+        // a replaced/restarted loginwindow must consume no submission attempt.
+        try requireSameLoginwindowApplication(expectedApplication)
+        try requireProcessIdentifier(
+            field, expected: expectedProcessIdentifier, deadline: deadline)
         try Self.before(
             deadline, operation: "writing an empty lock-screen authorization value")
         let written = AXUIElementSetAttributeValue(
             field, kAXValueAttribute as CFString, "" as CFString)
         try Self.requireEmptyValueWritten(written)
+    }
+
+    private static func runningApplicationIdentity(
+        _ application: NSRunningApplication
+    ) -> RunningApplicationIdentity {
+        RunningApplicationIdentity(
+            bundleIdentifier: application.bundleIdentifier,
+            bundlePath: application.bundleURL?.path,
+            executablePath: application.executableURL?.path,
+            isTerminated: application.isTerminated,
+            processIdentifier: application.processIdentifier)
+    }
+
+    private func runningLoginwindowApplications() -> [NSRunningApplication] {
+        NSRunningApplication.runningApplications(
+            withBundleIdentifier: Self.loginwindowBundleIdentifier)
+    }
+
+    private func requireSameLoginwindowApplication(
+        _ expected: NSRunningApplication
+    ) throws {
+        try Self.requireSameExactLoginwindow(
+            expected,
+            from: runningLoginwindowApplications(),
+            identity: Self.runningApplicationIdentity,
+            isSameInstance: { $0.isEqual($1) })
+    }
+
+    private func processIdentifier(
+        _ element: AXUIElement, deadline: Date
+    ) throws -> pid_t {
+        try Self.configureTimeout(element, deadline: deadline)
+        try Self.before(deadline, operation: "verifying loginwindow Accessibility ownership")
+        var processIdentifier: pid_t = 0
+        let status = AXUIElementGetPid(element, &processIdentifier)
+        try Self.requireResponsive(
+            status, operation: "verifying loginwindow Accessibility ownership")
+        guard status == .success, processIdentifier > 0 else {
+            throw LockScreenAuthorizationError(
+                "could not verify loginwindow Accessibility ownership (AX error \(status.rawValue))")
+        }
+        return processIdentifier
+    }
+
+    private func requireProcessIdentifier(
+        _ element: AXUIElement,
+        expected: pid_t,
+        deadline: Date
+    ) throws {
+        try Self.requireExactProcessIdentifier(
+            actual: try processIdentifier(element, deadline: deadline),
+            expected: expected,
+            elementDescription: "lock-screen")
+    }
+
+    private func element(
+        _ owner: AXUIElement, _ attribute: String, deadline: Date
+    ) throws -> AXUIElement? {
+        try Self.configureTimeout(owner, deadline: deadline)
+        try Self.before(deadline, operation: "reading a loginwindow Accessibility seed")
+        var value: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(
+            owner, attribute as CFString, &value)
+        try Self.requireResponsive(
+            status, operation: "reading a loginwindow Accessibility seed")
+        guard status == .success, let value else { return nil }
+        guard CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
+        return unsafeDowncast(value, to: AXUIElement.self)
+    }
+
+    private func elements(
+        _ owner: AXUIElement, _ attribute: String, deadline: Date
+    ) throws -> [AXUIElement] {
+        try Self.configureTimeout(owner, deadline: deadline)
+        try Self.before(deadline, operation: "reading loginwindow Accessibility seeds")
+        var value: CFTypeRef?
+        let status = AXUIElementCopyAttributeValue(
+            owner, attribute as CFString, &value)
+        try Self.requireResponsive(
+            status, operation: "reading loginwindow Accessibility seeds")
+        guard status == .success else { return [] }
+        return value as? [AXUIElement] ?? []
     }
 
     private func string(

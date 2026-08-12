@@ -14,12 +14,16 @@ Apple Authorization Plug-in 对短时、单次、签名 grant 作出 Allow；普
 `MechanismDestroy` 写入。complete 前 loginwindow password field 必须保持同一 AX
 element 且系统保持 locked；complete 后才能接受 field lifecycle completion + unlocked。
 
-锁屏 wake 和 loginwindow UI ready 是两个时刻。helper 先 wake，再在最长 8 秒的不授权、
-pre-submission 阶段查找并 focus exact `UserPasswordTextField`，并等待空 `AXValue` 可写性和
+锁屏 wake 和 loginwindow UI ready 是两个时刻。helper 先 wake，再只从唯一的 exact
+`com.apple.loginwindow` system bundle/executable 对应 PID 创建 AX application root；root、搜索种子和
+字段都回验同一 PID，绝不信任 system-wide focused application，也不 activate/frontmost 进程。
+搜索按 focused UI element、focused window、windows、application root 去重后做有界 BFS，不使用
+role/title fallback，也不读取字段值。随后在最长 8 秒的不授权、pre-submission 阶段查找并 focus
+exact `UserPasswordTextField`，并等待空 `AXValue` 可写性和
 exact AXConfirm/AXPress action 同时 ready；这期间磁盘上没有 grant。全部 ready 后先记录
 `authorization_field_ready`，
 controller callback 重新核对 opening owner、真人输入、locked state 和 primary console user，
-再按当前时间 mint/write 10 秒 grant，随后只执行一次空 `AXValue` + confirm。callback 前取消、
+再按当前时间 mint/write 10 秒 grant，随后只执行一次空 `AXValue` + 预选的 AXConfirm/AXPress action。callback 前取消、
 真人输入或 discovery 失败不会发布 grant；callback 后 AX 失败不会重新 mint、rewrite 或 submit。
 
 ## 0. 前提与恢复路径

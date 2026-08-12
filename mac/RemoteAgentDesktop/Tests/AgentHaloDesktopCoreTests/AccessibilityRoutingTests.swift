@@ -225,6 +225,220 @@ final class AccessibilityRoutingTests: XCTestCase {
         }
     }
 
+    func testLoginwindowSelectionRequiresExactBundlePathsAndOneLivePID() throws {
+        typealias Identity = SystemLockScreenAuthorizationInteractor.RunningApplicationIdentity
+        let exact = Identity(
+            bundleIdentifier: "com.apple.loginwindow",
+            bundlePath: "/System/Library/CoreServices/loginwindow.app",
+            executablePath:
+                "/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow",
+            isTerminated: false,
+            processIdentifier: 41)
+        XCTAssertEqual(
+            try SystemLockScreenAuthorizationInteractor
+                .exactLoginwindowProcessIdentifier(from: [exact]),
+            41)
+
+        let wrongFocusedFake = Identity(
+            bundleIdentifier: "com.apple.loginwindow",
+            bundlePath: "/tmp/loginwindow.app",
+            executablePath: "/tmp/loginwindow.app/Contents/MacOS/loginwindow",
+            isTerminated: false,
+            processIdentifier: 99)
+        XCTAssertEqual(
+            try SystemLockScreenAuthorizationInteractor
+                .exactLoginwindowProcessIdentifier(from: [wrongFocusedFake, exact]),
+            41,
+            "a focused same-bundle fake must never displace the exact system process")
+
+        for missingIdentity in [
+            Identity(
+                bundleIdentifier: nil, bundlePath: exact.bundlePath,
+                executablePath: exact.executablePath, isTerminated: false,
+                processIdentifier: 41),
+            Identity(
+                bundleIdentifier: exact.bundleIdentifier, bundlePath: nil,
+                executablePath: exact.executablePath, isTerminated: false,
+                processIdentifier: 41),
+            Identity(
+                bundleIdentifier: exact.bundleIdentifier, bundlePath: exact.bundlePath,
+                executablePath: nil, isTerminated: false, processIdentifier: 41),
+            Identity(
+                bundleIdentifier: exact.bundleIdentifier, bundlePath: exact.bundlePath,
+                executablePath: exact.executablePath, isTerminated: true,
+                processIdentifier: 41),
+            Identity(
+                bundleIdentifier: exact.bundleIdentifier, bundlePath: exact.bundlePath,
+                executablePath: exact.executablePath, isTerminated: false,
+                processIdentifier: 0),
+        ] {
+            XCTAssertThrowsError(
+                try SystemLockScreenAuthorizationInteractor
+                    .exactLoginwindowProcessIdentifier(from: [missingIdentity]))
+        }
+
+        var duplicate = exact
+        duplicate = Identity(
+            bundleIdentifier: duplicate.bundleIdentifier,
+            bundlePath: duplicate.bundlePath,
+            executablePath: duplicate.executablePath,
+            isTerminated: duplicate.isTerminated,
+            processIdentifier: 42)
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor
+                .exactLoginwindowProcessIdentifier(from: [exact, duplicate])) { error in
+            XCTAssertTrue(
+                (error as? LockScreenAuthorizationError)?.detail.contains("multiple exact") == true)
+        }
+
+        struct App: Equatable {
+            let token: Int
+            let identity: Identity
+        }
+        let bound = App(token: 1, identity: exact)
+        XCTAssertNoThrow(
+            try SystemLockScreenAuthorizationInteractor.requireSameExactLoginwindow(
+                bound,
+                from: [bound],
+                identity: { $0.identity },
+                isSameInstance: { $0.token == $1.token }))
+        let samePIDReplacement = App(token: 2, identity: exact)
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireSameExactLoginwindow(
+                bound,
+                from: [samePIDReplacement],
+                identity: { $0.identity },
+                isSameInstance: { $0.token == $1.token })) { error in
+            XCTAssertTrue(
+                (error as? LockScreenAuthorizationError)?.detail.contains(
+                    "instance changed during authorization") == true)
+        }
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireSameExactLoginwindow(
+                bound,
+                from: [],
+                identity: { $0.identity },
+                isSameInstance: { $0.token == $1.token }))
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireSameExactLoginwindow(
+                bound,
+                from: [bound, samePIDReplacement],
+                identity: { $0.identity },
+                isSameInstance: { $0.token == $1.token }))
+    }
+
+    func testLoginwindowSeedsAreOrderedAndDeduplicated() {
+        let seeds = SystemLockScreenAuthorizationInteractor.orderedSearchSeeds(
+            focusedUIElement: 10,
+            focusedWindow: 20,
+            windows: [20, 30, 10],
+            applicationRoot: 40,
+            areEqual: ==)
+        XCTAssertEqual(seeds, [10, 20, 30, 40])
+    }
+
+    func testEachOrderedLoginwindowSeedCanReachTheExactField() throws {
+        struct Node: Equatable {
+            let id: Int
+            let identifier: String?
+            let children: [Int]
+        }
+        for targetSeed in 1...4 {
+            let nodes = Dictionary(uniqueKeysWithValues: (1...4).map { seed in
+                let fieldID = seed + 10
+                return (
+                    seed,
+                    Node(
+                        id: seed,
+                        identifier: nil,
+                        children: seed == targetSeed ? [fieldID] : []))
+            } + [
+                (
+                    targetSeed + 10,
+                    Node(
+                        id: targetSeed + 10,
+                        identifier: "UserPasswordTextField",
+                        children: []))
+            ])
+            let seeds = [1, 2, 3, 4].map { nodes[$0]! }
+            let result = try SystemLockScreenAuthorizationInteractor.exactPasswordField(
+                seeds: seeds,
+                expectedProcessIdentifier: 41,
+                areEqual: ==,
+                processIdentifier: { _ in 41 },
+                identifier: { $0.identifier },
+                children: { node in try node.children.map { try XCTUnwrap(nodes[$0]) } })
+            XCTAssertEqual(result?.id, targetSeed + 10, "seed \(targetSeed)")
+        }
+    }
+
+    func testPasswordFieldSearchRejectsForeignPIDAndUsesLaterExactSeed() throws {
+        struct Node: Equatable {
+            let id: Int
+            let pid: pid_t
+            let identifier: String?
+            let children: [Int]
+        }
+        let nodes = [
+            1: Node(id: 1, pid: 900, identifier: "UserPasswordTextField", children: [2]),
+            2: Node(id: 2, pid: 41, identifier: "UserPasswordTextField", children: []),
+            3: Node(id: 3, pid: 41, identifier: nil, children: [4]),
+            4: Node(id: 4, pid: 41, identifier: "UserPasswordTextField", children: []),
+        ]
+        let result = try SystemLockScreenAuthorizationInteractor.exactPasswordField(
+            seeds: [nodes[1]!, nodes[3]!],
+            expectedProcessIdentifier: 41,
+            areEqual: ==,
+            processIdentifier: { $0.pid },
+            identifier: { $0.identifier },
+            children: { node in try node.children.map { try XCTUnwrap(nodes[$0]) } })
+        XCTAssertEqual(result?.id, 4)
+    }
+
+    func testPasswordFieldSearchIsBoundedByDepthAndNodeCount() throws {
+        struct Node: Equatable {
+            let id: Int
+            let children: [Int]
+        }
+        let nodes = [
+            1: Node(id: 1, children: [2, 3]),
+            2: Node(id: 2, children: [4]),
+            3: Node(id: 3, children: []),
+            4: Node(id: 4, children: []),
+        ]
+        func search(depth: Int, count: Int) throws -> Node? {
+            try SystemLockScreenAuthorizationInteractor.exactPasswordField(
+                seeds: [nodes[1]!],
+                expectedProcessIdentifier: 41,
+                maximumDepth: depth,
+                maximumNodes: count,
+                areEqual: ==,
+                processIdentifier: { _ in 41 },
+                identifier: { $0.id == 4 ? "UserPasswordTextField" : nil },
+                children: { node in try node.children.map { try XCTUnwrap(nodes[$0]) } })
+        }
+        XCTAssertNil(try search(depth: 1, count: 20))
+        XCTAssertNil(try search(depth: 20, count: 3))
+        XCTAssertEqual(try search(depth: 2, count: 4)?.id, 4)
+    }
+
+    func testRootAndFieldPIDMismatchAreRejected() {
+        for description in ["application root", "password field"] {
+            XCTAssertThrowsError(
+                try SystemLockScreenAuthorizationInteractor.requireExactProcessIdentifier(
+                    actual: 99,
+                    expected: 41,
+                    elementDescription: description)) { error in
+                XCTAssertTrue(
+                    (error as? LockScreenAuthorizationError)?.detail.contains(
+                        "not owned by the exact loginwindow process") == true)
+            }
+        }
+        XCTAssertNoThrow(
+            try SystemLockScreenAuthorizationInteractor.requireExactProcessIdentifier(
+                actual: 41, expected: 41, elementDescription: "password field"))
+    }
+
     func testEmptyLockScreenValueRequiresASettableAttribute() {
         XCTAssertNoThrow(try SystemLockScreenAuthorizationInteractor.requireEmptyValueWritable(
             queryStatus: .success, isSettable: true))
@@ -335,6 +549,44 @@ final class AccessibilityRoutingTests: XCTestCase {
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: grantPath),
             "failed value/action preflight published ambient grant authority")
+    }
+
+    func testLoginwindowReplacementBeforeGrantPublishesAndSubmitsNothing() {
+        var grantCount = 0
+        var submissionCount = 0
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.performGrantGatedSubmission(
+                preflight: { kAXConfirmAction as String },
+                revalidateBeforeGrant: {
+                    throw LockScreenAuthorizationError(
+                        "loginwindow instance changed before grant")
+                },
+                prepareGrant: { grantCount += 1 },
+                submit: { _ in submissionCount += 1 }))
+        XCTAssertEqual(grantCount, 0)
+        XCTAssertEqual(submissionCount, 0)
+    }
+
+    func testLoginwindowReplacementAfterEmptyWritePerformsNoActionOrRetry() {
+        var emptyWriteCount = 0
+        var actionCount = 0
+        var sameInstance = true
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.performSingleSubmission(
+                prepareEmptyValue: {
+                    XCTAssertTrue(sameInstance)
+                    emptyWriteCount += 1
+                    sameInstance = false
+                },
+                confirm: {
+                    guard sameInstance else {
+                        throw LockScreenAuthorizationError(
+                            "loginwindow instance changed before action")
+                    }
+                    actionCount += 1
+                }))
+        XCTAssertEqual(emptyWriteCount, 1)
+        XCTAssertEqual(actionCount, 0)
     }
 
     func testPreparedSubmissionCallsGrantExactlyOnceBeforeMutation() throws {

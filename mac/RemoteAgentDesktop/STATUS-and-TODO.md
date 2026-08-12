@@ -1,6 +1,6 @@
 # Computer Use / Locked Use — 状态与验收门禁
 
-更新时间：2026-08-11。当前分支：`feature/computer-use-locked-use`。
+更新时间：2026-08-12。当前分支：`feature/computer-use-locked-use`。
 
 ## 目标
 
@@ -48,8 +48,9 @@
 - 配置 Locked Use 后，裸 HTTP `window open`、`action` 和 `ax` 默认拒绝；只有设备本地显式设置 `computer_use.debug_http_actions=true` 才用于调试。HTTP close 始终保留，因为它只能收权和重锁。
 
 Codex resume 仍不能安全补发 thread-only dynamic tools，因此失败关闭。Claude Desktop-first 闭环
-已经实现并进入 m4pro 真机验收；当前 AgentHalo.5 的第二次锁屏 prompt 证明 loginwindow 是分阶段
-ready，AgentHalo.6 的 pregrant 两阶段 readiness 修复尚待重签部署和 E2E，不能把 Claude Locked Use
+已经实现并进入 m4pro 真机验收；AgentHalo.6 已验证 pregrant 两阶段 readiness 不会提前发布 grant，
+但也暴露出 system-wide focused application 不是 loginwindow 的可靠 AX root。AgentHalo.7 的 exact
+loginwindow process/root 修复尚待签名部署和 E2E，不能把 Claude Locked Use
 写成已验收完成。
 
 ### 2. Apple Authorization Plug-in 解锁链
@@ -77,6 +78,13 @@ ready，AgentHalo.6 的 pregrant 两阶段 readiness 修复尚待重签部署和
   ready 后 controller 再次核对 opening owner、真人输入、locked state 和 primary console identity，
   才以当时 `Date()` mint/write 10 秒 grant。由此 wake/discovery 不消耗 grant TTL，也不在字段未
   ready 时暴露短时授权；
+  helper 不再信任 system-wide focused application，也不会 activate/frontmost loginwindow；它只接受
+  唯一、未 terminated、PID>0 且 bundle ID=`com.apple.loginwindow`、bundle URL=
+  `/System/Library/CoreServices/loginwindow.app`、executable URL=
+  `/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow` 全部精确匹配的
+  `NSRunningApplication`。AX root 只由该 PID 的 `AXUIElementCreateApplication` 创建并用
+  `AXUIElementGetPid` 回验；搜索种子固定为 focused UI element、focused window、windows、app root，
+  去重后做深度/节点有界 BFS，每个候选和最终字段都必须仍归属同一 PID；不使用 role/title fallback；
   从首次空值尝试起使用新的短 AX deadline，
   从空值写入尝试起任一步 AX 失败都直接返回，不会在同一 request 内重写或再次 submit。该顺序是
   AgentHalo 当前的真机诊断实现，不代表对其他产品内部调用序列的声明；是否仍需 confirm/press
@@ -141,9 +149,9 @@ bash -n deploy/install.sh deploy/publish-release.sh mac/preflight.sh
 git diff --check
 ```
 
-2026-08-11 当前工作树的实际结果：
+2026-08-12 当前工作树的实际结果：
 
-- Swift 全量测试 `170/170` 通过；
+- Swift 全量测试 `178/178` 通过；
 - Go 全量 `go test -count=1 ./...`、全量 race `go test -race -count=1 ./...` 与
   `go vet ./...` 通过；
 - Authorization Plug-in ad-hoc build/sign/verify 通过（仅编译验证，禁止部署）；
@@ -155,10 +163,10 @@ git diff --check
 
 ## 真实设备状态与硬门禁
 
-截至 2026-08-11，m4pro 的实际状态：
+截至 2026-08-12，m4pro 的实际状态：
 
-- Developer ID 正式构建已完成签名和 Apple 公证；当前 `AgentHalo.5` main/helper（commit
-  `c496f1c`）已部署，main identifier=`dev.linsheng.agenthalo`、helper
+- Developer ID 正式构建已完成签名和 Apple 公证；当前 `AgentHalo.6` main/helper（commit
+  `83369bc`）已部署，main identifier=`dev.linsheng.agenthalo`、helper
   identifier=`dev.linsheng.agenthalo.desktop`、Team=`89LGY6BD53`，签名校验通过；
 - 正式签名的 `AgentHaloLockedUse` Plug-in 已安装并通过签名校验；
   `system.login.screensaver` 已链接独立的 `dev.linsheng.agenthalo.locked-use` 子 rule，正常
@@ -179,9 +187,19 @@ git diff --check
   audit → callback 内重验并现 mint grant → 单次空 AXValue + preselected action”两阶段；callback
   前的取消、真人输入或 readiness 失败不会发布 grant，callback 后任一 AX 失败也不会重新
   mint/write；
-- 代码现已在 exact `UserPasswordTextField` 上增加“确认 public AXValue 可写 → 显式写空值 →
-  confirm/press”的 credential-free、单次 fail-closed 顺序，并由 `170/170` Swift 测试和
-  preflight 覆盖；**AgentHalo.6 尚待重新正式签名、部署到 m4pro 并完成真实锁屏 E2E**；
+- AgentHalo.6 的 fresh Claude logical session `aa212ed9c44b` 固定 route=
+  `desktop_computer_use`；operation
+  `prompt-agenthalo6-locked-20260812-100033` 安全结束为 `needs_manual` /
+  `delivery_outcome=unknown`，没有 input、CLI fallback 或重复提交。helper audit 在
+  `02:00:56.844` 记录 `authorization_request_returned`，原因是 exact password field not found，
+  随后 `open_failed`、`window_closed`；全程 0 次 `authorization_field_ready`、0 次
+  `grant_published`、0 个 receipt。最终 helper `armed=true`、`active=true`、未 quarantine/manual/
+  suppressed、窗口和 shield 均关闭。机器最初 `IOConsoleLocked=Yes`，10:01:51 由另一/人工路径解锁；
+  此结果不是 AgentHalo 授权成功；
+- 根因是旧代码从 system-wide focused application 开始 AX 搜索；锁屏显示已 ready、TCC auth=2 时，
+  focused app 仍不保证是 loginwindow。待发布的 `AgentHalo.7` 改为上述唯一 exact loginwindow PID、
+  root/field PID 回验和有界 multi-seed BFS，同时保留 AgentHalo.6 的 pregrant readiness 与单次提交；
+  **AgentHalo.7 尚待正式签名、公证、部署到 m4pro 并完成真实锁屏 E2E**；
 - 旧 `remote-agent` 仍保留运行，只有下列真实 E2E 全部通过后才执行最终删除/切流。
 
 因此安装、签名、公证和基础启动门禁已经落地，但**不能诚实地把“锁定 → 无人值守授权解锁 →
@@ -215,8 +233,8 @@ Claude 截图/问答/授权/操作 → 重锁”标记为已通过**。完整操
 
 1. **没有独立 root deadman。** helper 遭 `SIGKILL`、内核崩溃或 WindowServer 故障时，进程内遮罩和监控会一起消失；launchd 重启后的 startup scrub 会重锁，但中间仍可能有暴露窗口。面向不可信本地环境的正式版本应增加独立特权 guardian/heartbeat。
 2. **Codex resume 仍不支持 dynamic-tool 闭环；Claude 尚未完成真机 E2E。** Claude Desktop-first
-   route、durable operation tombstone、问答和一次性授权操作已经实现，但 AgentHalo.6 的 pregrant
-   field/value/action readiness 修复还需重签部署和锁屏验证。任何 Desktop mutation 之后都禁止切到
+   route、durable operation tombstone、问答和一次性授权操作已经实现，但 AgentHalo.7 的 exact
+   loginwindow PID/root 修复还需重签部署和锁屏验证。任何 Desktop mutation 之后都禁止切到
    CLI；不能把 `needs_manual` 当作可重试发送。
 3. **ScreenCaptureKit、loginwindow AX 与 authorizationdb 都是系统版本敏感边界。** 单元测试不能替代目标 macOS 版本上的真实锁屏验收。
 4. **Authorization Plug-in 分发仍是管理员操作。** 自动更新不能在没有明确管理员授权时静默改 authorizationdb。
@@ -225,6 +243,6 @@ Claude 截图/问答/授权/操作 → 重锁”标记为已通过**。完整操
 7. **post-terminal 解锁归因没有公开的因果回调。** 代码已对 `receipt.complete` 前的 field 变化/提前解锁永久失败关闭；但 complete 后的 Apple Watch/另一 authorization transaction 可以产生与本 transaction 相同的 `field disappeared + unlocked` 快照。Apple Authorization Plug-in 公开 API 不提供把 loginwindow 可见撤锁绑定到 nonce 的 transaction ID。在每个目标 macOS 版本的真机竞态验收通过，或实现独立 guardian/client completion 之前，无人值守环境必须确保 alternate unlock 不可用/不在场；当前不声称已对该竞态提供生产保证。
 8. **锁状态 generation 只对已观测边沿 sticky。** 已开窗口和普通 unlocked 操作都在入口/出口比对 generation，watcher 观测到重锁后即使又 unlocked 也会撤权并丢弃结果。但 macOS 没有向该用户会话 helper 提供文档化、无损的 lock-transition notification；完全落在两次 `CGSession` probe 之间的极短 locked→unlocked 边沿仍不可观测。真机验收必须覆盖这类竞态；不能把当前轮询表述为与 WindowServer 原子同步。
 
-在上述真实 E2E 门禁打勾前，状态应写为：**实现已落地，AgentHalo.5（c496f1c）已正式部署；
-第二次 Claude Locked Use E2E 在分阶段 UI readiness 处安全失败，AgentHalo.6 两阶段修复待重签
-部署和复测；旧 remote-agent 继续保留**，而不是“生产完成”。
+在上述真实 E2E 门禁打勾前，状态应写为：**AgentHalo.6（83369bc）已正式部署；Claude Locked Use
+E2E 因错误信任 system-wide focused application 而在 grant 前安全失败，AgentHalo.7 exact
+loginwindow PID/root 修复待签名部署和复测；旧 remote-agent 继续保留**，而不是“生产完成”。

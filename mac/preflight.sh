@@ -146,6 +146,16 @@ else
 fi
 INTERACTOR="$HELPER_DIR/Sources/AgentHaloDesktopCore/LockScreenAuthorizationInteractor.swift"
 if grep -q 'UserPasswordTextField' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'com.apple.loginwindow' "$INTERACTOR" 2>/dev/null && \
+   grep -q '/System/Library/CoreServices/loginwindow.app' "$INTERACTOR" 2>/dev/null && \
+   grep -q '/System/Library/CoreServices/loginwindow.app/Contents/MacOS/loginwindow' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'NSRunningApplication.runningApplications' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'requireSameExactLoginwindow' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'AXUIElementCreateApplication(processIdentifier)' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'AXUIElementGetPid' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'kAXFocusedUIElementAttribute' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'kAXFocusedWindowAttribute' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'kAXWindowsAttribute' "$INTERACTOR" 2>/dev/null && \
    grep -q 'discoveryTimeout: TimeInterval = 8' "$INTERACTOR" 2>/dev/null && \
    grep -q 'try prepareGrant()' "$INTERACTOR" 2>/dev/null && \
    grep -q 'submissionDeadline' "$INTERACTOR" 2>/dev/null && \
@@ -157,9 +167,15 @@ if grep -q 'UserPasswordTextField' "$INTERACTOR" 2>/dev/null && \
    grep -q 'performSingleSubmission' "$INTERACTOR" 2>/dev/null && \
    grep -q 'AXUIElementIsAttributeSettable' "$INTERACTOR" 2>/dev/null && \
    grep -q 'kAXValueAttribute as CFString, "" as CFString' "$INTERACTOR" 2>/dev/null; then
-  pass "unlock request discovers the exact field before publishing, then submits one empty public AX value"
+  pass "exact-loginwindow PID, bounded field search, pregrant gate, and single empty-value submission wiring present"
 else
-  fail "the bounded two-phase credential-free loginwindow AX authorization interactor is missing"
+  fail "the bounded exact-PID two-phase credential-free loginwindow AX authorization interactor is missing"
+fi
+if grep -q 'kAXFocusedApplicationAttribute' "$INTERACTOR" 2>/dev/null || \
+   grep -qE '\.activate[[:space:]]*\(|activateIgnoringOtherApps|SetFrontProcess' "$INTERACTOR" 2>/dev/null; then
+  fail "lock-screen authorization trusts focused-app routing or activates/fronts a process"
+else
+  pass "no focused-app routing or process activation/fronting API is statically present in the lock-screen interactor"
 fi
 
 step "authorization plug-in builds"
