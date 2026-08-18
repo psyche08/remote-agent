@@ -191,9 +191,11 @@ type fileDerivedEntry struct {
 const fileDerivedCacheMax = 4096
 
 var (
-	claudeCLIMetaCache    = &fileDerivedCache{}
-	claudeCLIReplyAtCache = &fileDerivedCache{}
-	codexReplyAtCache     = &fileDerivedCache{}
+	claudeCLIMetaCache         = &fileDerivedCache{}
+	claudeCLIReplyAtCache      = &fileDerivedCache{}
+	codexReplyAtCache          = &fileDerivedCache{}
+	claudePendingQuestionCache = &fileDerivedCache{}
+	claudeNativeUIPromptCache  = &fileDerivedCache{}
 )
 
 func (c *fileDerivedCache) get(key string, compute func() any) any {
@@ -450,6 +452,13 @@ func claudePendingQuestion(sessionID string, projectsDir string) map[string]any 
 	if path == "" {
 		return nil
 	}
+	v, _ := claudePendingQuestionCache.get(path, func() any {
+		return claudePendingQuestionUncached(path)
+	}).(map[string]any)
+	return v
+}
+
+func claudePendingQuestionUncached(path string) map[string]any {
 	pending := map[string]map[string]any{}
 	order := []string{}
 	for _, rec := range jsonlTailRecords(path, jsonlTailScanBytes) {
@@ -512,6 +521,13 @@ func claudePendingNativeUIPrompt(sessionID string, projectsDir string) map[strin
 	if path == "" {
 		return nil
 	}
+	v, _ := claudeNativeUIPromptCache.get(path, func() any {
+		return claudePendingNativeUIPromptUncached(path)
+	}).(map[string]any)
+	return v
+}
+
+func claudePendingNativeUIPromptUncached(path string) map[string]any {
 	pending := map[string]map[string]any{}
 	order := []string{}
 	for _, rec := range jsonlTailRecords(path, jsonlTailScanBytes) {
