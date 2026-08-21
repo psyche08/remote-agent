@@ -440,6 +440,24 @@ artifact from `deploy/publish-release.sh`, or run `deploy/install.sh` with
 the installed binary; a prebuilt binary passed through
 `AGENTHALO_SKIP_BUILD=1` is subject to the same checks.
 
+For a manual local release build that does not contact the relay or deploy
+anything, pass an explicit integer module version to the repository-root
+script:
+
+```bash
+./build.sh 10
+```
+
+It uses `NOTARY_TEAM_ID` plus either the existing
+`NOTARY_APPLE_ID`/`NOTARY_PASSWORD` environment or a
+`NOTARY_KEYCHAIN_PROFILE`. The script builds and Developer ID signs the main
+binary, desktop helper, and Authorization Plug-in; submits all three in one
+Apple notarization payload; and retains the Accepted result and full notary
+log. Every retained artifact and build cache is kept under the Git-ignored
+`build/` directory. This script never publishes, installs the Plug-in, changes
+authorizationdb, or deploys a device, and it never falls back to ad-hoc
+signing.
+
 ```bash
 AGENTHALO_EXPECTED_TEAM_ID=ABCDE12345 \
 AGENTHALO_SIGN_IDENTITY="Developer ID Application: AgentHalo (ABCDE12345)" \

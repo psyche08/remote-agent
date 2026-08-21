@@ -19,11 +19,15 @@ data/
 *.jsonl
 .DS_Store
 
+# Manual signed/notarized release artifacts. The root build.sh keeps every
+# generated binary, bundle, archive, manifest, and notarization receipt here.
+/build/
+
 # generated screenshots (keep the dir via .gitkeep)
 screenshots/*.png
 !screenshots/.gitkeep
 
-# the authorization plug-in is built and signed on the target Mac, never in CI
+# generated Authorization Plug-in output (formal builds use the root build.sh)
 mac/authorization-plugin/build/
 
 # test/tool caches

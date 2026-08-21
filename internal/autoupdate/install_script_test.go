@@ -107,6 +107,81 @@ func TestPublisherUsesOnlyAgentHaloSigningIdentifier(t *testing.T) {
 	}
 }
 
+func TestManualBuilderSignsAndNotarizesEveryAgentHaloCodeObject(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join("..", "..", "build.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := string(body)
+	for _, required := range []string{
+		`BUILD_ROOT="$ROOT/build"`,
+		`set +x`,
+		`status --porcelain --untracked-files=normal`,
+		`AGENTHALO_SWIFT_SCRATCH_PATH="$WORK/swift"`,
+		`dev.linsheng.agenthalo.desktop`,
+		`dev.linsheng.agenthalo.locked-use.plugin`,
+		`--identifier dev.linsheng.agenthalo --options runtime --timestamp`,
+		`^CodeDirectory .*flags=.*\(runtime\)`,
+		`cp "$STAGE/agenthalo-darwin-arm64" "$STAGE/notary-payload/"`,
+		`cp "$STAGE/agenthalo-desktop" "$STAGE/notary-payload/"`,
+		`"$STAGE/AgentHaloLockedUse.bundle.zip"`,
+		`"$STAGE/notary-payload"`,
+		`--wait --timeout "$NOTARY_TIMEOUT"`,
+		`--output-format json`,
+		`[ "$NOTARY_STATUS" = "Accepted" ]`,
+		`notarization-log.json`,
+		`Apple notarized archive hash does not match local payload`,
+		`notarization log is missing an exact AgentHalo code ticket`,
+		`AgentHaloLockedUse.bundle/Contents/MacOS/AgentHaloLockedUse`,
+		`notarized main binary differs from the final deliverable`,
+		`notarized desktop helper differs from the final deliverable`,
+		`notarized Authorization Plug-in differs from the final deliverable`,
+		`"notarized": true`,
+		`main binary does not embed the exact signed desktop helper`,
+		`SHA256SUMS`,
+	} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("manual builder missing release invariant %q", required)
+		}
+	}
+	for _, forbidden := range []string{
+		`codesign --force --sign -`,
+		`security unlock-keychain`,
+		`sudo `,
+		`authorizationdb write`,
+		`scp `,
+		`rsync `,
+		`ssh `,
+	} {
+		if strings.Contains(script, forbidden) {
+			t.Fatalf("manual builder has forbidden side effect or weak signing path %q", forbidden)
+		}
+	}
+
+	helperBody, err := os.ReadFile(filepath.Join(
+		"..", "..", "mac", "RemoteAgentDesktop", "build.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	helper := string(helperBody)
+	for _, required := range []string{
+		`AGENTHALO_SWIFT_SCRATCH_PATH`,
+		`--scratch-path "$SWIFT_SCRATCH_PATH"`,
+	} {
+		if !strings.Contains(helper, required) {
+			t.Fatalf("desktop helper builder cannot keep intermediates in root build: missing %q", required)
+		}
+	}
+
+	ignoreBody, err := os.ReadFile(filepath.Join("..", "..", ".gitignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ignoreBody), "\n/build/\n") {
+		t.Fatal("root build directory is not anchored in .gitignore")
+	}
+}
+
 func TestStandaloneLaunchAgentInstallerRefusesLiveReplacement(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join("..", "..", "mac", "launchagent", "install.sh"))
 	if err != nil {

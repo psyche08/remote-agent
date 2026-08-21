@@ -19,6 +19,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ADHOC=0
 OUT=""
+SWIFT_SCRATCH_PATH="${AGENTHALO_SWIFT_SCRATCH_PATH:-}"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -34,9 +35,19 @@ done
 command -v swift >/dev/null 2>&1 || { echo "swift not found; install the Xcode command line tools" >&2; exit 127; }
 
 echo "==> building agenthalo-desktop (release)"
-( cd "$HERE" && swift build -c release --arch arm64 )
-BINARY="$HERE/.build/arm64-apple-macosx/release/agenthalo-desktop"
-[ -x "$BINARY" ] || BINARY="$HERE/.build/release/agenthalo-desktop"
+SWIFT_BUILD_ARGS=(-c release --arch arm64)
+if [ -n "$SWIFT_SCRATCH_PATH" ]; then
+  mkdir -p "$SWIFT_SCRATCH_PATH"
+  SWIFT_BUILD_ARGS+=(--scratch-path "$SWIFT_SCRATCH_PATH")
+fi
+( cd "$HERE" && swift build "${SWIFT_BUILD_ARGS[@]}" )
+if [ -n "$SWIFT_SCRATCH_PATH" ]; then
+  BINARY="$SWIFT_SCRATCH_PATH/arm64-apple-macosx/release/agenthalo-desktop"
+  [ -x "$BINARY" ] || BINARY="$SWIFT_SCRATCH_PATH/release/agenthalo-desktop"
+else
+  BINARY="$HERE/.build/arm64-apple-macosx/release/agenthalo-desktop"
+  [ -x "$BINARY" ] || BINARY="$HERE/.build/release/agenthalo-desktop"
+fi
 [ -x "$BINARY" ] || { echo "build produced no binary" >&2; exit 1; }
 
 # A standalone Developer ID executable cannot carry restricted Keychain access-
