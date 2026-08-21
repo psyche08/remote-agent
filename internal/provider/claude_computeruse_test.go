@@ -18,6 +18,94 @@ import (
 
 const claudeComputerUseTestTranscript = "11111111-2222-4333-8444-555555555555"
 
+func TestClaudeDesktopReadinessAllowsDeepSignatureVerificationOverTwoSeconds(t *testing.T) {
+	c := NewClaude("claude", config.ProviderConfig{Command: filepath.Join(t.TempDir(), "missing-claude")})
+	c.SetComputerUseAutomationHandler(func(context.Context, string, ComputerUseAutomationCallback) error {
+		return nil
+	})
+	c.claudeComputerUseSetDependencies(claudeComputerUseDependencies{
+		verifyApp: func(ctx context.Context, _, _, _ string) error {
+			timer := time.NewTimer(2100 * time.Millisecond)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+				return nil
+			}
+		},
+	})
+	started := time.Now()
+	if !c.Installed() {
+		t.Fatal("Claude Desktop was hidden when exact signature verification exceeded the old two-second deadline")
+	}
+	if elapsed := time.Since(started); elapsed < 2*time.Second || elapsed >= claudeDesktopReadinessTimeout {
+		t.Fatalf("unexpected readiness duration %s", elapsed)
+	}
+}
+
+func TestClaudeDesktopReadinessCachesExactIdentityAndStillReverifiesOperations(t *testing.T) {
+	const (
+		appPath  = "/Applications/Test Claude.app"
+		bundleID = "com.example.claude"
+		teamID   = "EXACTTEAM1"
+	)
+	c := NewClaude("claude", config.ProviderConfig{Command: filepath.Join(t.TempDir(), "missing-claude"), Extra: map[string]any{
+		"desktop_app_path": appPath, "desktop_bundle_id": bundleID, "desktop_team_id": teamID,
+	}})
+	c.SetComputerUseAutomationHandler(func(context.Context, string, ComputerUseAutomationCallback) error {
+		return nil
+	})
+	var mu sync.Mutex
+	verifyCalls := 0
+	release := make(chan struct{})
+	c.claudeComputerUseSetDependencies(claudeComputerUseDependencies{
+		verifyApp: func(_ context.Context, gotPath, gotBundleID, gotTeamID string) error {
+			if gotPath != appPath || gotBundleID != bundleID || gotTeamID != teamID {
+				return errors.New("readiness verification did not use the exact configured identity")
+			}
+			mu.Lock()
+			verifyCalls++
+			call := verifyCalls
+			mu.Unlock()
+			if call == 1 {
+				<-release
+			}
+			return nil
+		},
+	})
+
+	results := make(chan bool, 2)
+	go func() { results <- c.Installed() }()
+	go func() { results <- c.Installed() }()
+	time.Sleep(25 * time.Millisecond)
+	close(release)
+	if !<-results || !<-results {
+		t.Fatal("concurrent Claude readiness checks did not share the successful exact verification")
+	}
+	if st := c.Status(); !st.Installed || !st.Capabilities["computer_use"] {
+		t.Fatalf("cached readiness was not reflected in status: %#v", st)
+	}
+	mu.Lock()
+	if verifyCalls != 1 {
+		t.Fatalf("readiness verification calls=%d, want one shared exact check", verifyCalls)
+	}
+	mu.Unlock()
+
+	runtime := claudeComputerUseRuntimeFor(c)
+	runtime.mu.Lock()
+	verify := runtime.deps.verifyApp
+	runtime.mu.Unlock()
+	if err := verify(context.Background(), appPath, bundleID, teamID); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if verifyCalls != 2 {
+		t.Fatalf("operation preflight reused readiness cache: verification calls=%d, want 2", verifyCalls)
+	}
+}
+
 type fakeClaudeComputerUse struct {
 	mu        sync.Mutex
 	opened    bool

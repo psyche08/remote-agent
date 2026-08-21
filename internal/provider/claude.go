@@ -73,6 +73,10 @@ type Claude struct {
 	authMu                sync.Mutex
 	authCheckedAt         time.Time
 	authenticated         bool
+	desktopReadinessMu    sync.Mutex
+	desktopReadiness      claudeDesktopReadinessResult
+	desktopReadinessCheck *claudeDesktopReadinessCheck
+	desktopReadinessEpoch uint64
 }
 
 var (
@@ -128,7 +132,7 @@ func (c *Claude) ID() string { return c.id }
 // authenticated stream-json CLI fallback. Status exposes each readiness bit
 // separately; one backend being unavailable must not hide the other.
 func (c *Claude) Installed() bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), claudeDesktopReadinessTimeout)
 	desktopReady := c.claudeDesktopReady(ctx)
 	cancel()
 	cli := c.resolveCommand()
@@ -149,7 +153,7 @@ func (c *Claude) StopCLIStream() {
 }
 
 func (c *Claude) Status() Status {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), claudeDesktopReadinessTimeout)
 	desktopReady := c.claudeDesktopReady(ctx)
 	cancel()
 	cli := c.resolveCommand()

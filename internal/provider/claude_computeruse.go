@@ -24,7 +24,32 @@ const (
 	claudeDesktopDefaultBundleID = "com.anthropic.claudefordesktop"
 	claudeDesktopDefaultTeamID   = "Q6L2SF6YDW"
 	claudeDesktopDefaultAppPath  = "/Applications/Claude.app"
+
+	// A real Claude.app deep verification can take more than two seconds on
+	// Apple Silicon. Keep the readiness probe bounded, but leave enough room for
+	// codesign to validate the full bundle on an ordinarily loaded host.
+	claudeDesktopReadinessTimeout    = 5 * time.Second
+	claudeDesktopReadinessSuccessTTL = 15 * time.Second
+	claudeDesktopReadinessFailureTTL = time.Second
 )
+
+type claudeDesktopReadinessKey struct {
+	appPath  string
+	bundleID string
+	teamID   string
+}
+
+type claudeDesktopReadinessResult struct {
+	key       claudeDesktopReadinessKey
+	ready     bool
+	expiresAt time.Time
+}
+
+type claudeDesktopReadinessCheck struct {
+	key   claudeDesktopReadinessKey
+	epoch uint64
+	done  chan struct{}
+}
 
 func (c *Claude) claudePrimaryRoute() string {
 	if stringExtra(c.cfg.Extra, "primary_route", claudeRouteDesktopComputerUse) == claudeRouteStreamJSONCLI {
@@ -68,12 +93,65 @@ func (c *Claude) claudeDesktopReady(ctx context.Context) bool {
 	if handler == nil || verify == nil {
 		return false
 	}
-	return verify(
-		ctx,
-		stringExtra(c.cfg.Extra, "desktop_app_path", claudeDesktopDefaultAppPath),
-		stringExtra(c.cfg.Extra, "desktop_bundle_id", claudeDesktopDefaultBundleID),
-		stringExtra(c.cfg.Extra, "desktop_team_id", claudeDesktopDefaultTeamID),
-	) == nil
+	key := claudeDesktopReadinessKey{
+		appPath:  stringExtra(c.cfg.Extra, "desktop_app_path", claudeDesktopDefaultAppPath),
+		bundleID: stringExtra(c.cfg.Extra, "desktop_bundle_id", claudeDesktopDefaultBundleID),
+		teamID:   stringExtra(c.cfg.Extra, "desktop_team_id", claudeDesktopDefaultTeamID),
+	}
+
+	for {
+		now := time.Now()
+		c.desktopReadinessMu.Lock()
+		if c.desktopReadiness.key == key && now.Before(c.desktopReadiness.expiresAt) {
+			ready := c.desktopReadiness.ready
+			c.desktopReadinessMu.Unlock()
+			return ready
+		}
+		if check := c.desktopReadinessCheck; check != nil {
+			done := check.done
+			c.desktopReadinessMu.Unlock()
+			select {
+			case <-ctx.Done():
+				return false
+			case <-done:
+				continue
+			}
+		}
+		check := &claudeDesktopReadinessCheck{
+			key: key, epoch: c.desktopReadinessEpoch, done: make(chan struct{}),
+		}
+		c.desktopReadinessCheck = check
+		c.desktopReadinessMu.Unlock()
+
+		ready := verify(ctx, key.appPath, key.bundleID, key.teamID) == nil
+		ttl := claudeDesktopReadinessFailureTTL
+		if ready {
+			ttl = claudeDesktopReadinessSuccessTTL
+		}
+		c.desktopReadinessMu.Lock()
+		if c.desktopReadinessCheck == check {
+			// This cache is only a readiness/status optimization. Every prompt or
+			// permission operation still calls verifyApp directly immediately
+			// before launching or touching Claude, so a cached result never grants
+			// authority to mutate the application UI.
+			if check.epoch == c.desktopReadinessEpoch {
+				c.desktopReadiness = claudeDesktopReadinessResult{
+					key: key, ready: ready, expiresAt: time.Now().Add(ttl),
+				}
+			}
+			c.desktopReadinessCheck = nil
+			close(check.done)
+		}
+		c.desktopReadinessMu.Unlock()
+		return ready
+	}
+}
+
+func (c *Claude) invalidateClaudeDesktopReadiness() {
+	c.desktopReadinessMu.Lock()
+	c.desktopReadinessEpoch++
+	c.desktopReadiness = claudeDesktopReadinessResult{}
+	c.desktopReadinessMu.Unlock()
 }
 
 type claudeComputerUseDisposition string
@@ -242,6 +320,7 @@ func (c *Claude) SetComputerUseAutomationHandler(handler ComputerUseAutomationHa
 	runtime.mu.Lock()
 	runtime.handler = handler
 	runtime.mu.Unlock()
+	c.invalidateClaudeDesktopReadiness()
 }
 
 func (c *Claude) SetClaudeControlRouteCommitHandler(handler ClaudeControlRouteCommitHandler) {
@@ -306,10 +385,12 @@ func (c *Claude) claudeComputerUseSetDependencies(deps claudeComputerUseDependen
 		runtime.deps.now = deps.now
 	}
 	runtime.mu.Unlock()
+	c.invalidateClaudeDesktopReadiness()
 	return func() {
 		runtime.mu.Lock()
 		runtime.deps = old
 		runtime.mu.Unlock()
+		c.invalidateClaudeDesktopReadiness()
 	}
 }
 
