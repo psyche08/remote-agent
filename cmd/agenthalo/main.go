@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -19,11 +20,14 @@ import (
 	"github.com/psyche08/remote-agent/internal/autoupdate"
 	"github.com/psyche08/remote-agent/internal/buildinfo"
 	"github.com/psyche08/remote-agent/internal/config"
+	"github.com/psyche08/remote-agent/internal/desktopasset"
 	"github.com/psyche08/remote-agent/internal/logupload"
 	"github.com/psyche08/remote-agent/internal/provider"
 	"github.com/psyche08/remote-agent/internal/state"
 	"github.com/psyche08/remote-agent/internal/turnstatehook"
 )
+
+const productName = "AgentHalo"
 
 func main() {
 	os.Exit(run(os.Args[1:]))
@@ -39,12 +43,15 @@ func run(args []string) int {
 	if len(args) > 0 && args[0] == "update" {
 		return runUpdate(args[1:])
 	}
+	if len(args) > 0 && args[0] == "desktop" {
+		return runDesktop(args[1:])
+	}
 	if len(args) > 0 && args[0] == "version" {
 		b, _ := json.Marshal(buildinfo.Info())
 		fmt.Println(string(b))
 		return 0
 	}
-	fs := flag.NewFlagSet("remote-agent", flag.ContinueOnError)
+	fs := flag.NewFlagSet(productName, flag.ContinueOnError)
 	configPath := fs.String("config", "", "config.json path")
 	listen := fs.String("listen", "", "TCP address for development, e.g. 127.0.0.1:18765")
 	uds := fs.String("uds", "", "Unix socket path")
@@ -71,6 +78,21 @@ func run(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 2
 	}
+	// Keep the desktop helper on disk and reload an already loaded LaunchAgent
+	// before serving. This intentionally runs even when the new config disables
+	// computer use: otherwise a true -> false deployment would leave the old
+	// helper process enforcing its startup-time enabled config until logout.
+	// Failing does not take down unrelated agent features, but it does disable
+	// computer use in this process so a new API cannot drive a stale helper.
+	computerUseRequested := cfg.ComputerUse.Enabled
+	if err := refreshDesktopHelperCapability(cfg); err != nil {
+		if computerUseRequested {
+			fmt.Fprintf(os.Stderr,
+				"desktop helper refresh failed; computer use disabled for this agent process: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "desktop helper refresh failed while computer use is disabled: %v\n", err)
+		}
+	}
 	stateDir := config.ResolveStateDir(cfg, baseDir)
 	store := state.New(filepath.Join(stateDir, "data"))
 	registry := provider.BuildRegistry(cfg)
@@ -90,6 +112,41 @@ func run(args []string) int {
 		return serveUnix(srv, cfg.UDS)
 	}
 	return serveTCP(srv, cfg.Host+":"+strconv.Itoa(cfg.Port))
+}
+
+var (
+	desktopHelperEmbedded      = desktopasset.Embedded
+	desktopHelperEnsureCurrent = desktopasset.EnsureCurrent
+	desktopHelperDefaultPath   = desktopasset.DefaultHelperPath
+)
+
+func ensureDesktopHelperCurrent(cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("nil config")
+	}
+	if !desktopHelperEmbedded() {
+		return nil
+	}
+	_, err := desktopHelperEnsureCurrent(
+		desktopHelperDefaultPath(), cfg.ComputerUse.HelperSocket,
+	)
+	return err
+}
+
+func refreshDesktopHelperCapability(cfg *config.Config) error {
+	err := ensureDesktopHelperCurrent(cfg)
+	if err != nil && cfg != nil {
+		// A loaded helper reads enablement, protocol paths and safety TTLs only at
+		// startup. If materialization/restart failed, connecting a new agent to
+		// whatever process happens to remain would operate under stale policy.
+		// Keep the rest of the agent online, but do not construct a controller or
+		// advertise model tools in this process.
+		cfg.ComputerUse.Enabled = false
+		cfg.ComputerUse.LockedUse.Enabled = false
+		cfg.ComputerUse.DebugHTTPActions = false
+		cfg.ComputerUse.HelperRefreshFailed = true
+	}
+	return err
 }
 
 func applyListenerOverrides(cfg *config.Config, listen string, uds string) error {
@@ -121,10 +178,10 @@ func applyListenerOverrides(cfg *config.Config, listen string, uds string) error
 
 func runUpdate(args []string) int {
 	if len(args) == 0 || args[0] != "apply" {
-		fmt.Fprintln(os.Stderr, "usage: remote-agent update apply --device id --target path [--relay-url url]")
+		fmt.Fprintln(os.Stderr, "AgentHalo usage: agenthalo update apply --device id --target path [--relay-url url]")
 		return 2
 	}
-	fs := flag.NewFlagSet("remote-agent update apply", flag.ContinueOnError)
+	fs := flag.NewFlagSet("AgentHalo update apply", flag.ContinueOnError)
 	relayURL := fs.String("relay-url", "", "relay URL publishing the release manifest (required)")
 	service := fs.String("service", "", "relay service name (default "+autoupdate.DefaultService+")")
 	certDir := fs.String("cert-dir", "", "client cert directory for relay mTLS")
@@ -191,18 +248,18 @@ func (r *repeatedString) Set(v string) error {
 
 func runLogs(args []string) int {
 	if len(args) == 0 || args[0] != "upload" {
-		fmt.Fprintln(os.Stderr, "usage: remote-agent logs upload [--once] [--source path]")
+		fmt.Fprintln(os.Stderr, "AgentHalo usage: agenthalo logs upload [--once] [--source path]")
 		return 2
 	}
-	fs := flag.NewFlagSet("remote-agent logs upload", flag.ContinueOnError)
+	fs := flag.NewFlagSet("AgentHalo logs upload", flag.ContinueOnError)
 	relayURL := fs.String("relay-url", "", "relay URL, e.g. https://relay.example.com:8443")
-	namespace := fs.String("namespace", "remocoding", "relay log namespace")
+	namespace := fs.String("namespace", "agenthalo", "relay log namespace")
 	user := fs.String("user", "", "private-tunnel user id; optional when cert-dir contains an agent cert for this device")
 	device := fs.String("device", "", "device id")
 	certDir := fs.String("cert-dir", "/opt/private-tunnel/certs", "directory containing user-*.crt/key or agent-*.crt/key")
 	certFile := fs.String("cert", "", "explicit client cert")
 	keyFile := fs.String("key", "", "explicit client key")
-	statePath := fs.String("state", "/opt/private-tunnel/state/remote-agent/data/log-upload-state.json", "offset state JSON path")
+	statePath := fs.String("state", "/opt/private-tunnel/state/agenthalo/data/log-upload-state.json", "offset state JSON path")
 	interval := fs.Duration("interval", time.Minute, "upload interval")
 	maxChunk := fs.Int64("max-chunk", 1024*1024, "max bytes to send per source per upload")
 	once := fs.Bool("once", false, "upload once and exit")
@@ -241,7 +298,7 @@ func runLogs(args []string) int {
 
 func runHook(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: remote-agent hook <turnstate|install-turnstate>")
+		fmt.Fprintln(os.Stderr, "AgentHalo usage: agenthalo hook <turnstate|claude-observe|install-turnstate>")
 		return 2
 	}
 	switch args[0] {
@@ -252,21 +309,41 @@ func runHook(args []string) int {
 		}
 		turnstatehook.Run(state, os.Stdin, "")
 		return 0
-	case "install-turnstate":
-		fs := flag.NewFlagSet("remote-agent hook install-turnstate", flag.ContinueOnError)
-		settings := fs.String("settings", "", "Claude settings.json path")
-		bin := fs.String("binary", "", "remote-agent binary path for hook commands")
-		dir := fs.String("turnstate-dir", "", "turn-state directory")
+	case "claude-observe":
+		fs := flag.NewFlagSet("AgentHalo hook claude-observe", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		dir := fs.String("interaction-dir", "", "private Claude interaction directory")
+		cleanup := fs.Bool("cleanup", false, "retire a native interaction candidate without a decision")
 		if err := fs.Parse(args[1:]); err != nil {
 			return 2
 		}
-		cfg, err := turnstatehook.Install(*settings, *bin, *dir)
+		// An observer hook must return control to the native Claude UI without
+		// emitting a permission/question decision on stdout or stderr.
+		if *cleanup {
+			turnstatehook.RunInteractionCleanup(os.Stdin, *dir)
+		} else {
+			turnstatehook.RunInteractionObserver(os.Stdin, *dir)
+		}
+		return 0
+	case "install-turnstate":
+		fs := flag.NewFlagSet("AgentHalo hook install-turnstate", flag.ContinueOnError)
+		settings := fs.String("settings", "", "Claude settings.json path")
+		bin := fs.String("binary", "", "agenthalo binary path for hook commands")
+		dir := fs.String("turnstate-dir", "", "turn-state directory")
+		interactionDir := fs.String("interaction-dir", "", "private Claude interaction directory")
+		if err := fs.Parse(args[1:]); err != nil {
+			return 2
+		}
+		cfg, err := turnstatehook.InstallWithInteractionDir(*settings, *bin, *dir, *interactionDir)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
 		fmt.Println("installed turn-state hooks")
 		for _, cmd := range turnstatehook.InstalledCommands(cfg) {
+			fmt.Println("  " + cmd)
+		}
+		for _, cmd := range turnstatehook.InstalledInteractionCommands(cfg) {
 			fmt.Println("  " + cmd)
 		}
 		return 0
@@ -297,7 +374,7 @@ func serveTCP(srv *http.Server, addr string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	fmt.Printf("remote-agent listening on http://%s\n", addr)
+	fmt.Printf("AgentHalo listening on http://%s\n", addr)
 	return serveListener(srv, ln)
 }
 
@@ -317,7 +394,7 @@ func serveUnix(srv *http.Server, path string) int {
 		_ = os.Remove(path)
 	}()
 	_ = os.Chmod(path, 0o600)
-	fmt.Printf("remote-agent listening on unix://%s\n", path)
+	fmt.Printf("AgentHalo listening on unix://%s\n", path)
 	return serveListener(srv, ln)
 }
 

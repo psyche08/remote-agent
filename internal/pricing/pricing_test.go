@@ -9,8 +9,8 @@ import (
 )
 
 func TestLiveOfficialPricingPages(t *testing.T) {
-	if os.Getenv("RC_PRICING_LIVE") != "1" {
-		t.Skip("set RC_PRICING_LIVE=1 to validate official pricing pages")
+	if os.Getenv("AGENTHALO_PRICING_LIVE") != "1" {
+		t.Skip("set AGENTHALO_PRICING_LIVE=1 to validate official pricing pages")
 	}
 	m := New(t.TempDir())
 	if err := m.Refresh(context.Background()); err != nil {

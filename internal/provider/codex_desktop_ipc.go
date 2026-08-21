@@ -42,7 +42,7 @@ func NewCodexDesktopIPCClient(socketPath string, timeout time.Duration, hostID s
 	if hostID == "" {
 		hostID = "local"
 	}
-	return &CodexDesktopIPCClient{SocketPath: socketPath, Timeout: timeout, ClientType: "remote-agent", HostID: hostID, clientID: "initializing-client"}
+	return &CodexDesktopIPCClient{SocketPath: socketPath, Timeout: timeout, ClientType: "agenthalo", HostID: hostID, clientID: "initializing-client"}
 }
 
 func (c *CodexDesktopIPCClient) StartTurn(conversationID string, prompt string, opts map[string]any, timeout time.Duration) (any, error) {
@@ -196,7 +196,7 @@ func (c *CodexDesktopIPCClient) connect(timeout time.Duration) (net.Conn, error)
 func (c *CodexDesktopIPCClient) initialize(conn net.Conn, timeout time.Duration) error {
 	res, err := c.requestOnConn(conn, "initialize", map[string]any{
 		"clientType": c.ClientType,
-		"clientInfo": map[string]any{"name": c.ClientType, "title": c.ClientType, "version": remoteCodingClientVersion()},
+		"clientInfo": map[string]any{"name": "AgentHalo", "title": "AgentHalo", "version": agentHaloClientVersion()},
 	}, timeout, "initializing-client", "")
 	if err != nil {
 		return err

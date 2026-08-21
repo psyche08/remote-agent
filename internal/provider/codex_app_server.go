@@ -272,8 +272,8 @@ func (c *CodexAppServerClient) Initialize(name string) error {
 		timeout = codexAppServerStdioInitializeTimeout
 	}
 	_, err := c.request("initialize", map[string]any{
-		"clientInfo":   map[string]any{"name": name, "title": name, "version": remoteCodingClientVersion()},
-		"capabilities": nil,
+		"clientInfo":   map[string]any{"name": name, "title": name, "version": agentHaloClientVersion()},
+		"capabilities": map[string]any{"experimentalApi": true},
 	}, timeout)
 	if err != nil {
 		return err

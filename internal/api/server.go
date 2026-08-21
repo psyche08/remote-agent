@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/psyche08/remote-agent/internal/buildinfo"
+	"github.com/psyche08/remote-agent/internal/computeruse"
 	"github.com/psyche08/remote-agent/internal/config"
 	"github.com/psyche08/remote-agent/internal/pricing"
 	"github.com/psyche08/remote-agent/internal/provider"
@@ -24,34 +26,41 @@ import (
 )
 
 type Server struct {
-	cfg             *config.Config
-	registry        provider.Registry
-	store           *state.Store
-	activeProvider  string
-	activeSessionID *string
-	mu              sync.Mutex
-	resumeMu        sync.Mutex
-	resumeInFlight  map[string]bool
-	sendMu          sync.Mutex
-	sendInFlight    map[string]string
-	streamMu        sync.Mutex
-	streamSubs      map[string]map[chan []byte]bool
-	presenceMu      sync.Mutex
-	presence        map[string]time.Time
-	pushMu          sync.Mutex
-	pushLast        map[string]string
-	pushStop        chan struct{}
-	pushOnce        sync.Once
-	pushSender      func(map[string]any) int
-	updateMu        sync.Mutex
-	updateRunning   bool
-	nativeMu        sync.Mutex
-	nativeCache     map[string]*nativeSessionCacheEntry
-	clientMu        sync.Mutex
-	clients         map[string]*clientVersionSeen
-	pricing         *pricing.Manager
-	lastScreenshot  string
-	lastShotAt      string
+	cfg              *config.Config
+	registry         provider.Registry
+	store            *state.Store
+	activeProvider   string
+	activeSessionID  *string
+	mu               sync.Mutex
+	resumeMu         sync.Mutex
+	resumeInFlight   map[string]bool
+	sendMu           sync.Mutex
+	sendInFlight     map[string]string
+	streamMu         sync.Mutex
+	streamSubs       map[string]map[chan []byte]bool
+	presenceMu       sync.Mutex
+	presence         map[string]time.Time
+	pushMu           sync.Mutex
+	pushLast         map[string]string
+	pushStop         chan struct{}
+	pushOnce         sync.Once
+	pushSender       func(map[string]any) int
+	updateMu         sync.Mutex
+	updateRunning    bool
+	nativeMu         sync.Mutex
+	nativeCache      map[string]*nativeSessionCacheEntry
+	clientMu         sync.Mutex
+	clients          map[string]*clientVersionSeen
+	pricing          *pricing.Manager
+	lastScreenshot   string
+	lastShotAt       string
+	computerUseCtl   *computeruse.Controller
+	computerUseMu    sync.Mutex
+	computerUseTurns map[computerUseTurnKey]computerUseTurnLease
+	computerUseEnded map[computerUseTurnIdentity]struct{}
+	// Test-only barrier invoked after a trusted provider callback is made
+	// permanently stale and before its synchronous close/relock begins.
+	computerUseAutomationRevokedHook func()
 }
 
 type nativeSessionCacheEntry struct {
@@ -99,19 +108,42 @@ func NewServer(cfg *config.Config, registry provider.Registry, store *state.Stor
 		streamSubs: map[string]map[chan []byte]bool{}, presence: map[string]time.Time{},
 		pushLast: map[string]string{}, pushStop: make(chan struct{}), nativeCache: map[string]*nativeSessionCacheEntry{},
 		clients: map[string]*clientVersionSeen{}, pricing: pricing.New(store.DataDir()),
+		computerUseTurns: map[computerUseTurnKey]computerUseTurnLease{},
+		computerUseEnded: map[computerUseTurnIdentity]struct{}{},
 	}
 	s.pushSender = func(payload map[string]any) int { return s.sendPushToAll(payload, true) }
+	// The controller exists whenever computer use is configured on, so the
+	// status route can explain the feature. Locked Use only arms in
+	// StartBackground, after its startup scrub establishes a locked baseline.
+	if cfg.ComputerUse.Enabled {
+		s.computerUseCtl = computeruse.NewController(
+			expandUser(cfg.ComputerUse.HelperSocket),
+			cfg.ComputerUse.Enabled, cfg.ComputerUse.LockedUse.Enabled,
+		)
+	}
 	for _, id := range registry.IDs() {
 		providerID := id
-		if p, ok := registry[id].(interface {
+		registeredProvider := registry[id]
+		if p, ok := registeredProvider.(interface {
 			SetStreamPublisher(func(target string, frame map[string]any))
 		}); ok {
 			p.SetStreamPublisher(func(target string, frame map[string]any) {
 				s.publishProviderStream(providerID, target, frame)
 			})
 		}
+		if host, ok := registeredProvider.(provider.ClaudeControlRouteCommitHost); ok {
+			s.installClaudeControlRouteCommitHandler(providerID, host)
+		}
+		if s.computerUseCtl != nil {
+			if host, ok := registeredProvider.(provider.ComputerUseToolHost); ok {
+				s.installComputerUseToolHandler(providerID, host)
+			}
+			if host, ok := registeredProvider.(provider.ComputerUseAutomationHost); ok {
+				s.installComputerUseAutomationHandler(providerID, host)
+			}
+		}
 	}
-	// A running/waiting state belongs to one remote-agent process generation.
+	// A running/waiting state belongs to one AgentHalo process generation.
 	// Never carry it across a restart; live provider discovery will repopulate
 	// authoritative runtime state after startup.
 	s.resetPersistedTransientSessions()
@@ -153,11 +185,19 @@ func (s *Server) StartBackgroundWithOptions(autoUpdate bool, watchdog bool) {
 		if watchdog {
 			go s.watchdogLoop()
 		}
+		if s.computerUseCtl != nil {
+			s.computerUseCtl.Start()
+		}
 		s.pricing.Start(s.pushStop)
 	})
 }
 
 func (s *Server) StopBackground() {
+	if s.computerUseCtl != nil {
+		// Closing the window relocks the screen before the process goes away.
+		// A shutdown must not be a way to leave a Mac unlocked.
+		s.computerUseCtl.Stop()
+	}
 	select {
 	case <-s.pushStop:
 	default:
@@ -182,6 +222,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/copy_reply", s.copyReply)
 	mux.HandleFunc("/recover", s.recover)
 	mux.HandleFunc("/ocr", s.ocr)
+	mux.HandleFunc("/computer_use", s.computerUse)
+	mux.HandleFunc("/computer_use/locked_use", s.computerUseLockedUse)
+	mux.HandleFunc("/computer_use/window", s.computerUseWindow)
+	mux.HandleFunc("/computer_use/action", s.computerUseAction)
+	mux.HandleFunc("/computer_use/ax", s.computerUseAX)
 	mux.HandleFunc("/sessions", s.sessions)
 	mux.HandleFunc("/native_sessions", s.nativeSessions)
 	mux.HandleFunc("/session_options", s.sessionOptions)
@@ -215,7 +260,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/pricing", s.pricingStatus)
 	// The full console is device-owned and embedded in the agent binary. The
 	// relay root serves only a stable device host which frames this handler
-	// through /s/remotecoding/d/<device>/ without leaving the root PWA URL.
+	// through /s/agenthalo/d/<device>/ without leaving the root PWA URL.
 	mux.Handle("/", webui.Handler(buildinfo.Commit))
 	return s.captureClientVersion(mux)
 }
@@ -454,6 +499,14 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 				bindSessionTranscript(p, session, recordString(session, "session_id"), native)
 			}
 		}
+		if providerID == "claude" {
+			// Snapshot route plus monotonic commitment only after the provider
+			// operation and native identity (if any) are known.
+			setClaudeControlRoute(session, p, recordString(session, "session_id"))
+			if native != "" {
+				bindSessionTranscript(p, session, recordString(session, "session_id"), native)
+			}
+		}
 		if err := s.store.UpsertSession(session); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -473,6 +526,7 @@ type sendPromptIn struct {
 	SessionID   string   `json:"session_id"`
 	Prompt      string   `json:"prompt"`
 	Attachments []string `json:"attachments"`
+	OperationID string   `json:"operation_id"`
 }
 
 func (s *Server) sendPrompt(w http.ResponseWriter, r *http.Request) {
@@ -546,6 +600,17 @@ func (s *Server) sendPrompt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "session_id belongs to provider "+storedProvider+", not "+providerID)
 		return
 	}
+	body.OperationID = strings.TrimSpace(body.OperationID)
+	if body.OperationID == "" {
+		if providerID == "claude" {
+			writeError(w, http.StatusBadRequest, "operation_id is required for restart-safe Claude delivery")
+			return
+		}
+		body.OperationID = newID()
+	} else if err := validatePromptOperationID(body.OperationID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	session["provider_id"] = providerID
 	// Migrate persisted native Codex sessions before binding. Older releases
 	// recorded desktop_ipc even on ChatGPT Desktop builds that never publish
@@ -564,6 +629,17 @@ func (s *Server) sendPrompt(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.bindProviderTranscript(p, body.SessionID)
+	// Route-less Claude records predate Computer Use ownership persistence.
+	// Adopt the provider's default only after binding; an existing canonical
+	// route remains authoritative and must not be replaced by a fresh-process
+	// default before delivery.
+	if providerID == "claude" && canonicalClaudeControlRoute(recordString(session, "claude_control_route")) == "" &&
+		setClaudeControlRoute(session, p, body.SessionID) {
+		if err := s.store.UpsertSession(session); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
 	attachments, err := s.loadAttachments(providerID, body.SessionID, body.Attachments)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -578,17 +654,89 @@ func (s *Server) sendPrompt(w http.ResponseWriter, r *http.Request) {
 	if codexDesktopDeliveryForProvider(p, session) {
 		deliveryState = "attaching"
 	}
-	task := newTaskRecord(s.cfg.DeviceID, body.SessionID, providerID, body.Prompt)
+	requestDigest := promptRequestDigest(providerID, body.SessionID, body.Prompt, body.Attachments)
+	task := newTaskRecordWithID(
+		s.cfg.DeviceID, body.SessionID, providerID, body.Prompt, body.OperationID,
+	)
+	task["operation_id"] = body.OperationID
+	task["request_digest"] = requestDigest
 	if deliveryState == "attaching" {
 		task["status"] = "attaching"
 	} else {
 		task["status"] = "sent"
 	}
-	if err := s.store.AppendTask(task); err != nil {
+	durableTask, created, err := s.store.AppendTaskOnce(task)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	if !created {
+		if recordString(durableTask, "request_digest") != requestDigest ||
+			!sameProviderID(recordString(durableTask, "provider_id"), providerID) ||
+			recordString(durableTask, "session_id") != body.SessionID {
+			writeError(w, http.StatusConflict, "operation_id is already bound to another prompt request")
+			return
+		}
+		task = durableTask
+		switch recordString(task, "status") {
+		case "running", "completed", "waiting_approval", "waiting_input":
+			repairedSession, repairErr := s.repairPromptOperationBinding(p, providerID, task)
+			if repairErr != nil {
+				writeError(w, http.StatusInternalServerError, repairErr.Error())
+				return
+			}
+			session = repairedSession
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "accepted": true, "idempotent": true,
+				"task_id": body.OperationID, "session_id": body.SessionID,
+				"provider_id": providerID, "state": recordString(task, "status"),
+				"native_session_id": recordString(session, "native_session_id"),
+				"title":             recordString(session, "title"), "cwd": recordString(session, "cwd"),
+			})
+			return
+		case "needs_manual", "delivery_unknown":
+			repairedSession, repairErr := s.repairPromptOperationBinding(p, providerID, task)
+			if repairErr != nil {
+				writeError(w, http.StatusInternalServerError, repairErr.Error())
+				return
+			}
+			session = repairedSession
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": false, "accepted": false, "idempotent": true,
+				"task_id": body.OperationID, "session_id": body.SessionID,
+				"provider_id": providerID, "state": "needs_manual",
+				"delivery_outcome":  "unknown",
+				"native_session_id": recordString(session, "native_session_id"),
+				"error":             firstNonEmpty(recordString(task, "error"), "prompt delivery is uncertain and requires manual review"),
+			})
+			return
+		case "error":
+			repairedSession, repairErr := s.repairPromptOperationBinding(p, providerID, task)
+			if repairErr != nil {
+				writeError(w, http.StatusInternalServerError, repairErr.Error())
+				return
+			}
+			session = repairedSession
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": false, "accepted": false, "idempotent": true,
+				"task_id": body.OperationID, "session_id": body.SessionID,
+				"provider_id": providerID, "state": "error",
+				"error": firstNonEmpty(recordString(task, "error"), "prompt delivery failed"),
+			})
+			return
+		}
+	}
 	if !s.beginSend(providerID, body.SessionID, deliveryState) {
+		if !created {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "accepted": true, "idempotent": true,
+				"task_id": body.OperationID, "session_id": body.SessionID,
+				"provider_id": providerID, "state": firstNonEmpty(recordString(task, "status"), deliveryState),
+				"native_session_id": recordString(session, "native_session_id"),
+				"title":             recordString(session, "title"), "cwd": recordString(session, "cwd"),
+			})
+			return
+		}
 		updatedTask, _, _ := s.store.UpdateTask(recordString(task, "task_id"), state.Record{
 			"status": "error",
 			"error":  "send already in progress",
@@ -651,46 +799,259 @@ func (s *Server) sendState(providerID string, sessionID string) string {
 }
 
 func (s *Server) finishSend(providerID string, sessionID string, prompt string, attachments []provider.Attachment, taskID string, p provider.Provider) {
+	defer s.endSend(providerID, sessionID)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.recordPromptProviderPanic(providerID, sessionID, taskID)
+		}
+	}()
+
 	var result provider.SendResult
 	if len(attachments) > 0 {
-		if sender, ok := p.(provider.AttachmentSender); ok {
+		if sender, ok := p.(provider.PromptOperationAttachmentSender); ok {
+			result = sender.SendPromptOperationWithAttachments(sessionID, prompt, attachments, taskID)
+		} else if sender, ok := p.(provider.AttachmentSender); ok {
 			result = sender.SendPromptWithAttachments(sessionID, prompt, attachments)
 		} else {
 			msg := "provider does not support attachments"
 			result = provider.SendResult{OK: false, State: "error", Error: &msg}
 		}
 	} else {
-		result = p.SendPrompt(sessionID, prompt)
+		if sender, ok := p.(provider.PromptOperationSender); ok {
+			result = sender.SendPromptOperation(sessionID, prompt, taskID)
+		} else {
+			result = p.SendPrompt(sessionID, prompt)
+		}
 	}
-	status := "running"
-	stateValue := firstNonEmpty(result.State, "running")
-	if !result.OK {
-		status = "error"
-		stateValue = firstNonEmpty(result.State, "error")
-	}
+	status, stateValue, deliveryOutcome := promptDeliveryOutcome(result)
 	errText := ""
 	if result.Error != nil {
 		errText = *result.Error
 	}
-	updatedTask, _, _ := s.store.UpdateTask(taskID, state.Record{
-		"status":         status,
-		"native_task_id": result.NativeTaskID,
-		"error":          errText,
-	})
-	session, ok, err := s.findSessionForProviderAny(providerID, sessionID)
-	if err == nil && ok {
-		session["last_prompt"] = prompt
-		session["state"] = stateValue
-		session["updated_at"] = nowISO()
-		if result.OK {
-			session["last_error"] = ""
-		} else {
-			session["last_error"] = firstNonEmpty(errText, "send failed")
-		}
-		_ = s.store.UpsertSession(session)
+	claudeRoute := ""
+	claudeCommitted, claudeCommittedKnown := false, false
+	if providerID == "claude" {
+		// Snapshot provider-owned state before entering the store transaction.
+		// Provider callbacks may synchronously acquire the store, so calling back
+		// into the provider while holding the store mutex would invert that lock
+		// order.
+		claudeRoute = claudeControlRouteFromProvider(p, sessionID)
+		claudeCommitted, claudeCommittedKnown = claudeControlCommittedFromProvider(p, sessionID)
 	}
-	s.endSend(providerID, sessionID)
+	updatedTask, updatedSession, found, commitErr := s.store.CommitTaskSessionOutcome(
+		taskID, sessionID, func(task state.Record, session state.Record) error {
+			if !sameProviderID(recordString(task, "provider_id"), providerID) {
+				return errors.New("provider task ownership changed during send")
+			}
+			if !sameProviderID(recordString(session, "provider_id"), providerID) {
+				return errors.New("provider session ownership changed during send")
+			}
+			task["status"] = status
+			task["delivery_outcome"] = deliveryOutcome
+			task["native_task_id"] = result.NativeTaskID
+			task["error"] = errText
+			session["last_prompt"] = prompt
+			session["state"] = stateValue
+			if result.OK {
+				session["last_error"] = ""
+			} else {
+				session["last_error"] = firstNonEmpty(errText, "send failed")
+			}
+			if result.NativeSessionID != "" {
+				// Desktop-first Claude sessions may not have a native transcript until
+				// their first UI send creates one. Persist and bind that identity before
+				// publishing the completed delivery state so later approvals, answers,
+				// and restart hydration target the same conversation.
+				session["native_session_id"] = result.NativeSessionID
+				session["transcript_id"] = result.NativeSessionID
+			}
+			if providerID == "claude" {
+				// A pre-mutation Computer Use failure may intentionally switch this
+				// logical session to the CLI fallback. Publish that owner and its
+				// monotonic commitment in the same transaction as the task outcome.
+				if claudeRoute != "" {
+					session["claude_control_route"] = claudeRoute
+				}
+				committed := claudeControlCommittedForBinding(
+					session, firstNonEmpty(recordString(session, "transcript_id"), recordString(session, "native_session_id")),
+				)
+				if claudeRoute == "desktop_computer_use" && claudeCommittedKnown {
+					committed = committed || claudeCommitted
+				}
+				session[claudeControlCommittedKey] = committed
+				task["claude_control_route"] = recordString(session, "claude_control_route")
+				task[claudeControlCommittedKey] = committed
+			}
+			task["native_session_id"] = recordString(session, "native_session_id")
+			task["transcript_id"] = recordString(session, "transcript_id")
+			return nil
+		})
+	if commitErr != nil || !found {
+		// A provider call has already crossed its side-effect boundary. Never
+		// turn a storage failure into a definite delivery failure: first replay a
+		// prepared journal, then expose only an in-memory needs_manual outcome if
+		// no durable result can be recovered. A retry with this operation id will
+		// let the provider's tombstone decide whether delivery was attempted.
+		if recoveredTask, recoveredSession, recovered := s.persistedPromptOperationOutcome(taskID, sessionID); recovered {
+			updatedTask, updatedSession, found = recoveredTask, recoveredSession, true
+		} else {
+			updatedTask = state.Record{
+				"task_id": taskID, "session_id": sessionID, "provider_id": providerID,
+				"status": "needs_manual", "delivery_outcome": "unknown",
+				"error": "prompt delivery outcome could not be durably recorded; manual review is required",
+			}
+			if current, ok, err := s.findSessionForProviderAny(providerID, sessionID); err == nil && ok {
+				updatedSession = current
+			}
+		}
+	}
+	if found && updatedSession != nil && providerID == "claude" {
+		transcriptID := firstNonEmpty(
+			recordString(updatedSession, "transcript_id"), recordString(updatedSession, "native_session_id"),
+		)
+		bindSessionTranscript(p, updatedSession, sessionID, transcriptID)
+	}
 	s.publishTaskStream(providerID, sessionID, updatedTask)
+}
+
+func (s *Server) recordPromptProviderPanic(providerID string, sessionID string, taskID string) {
+	const detail = "provider stopped unexpectedly after prompt admission; delivery outcome is unknown and requires manual review"
+	updatedTask, _, found, err := s.store.CommitTaskSessionOutcome(
+		taskID, sessionID, func(task state.Record, session state.Record) error {
+			if !sameProviderID(recordString(task, "provider_id"), providerID) ||
+				!sameProviderID(recordString(session, "provider_id"), providerID) {
+				return errors.New("provider ownership changed while recording an uncertain prompt outcome")
+			}
+			task["status"] = "needs_manual"
+			task["delivery_outcome"] = "unknown"
+			task["error"] = detail
+			session["state"] = "needs_manual"
+			session["last_error"] = detail
+			return nil
+		},
+	)
+	if err != nil || !found {
+		if recoveredTask, _, recovered := s.persistedPromptOperationOutcome(taskID, sessionID); recovered {
+			updatedTask = recoveredTask
+		} else {
+			updatedTask = state.Record{
+				"task_id": taskID, "session_id": sessionID, "provider_id": providerID,
+				"status": "needs_manual", "delivery_outcome": "unknown", "error": detail,
+			}
+		}
+	}
+	s.publishTaskStream(providerID, sessionID, updatedTask)
+}
+
+func promptDeliveryOutcome(result provider.SendResult) (taskStatus string, sessionState string, outcome string) {
+	stateValue := strings.TrimSpace(result.State)
+	if result.OK {
+		switch stateValue {
+		case "idle", "completed":
+			return "completed", firstNonEmpty(stateValue, "completed"), "confirmed"
+		case "waiting_approval", "waiting_input":
+			return stateValue, stateValue, "confirmed"
+		default:
+			return "running", firstNonEmpty(stateValue, "running"), "confirmed"
+		}
+	}
+	if stateValue == "needs_manual" || stateValue == "delivery_unknown" {
+		return "needs_manual", "needs_manual", "unknown"
+	}
+	return "error", firstNonEmpty(stateValue, "error"), "failed"
+}
+
+func (s *Server) persistedPromptOperationOutcome(taskID string, sessionID string) (state.Record, state.Record, bool) {
+	tasks, err := s.store.Tasks()
+	if err != nil {
+		return nil, nil, false
+	}
+	var task state.Record
+	for _, candidate := range tasks {
+		if recordString(candidate, "task_id") == taskID && recordString(candidate, "session_id") == sessionID {
+			task = candidate
+			break
+		}
+	}
+	if task == nil || recordString(task, "delivery_outcome") == "" {
+		return nil, nil, false
+	}
+	session, found, err := s.store.FindSession(sessionID)
+	if err != nil || !found {
+		return nil, nil, false
+	}
+	return task, session, true
+}
+
+// repairPromptOperationBinding makes a terminal duplicate self-healing. The
+// task carries the native transcript and Claude owner published with its
+// outcome; if a legacy or externally interrupted write left the session
+// incomplete, the same journaled transaction restores the missing half before
+// the provider is rebound. Conflicting proof fails closed and is never sent.
+func (s *Server) repairPromptOperationBinding(
+	p provider.Provider, providerID string, durableTask state.Record,
+) (state.Record, error) {
+	taskID := recordString(durableTask, "task_id")
+	sessionID := recordString(durableTask, "session_id")
+	_, repairedSession, found, err := s.store.CommitTaskSessionOutcome(
+		taskID, sessionID, func(task state.Record, session state.Record) error {
+			if !sameProviderID(recordString(task, "provider_id"), providerID) ||
+				!sameProviderID(recordString(session, "provider_id"), providerID) {
+				return errors.New("prompt operation binding belongs to another provider")
+			}
+			taskTranscript := recordString(task, "transcript_id")
+			taskNative := recordString(task, "native_session_id")
+			if taskTranscript != "" && taskNative != "" && taskTranscript != taskNative {
+				return errors.New("prompt operation contains conflicting native session proof")
+			}
+			proof := firstNonEmpty(taskTranscript, taskNative)
+			sessionTranscript := recordString(session, "transcript_id")
+			sessionNative := recordString(session, "native_session_id")
+			if proof == "" {
+				if sessionTranscript != "" && sessionNative != "" && sessionTranscript != sessionNative {
+					return errors.New("stored session contains conflicting native session proof")
+				}
+				proof = firstNonEmpty(sessionTranscript, sessionNative)
+			}
+			if proof != "" {
+				if (sessionTranscript != "" && sessionTranscript != proof) ||
+					(sessionNative != "" && sessionNative != proof) {
+					return errors.New("prompt operation native session proof conflicts with stored session")
+				}
+				task["transcript_id"], task["native_session_id"] = proof, proof
+				session["transcript_id"], session["native_session_id"] = proof, proof
+			}
+			if providerID == "claude" {
+				taskRoute := canonicalClaudeControlRoute(recordString(task, "claude_control_route"))
+				sessionRoute := canonicalClaudeControlRoute(recordString(session, "claude_control_route"))
+				if taskRoute != "" && sessionRoute != "" && taskRoute != sessionRoute {
+					return errors.New("prompt operation Claude route conflicts with stored session")
+				}
+				route := firstNonEmpty(taskRoute, sessionRoute)
+				if route != "" {
+					task["claude_control_route"], session["claude_control_route"] = route, route
+				}
+				committed := claudeControlCommittedForBinding(session, proof)
+				if taskCommitted, ok := task[claudeControlCommittedKey].(bool); ok {
+					committed = committed || taskCommitted
+				}
+				task[claudeControlCommittedKey], session[claudeControlCommittedKey] = committed, committed
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("repair prompt operation binding: %w", err)
+	}
+	if !found {
+		return nil, errors.New("repair prompt operation binding: durable task or session is missing")
+	}
+	transcriptID := firstNonEmpty(
+		recordString(repairedSession, "transcript_id"), recordString(repairedSession, "native_session_id"),
+	)
+	if transcriptID != "" || providerID == "claude" {
+		bindSessionTranscript(p, repairedSession, sessionID, transcriptID)
+	}
+	return repairedSession, nil
 }
 
 type rewindUserMessageIn struct {
@@ -954,6 +1315,8 @@ func (s *Server) resumeNativeSession(w http.ResponseWriter, r *http.Request) {
 	}
 	logicalID := providerScopedLogicalID(targetID, cliID)
 	selectedCodexRoute := ""
+	selectedClaudeRoute := ""
+	existingClaudeStateChanged := false
 	existing, found, findErr := s.findSessionForProviderAny(targetID, cliID)
 	if findErr != nil {
 		// Persisted ownership is authoritative. If it cannot be read, fail
@@ -971,6 +1334,9 @@ func (s *Server) resumeNativeSession(w http.ResponseWriter, r *http.Request) {
 			if selectedCodexRoute == "app_server" {
 				selectedCodexRoute = codexAppServerDeliveryRoute(target)
 			}
+		} else if targetID == "claude" {
+			existingClaudeStateChanged = normalizeClaudeControlCommitted(existing)
+			selectedClaudeRoute = claudeControlRouteForBinding(target, existing, logicalID)
 		}
 	}
 	if body.Fork {
@@ -987,6 +1353,29 @@ func (s *Server) resumeNativeSession(w http.ResponseWriter, r *http.Request) {
 			"codex_control_route": selectedCodexRoute,
 			"cwd":                 stringAny(native["cwd"]),
 		}, logicalID, cliID)
+	} else if targetID == "claude" {
+		if selectedClaudeRoute == "" {
+			selectedClaudeRoute = claudeControlRouteFromProvider(target, logicalID)
+		}
+		bindSessionTranscript(target, state.Record{
+			"provider_id":             "claude",
+			"claude_control_route":    selectedClaudeRoute,
+			claudeControlCommittedKey: true,
+			"cwd":                     stringAny(native["cwd"]),
+		}, logicalID, cliID)
+		// Persist the adopted owner before activation when a legacy logical
+		// record already exists. This makes a restart during activation restore
+		// the same route instead of selecting a new default.
+		if found && canonicalClaudeControlRoute(recordString(existing, "claude_control_route")) == "" && selectedClaudeRoute != "" {
+			existing["claude_control_route"] = selectedClaudeRoute
+			existingClaudeStateChanged = true
+		}
+		if found && existingClaudeStateChanged {
+			if err := s.store.UpsertSession(existing); err != nil {
+				writeError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+		}
 	}
 	if waiter, ok := target.(interface{ WaitResumable(string) bool }); ok && !body.Fork {
 		if !waiter.WaitResumable(cliID) {
@@ -1026,6 +1415,14 @@ func (s *Server) resumeNativeSession(w http.ResponseWriter, r *http.Request) {
 		} else {
 			delete(session, "delivery_route")
 		}
+	} else if targetID == "claude" {
+		// Resume always adopts an existing transcript and is therefore committed,
+		// even if the selected owner is Desktop Computer Use.
+		session[claudeControlCommittedKey] = true
+		if !setClaudeControlRoute(session, target, logicalID) && selectedClaudeRoute != "" {
+			session["claude_control_route"] = selectedClaudeRoute
+		}
+		bindSessionTranscript(target, session, logicalID, cliID)
 	}
 	session["state"] = "running"
 	if targetID == "codex" {
@@ -1722,7 +2119,21 @@ func (s *Server) interrupt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
+	// An interrupt ends the authority to drive the desktop immediately. Do not
+	// wait for an eventually delivered provider terminal frame: revoke the
+	// lease before invoking the provider and synchronously require the helper to
+	// confirm cleanup. The provider is still interrupted if relock confirmation
+	// fails; its task must not keep running merely because cleanup reported a
+	// fault, while the already-revoked lease remains fail-closed.
+	cleanupErr := s.terminateComputerUseTarget(providerID, body.SessionID, "provider interrupt")
 	res := p.Interrupt(body.SessionID)
+	if cleanupErr != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"ok": false, "status": "error", "code": computerUseErrorCode(cleanupErr),
+			"detail": "interrupt could not confirm computer-use relock: " + cleanupErr.Error(),
+		})
+		return
+	}
 	code := http.StatusOK
 	if !truthy(res["ok"], false) {
 		code = http.StatusBadRequest
@@ -1937,10 +2348,17 @@ func (s *Server) approval(w http.ResponseWriter, r *http.Request) {
 }
 
 type questionAnswerIn struct {
-	ProviderID string            `json:"provider_id"`
-	SessionID  string            `json:"session_id"`
-	RequestID  string            `json:"request_id"`
-	Answers    map[string]string `json:"answers"`
+	ProviderID  string               `json:"provider_id"`
+	SessionID   string               `json:"session_id"`
+	RequestID   string               `json:"request_id"`
+	Answers     map[string]string    `json:"answers"`
+	AnswerItems []questionAnswerItem `json:"answer_items"`
+}
+
+type questionAnswerItem struct {
+	Question string   `json:"question"`
+	Selected []string `json:"selected"`
+	Other    string   `json:"other"`
 }
 
 func (s *Server) questionAnswer(w http.ResponseWriter, r *http.Request) {
@@ -1952,7 +2370,7 @@ func (s *Server) questionAnswer(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	if body.SessionID == "" || body.RequestID == "" || len(body.Answers) == 0 {
+	if body.SessionID == "" || body.RequestID == "" || (len(body.Answers) == 0 && len(body.AnswerItems) == 0) {
 		writeError(w, http.StatusBadRequest, "session_id, request_id and answers are required")
 		return
 	}
@@ -1965,14 +2383,22 @@ func (s *Server) questionAnswer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
-	answerer, ok := p.(interface {
+	structured, flat, err := normalizedQuestionAnswers(body.Answers, body.AnswerItems)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var res map[string]any
+	if answerer, ok := p.(provider.StructuredQuestionAnswerer); ok && len(body.AnswerItems) > 0 {
+		res = answerer.AnswerQuestionStructured(body.SessionID, body.RequestID, structured)
+	} else if answerer, ok := p.(interface {
 		AnswerQuestion(sessionID string, requestID string, answers map[string]string) map[string]any
-	})
-	if !ok {
+	}); ok {
+		res = answerer.AnswerQuestion(body.SessionID, body.RequestID, flat)
+	} else {
 		writeError(w, http.StatusBadRequest, "provider does not support structured question answers")
 		return
 	}
-	res := answerer.AnswerQuestion(body.SessionID, body.RequestID, body.Answers)
 	code := http.StatusOK
 	if !truthy(res["ok"], false) {
 		code = http.StatusBadRequest
@@ -1980,9 +2406,67 @@ func (s *Server) questionAnswer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, code, res)
 }
 
+func normalizedQuestionAnswers(
+	legacy map[string]string, items []questionAnswerItem,
+) (map[string]provider.QuestionAnswer, map[string]string, error) {
+	structured := map[string]provider.QuestionAnswer{}
+	flat := map[string]string{}
+	if len(items) == 0 {
+		for question, answer := range legacy {
+			question = strings.TrimSpace(question)
+			answer = strings.TrimSpace(answer)
+			if question == "" || answer == "" {
+				return nil, nil, errors.New("every question requires a non-empty answer")
+			}
+			flat[question] = answer
+			structured[question] = provider.QuestionAnswer{Other: answer}
+		}
+		return structured, flat, nil
+	}
+	if len(items) > 32 {
+		return nil, nil, errors.New("too many question answers")
+	}
+	for _, item := range items {
+		question := strings.TrimSpace(item.Question)
+		if question == "" || len(question) > 4096 {
+			return nil, nil, errors.New("every answer requires a valid question")
+		}
+		if _, duplicate := structured[question]; duplicate {
+			return nil, nil, errors.New("duplicate question answer")
+		}
+		seen := map[string]bool{}
+		selected := make([]string, 0, len(item.Selected))
+		for _, raw := range item.Selected {
+			value := strings.TrimSpace(raw)
+			if value == "" || len(value) > 4096 || seen[value] {
+				continue
+			}
+			seen[value] = true
+			selected = append(selected, value)
+		}
+		other := strings.TrimSpace(item.Other)
+		if len(other) > 16*1024 {
+			return nil, nil, errors.New("question answer is too long")
+		}
+		if len(selected) == 0 && other == "" {
+			return nil, nil, errors.New("every question requires a non-empty answer")
+		}
+		structured[question] = provider.QuestionAnswer{Selected: selected, Other: other}
+		values := append([]string(nil), selected...)
+		if other != "" {
+			values = append(values, other)
+		}
+		flat[question] = strings.Join(values, ", ")
+	}
+	return structured, flat, nil
+}
+
 func (s *Server) publishProviderStream(providerID string, target string, frame map[string]any) {
 	if target == "" {
 		return
+	}
+	if err := s.observeComputerUseProviderFrame(providerID, target, frame); err != nil {
+		fmt.Fprintf(os.Stderr, "computer-use turn cleanup failed for %s/%s: %v\n", providerID, target, err)
 	}
 	b, err := json.Marshal(frame)
 	if err != nil {
@@ -2375,6 +2859,14 @@ func (s *Server) closeSession(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+	}
+	// Closing a logical session revokes desktop authority before either the
+	// durable record or provider owner can disappear. The provider's eventual
+	// terminal frame is not a cleanup guarantee: Locked Use must synchronously
+	// confirm relock here, and a failure leaves the session available for retry.
+	if err := s.terminateComputerUseTarget(providerID, logicalID, "provider session close"); err != nil {
+		writeComputerUseError(w, fmt.Errorf("close session could not confirm computer-use relock: %w", err))
+		return
 	}
 	if _, removed, removeErr := s.store.RemoveSession(logicalID); removeErr != nil {
 		writeError(w, http.StatusInternalServerError, removeErr.Error())

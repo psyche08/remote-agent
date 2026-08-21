@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	pushVAPIDSub      = "mailto:remote-agent@example.invalid"
+	pushVAPIDSub      = "mailto:agenthalo@example.invalid"
 	pushFailThreshold = 5
 	pushPresenceTTL   = 25 * time.Second
 	pushMonitorEvery  = 2 * time.Second
@@ -203,7 +203,7 @@ func (s *Server) pushApprove(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) pushTest(w http.ResponseWriter, r *http.Request) {
-	payload := buildPushPayload("test", "waiting_approval", "remote-agent push test")
+	payload := buildPushPayload("test", "waiting_approval", "AgentHalo push test")
 	payload["device"] = s.cfg.DeviceID
 	subs, _ := s.loadPushSubs()
 	n := s.sendPushToAll(payload, true)
@@ -310,8 +310,8 @@ func buildProviderPushPayload(providerID string, sessionID string, nativeSession
 		"title":          title,
 		"body":           body,
 		"kind":           kind,
-		"tag":            "remotecoding-" + providerID + "-" + nativeSessionID,
-		"url":            "/s/remotecoding/?" + q.Encode(),
+		"tag":            "agenthalo-" + providerID + "-" + nativeSessionID,
+		"url":            "/s/agenthalo/?" + q.Encode(),
 		"session":        sessionID,
 		"native_session": nativeSessionID,
 		"provider":       providerID,
@@ -397,7 +397,7 @@ func (s *Server) pushProxy() string {
 	if s.cfg.PushProxy != "" {
 		return s.cfg.PushProxy
 	}
-	return os.Getenv("RC_PUSH_PROXY")
+	return os.Getenv("AGENTHALO_PUSH_PROXY")
 }
 
 func (s *Server) pushDir() string {
@@ -412,39 +412,14 @@ func (s *Server) pushSubsPath() string {
 	return filepath.Join(s.pushDir(), "subscriptions.json")
 }
 
-func (s *Server) legacyPushSubsPath() string {
-	return filepath.Join(s.store.DataDir(), "push_subscriptions.json")
-}
-
 func (s *Server) vapidPath() string {
 	return filepath.Join(s.pushDir(), "vapid.json")
-}
-
-func (s *Server) legacyVAPIDPath() string {
-	return filepath.Join(s.store.DataDir(), "push_vapid.json")
 }
 
 func (s *Server) loadPushSubs() ([]pushSub, error) {
 	s.pushMu.Lock()
 	defer s.pushMu.Unlock()
-	for _, p := range []string{s.pushSubsPath(), s.legacyPushSubsPath()} {
-		b, err := os.ReadFile(p)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if len(strings.TrimSpace(string(b))) == 0 {
-			return []pushSub{}, nil
-		}
-		var subs []pushSub
-		if err := json.Unmarshal(b, &subs); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", p, err)
-		}
-		return subs, nil
-	}
-	return []pushSub{}, nil
+	return s.loadPushSubsNoLock()
 }
 
 func (s *Server) savePushSubs(subs []pushSub) error {
@@ -495,24 +470,22 @@ func (s *Server) bumpPushFail(endpoint string) error {
 }
 
 func (s *Server) loadPushSubsNoLock() ([]pushSub, error) {
-	for _, p := range []string{s.pushSubsPath(), s.legacyPushSubsPath()} {
-		b, err := os.ReadFile(p)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if len(strings.TrimSpace(string(b))) == 0 {
-			return []pushSub{}, nil
-		}
-		var subs []pushSub
-		if err := json.Unmarshal(b, &subs); err != nil {
-			return nil, fmt.Errorf("parse %s: %w", p, err)
-		}
-		return subs, nil
+	p := s.pushSubsPath()
+	b, err := os.ReadFile(p)
+	if os.IsNotExist(err) {
+		return []pushSub{}, nil
 	}
-	return []pushSub{}, nil
+	if err != nil {
+		return nil, err
+	}
+	if len(strings.TrimSpace(string(b))) == 0 {
+		return []pushSub{}, nil
+	}
+	var subs []pushSub
+	if err := json.Unmarshal(b, &subs); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", p, err)
+	}
+	return subs, nil
 }
 
 func (s *Server) loadOrCreateVAPID() (map[string]string, error) {
@@ -521,19 +494,14 @@ func (s *Server) loadOrCreateVAPID() (map[string]string, error) {
 	}
 	s.pushMu.Lock()
 	defer s.pushMu.Unlock()
-	for _, p := range []string{s.vapidPath(), s.legacyVAPIDPath()} {
-		keys, ok, err := readVAPIDFile(p)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			if p != s.vapidPath() {
-				_ = writeJSON0600(s.vapidPath(), keys)
-			}
-			return keys, nil
-		}
+	keys, ok, err := readVAPIDFile(s.vapidPath())
+	if err != nil {
+		return nil, err
 	}
-	keys, err := generateVAPIDKeys()
+	if ok {
+		return keys, nil
+	}
+	keys, err = generateVAPIDKeys()
 	if err != nil {
 		return nil, err
 	}

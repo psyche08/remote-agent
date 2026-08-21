@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -98,6 +100,9 @@ func validateStartOptions(p provider.Provider, in createSessionIn) (provider.Sta
 	model := cleanOptional(in.Model)
 	effort := cleanOptional(in.Effort)
 	mode := cleanOptional(in.Mode)
+	if mode == "" && canonicalProviderID(p.ID()) == "claude" {
+		mode = firstNonEmpty(cleanOptional(ms.Mode), "auto")
+	}
 	if model != "" && len(ms.Models) > 0 && !modelAllowed(ms.Models, model) {
 		return opts, errors.New("unknown model: " + model)
 	}
@@ -151,7 +156,7 @@ func newSessionRecord(deviceID string, providerID string, title string, opts pro
 		title = "untitled"
 	}
 	ts := nowISO()
-	return state.Record{
+	record := state.Record{
 		"session_id":           newID(),
 		"device_id":            deviceID,
 		"provider_id":          providerID,
@@ -170,12 +175,26 @@ func newSessionRecord(deviceID string, providerID string, title string, opts pro
 		"created_at":           ts,
 		"updated_at":           ts,
 	}
+	if canonicalProviderID(providerID) == "claude" {
+		// Desktop-first creation is tentative until the provider confirms an
+		// exact native transcript or commits the CLI route. Persisting false is
+		// what distinguishes a new session from a legacy record whose missing
+		// field must be restored fail-closed as committed.
+		record[claudeControlCommittedKey] = false
+	}
+	return record
 }
 
 func newTaskRecord(deviceID string, sessionID string, providerID string, prompt string) state.Record {
+	return newTaskRecordWithID(deviceID, sessionID, providerID, prompt, newID())
+}
+
+func newTaskRecordWithID(
+	deviceID string, sessionID string, providerID string, prompt string, taskID string,
+) state.Record {
 	ts := nowISO()
 	return state.Record{
-		"task_id":          newID(),
+		"task_id":          taskID,
 		"session_id":       sessionID,
 		"device_id":        deviceID,
 		"provider_id":      providerID,
@@ -189,6 +208,32 @@ func newTaskRecord(deviceID string, sessionID string, providerID string, prompt 
 		"created_at":       ts,
 		"updated_at":       ts,
 	}
+}
+
+var promptOperationIDRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$`)
+
+func validatePromptOperationID(value string) error {
+	if !promptOperationIDRE.MatchString(strings.TrimSpace(value)) {
+		return errors.New("operation_id must be 16-128 safe ASCII characters")
+	}
+	return nil
+}
+
+func promptRequestDigest(
+	providerID string, sessionID string, prompt string, attachments []string,
+) string {
+	payload := struct {
+		ProviderID  string   `json:"provider_id"`
+		SessionID   string   `json:"session_id"`
+		Prompt      string   `json:"prompt"`
+		Attachments []string `json:"attachments,omitempty"`
+	}{
+		ProviderID: canonicalProviderID(providerID), SessionID: sessionID,
+		Prompt: prompt, Attachments: append([]string(nil), attachments...),
+	}
+	b, _ := json.Marshal(payload)
+	digest := sha256.Sum256(b)
+	return hex.EncodeToString(digest[:])
 }
 
 func (s *Server) findSessionAny(id string) (state.Record, bool, error) {
@@ -243,11 +288,29 @@ func (s *Server) hydrateControlSession(p provider.Provider, providerID string, i
 	if rec, ok, err := s.findSessionForProviderAny(providerID, id); err != nil {
 		return err
 	} else if ok {
+		claudeStateChanged := false
+		if canonicalProviderID(providerID) == "claude" {
+			claudeStateChanged = normalizeClaudeControlCommitted(rec)
+			// Adopt and persist the provider primary route before binding. A legacy
+			// route-less record is already committed fail-closed; binding first
+			// would let an implementation that ignores empty routes lose that fact.
+			if canonicalClaudeControlRoute(recordString(rec, "claude_control_route")) == "" &&
+				setClaudeControlRoute(rec, p, recordString(rec, "session_id")) {
+				claudeStateChanged = true
+			}
+		}
 		logical := recordString(rec, "session_id")
 		transcript := firstNonEmpty(recordString(rec, "transcript_id"), recordString(rec, "native_session_id"))
-		if logical != "" && transcript != "" {
+		if logical != "" && (transcript != "" || canonicalProviderID(providerID) == "claude") {
 			bindSessionTranscript(p, rec, logical, transcript)
-			bindSessionTranscript(p, rec, id, transcript)
+			if transcript != "" {
+				bindSessionTranscript(p, rec, id, transcript)
+			}
+		}
+		if claudeStateChanged {
+			if err := s.store.UpsertSession(rec); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -256,9 +319,10 @@ func (s *Server) hydrateControlSession(p provider.Provider, providerID string, i
 		if transcript == "" {
 			transcript = id
 		}
-		if binder, ok := p.(interface{ BindTranscript(string, string) }); ok {
-			binder.BindTranscript(id, transcript)
-		}
+		bindSessionTranscript(p, state.Record{
+			"provider_id": providerID,
+			"cwd":         stringAny(row["cwd"]),
+		}, id, transcript)
 		return nil
 	}
 	// A provider-reported pending session is authoritative even in the small
@@ -270,9 +334,7 @@ func (s *Server) hydrateControlSession(p provider.Provider, providerID string, i
 			if pendingID != id {
 				continue
 			}
-			if binder, ok := p.(interface{ BindTranscript(string, string) }); ok {
-				binder.BindTranscript(id, id)
-			}
+			bindSessionTranscript(p, state.Record{"provider_id": providerID}, id, id)
 			return nil
 		}
 	}
@@ -283,7 +345,11 @@ func (s *Server) bindProviderTranscript(p provider.Provider, id string) {
 	if id == "" {
 		return
 	}
-	if _, ok := p.(interface{ BindTranscript(string, string) }); !ok {
+	_, transcriptAware := p.(interface{ BindTranscript(string, string) })
+	_, claudeRouteAware := p.(interface {
+		BindClaudeControlRoute(string, string, string, string)
+	})
+	if !transcriptAware && !claudeRouteAware {
 		return
 	}
 	rec, ok, err := s.findSessionForProviderAny(p.ID(), id)
@@ -291,6 +357,10 @@ func (s *Server) bindProviderTranscript(p provider.Provider, id string) {
 		return
 	}
 	if !ok {
+		if canonicalProviderID(p.ID()) == "claude" {
+			bindSessionTranscript(p, state.Record{"provider_id": "claude"}, id, id)
+			return
+		}
 		// Native-session previews are intentionally not persisted as logical
 		// sessions until the web sends a prompt. Bind the native id to itself
 		// with the provider's explicit native route so read-side running,
@@ -301,12 +371,14 @@ func (s *Server) bindProviderTranscript(p provider.Provider, id string) {
 			binder.BindSessionRoute(id, id, codexPreferredNativeDeliveryRoute(p), "")
 			return
 		}
-		p.(interface{ BindTranscript(string, string) }).BindTranscript(id, id)
+		if binder, ok := p.(interface{ BindTranscript(string, string) }); ok {
+			binder.BindTranscript(id, id)
+		}
 		return
 	}
 	sessionID := recordString(rec, "session_id")
-	transcriptID := recordString(rec, "transcript_id")
-	if sessionID != "" && transcriptID != "" {
+	transcriptID := firstNonEmpty(recordString(rec, "transcript_id"), recordString(rec, "native_session_id"))
+	if sessionID != "" && (transcriptID != "" || canonicalProviderID(p.ID()) == "claude") {
 		bindSessionTranscript(p, rec, sessionID, transcriptID)
 	}
 	if id != "" && transcriptID != "" {
@@ -315,7 +387,34 @@ func (s *Server) bindProviderTranscript(p provider.Provider, id string) {
 }
 
 func bindSessionTranscript(p provider.Provider, rec state.Record, sessionID string, transcriptID string) {
-	if p == nil || sessionID == "" || transcriptID == "" {
+	if p == nil || sessionID == "" {
+		return
+	}
+	// Claude and Codex have different ownership contracts. Claude's route is
+	// Computer Use versus standalone CLI, while Codex's route selects an
+	// app-server/desktop transport. Never send a Claude route through Codex's
+	// BindSessionRoute compatibility interface.
+	if canonicalProviderID(p.ID()) == "claude" {
+		bindClaudeControlStartOptions(p, rec, sessionID)
+		committed := claudeControlCommittedForBinding(rec, transcriptID)
+		if binder, ok := p.(interface {
+			BindClaudeControlRoute(string, string, string, string)
+		}); ok {
+			if route := claudeControlRouteForBinding(p, rec, sessionID); route != "" {
+				binder.BindClaudeControlRoute(sessionID, transcriptID, route, recordString(rec, "cwd"))
+				bindClaudeControlCommitted(p, sessionID, committed)
+				return
+			}
+		}
+		if binder, ok := p.(interface{ BindTranscript(string, string) }); ok {
+			if transcriptID != "" {
+				binder.BindTranscript(sessionID, transcriptID)
+			}
+		}
+		bindClaudeControlCommitted(p, sessionID, committed)
+		return
+	}
+	if transcriptID == "" {
 		return
 	}
 	if binder, ok := p.(interface {
@@ -338,6 +437,192 @@ func bindSessionTranscript(p provider.Provider, rec state.Record, sessionID stri
 	if binder, ok := p.(interface{ BindTranscript(string, string) }); ok {
 		binder.BindTranscript(sessionID, transcriptID)
 	}
+}
+
+func bindClaudeControlStartOptions(p provider.Provider, rec state.Record, sessionID string) {
+	if p == nil || sessionID == "" || canonicalProviderID(p.ID()) != "claude" {
+		return
+	}
+	_, hasCwd := rec["cwd"]
+	_, hasModel := rec["model"]
+	_, hasEffort := rec["effort"]
+	_, hasMode := rec["mode"]
+	if !hasCwd && !hasModel && !hasEffort && !hasMode {
+		return
+	}
+	if binder, ok := p.(provider.ClaudeControlStartOptionsHost); ok {
+		binder.BindClaudeControlStartOptions(sessionID, provider.StartOptions{
+			Cwd: recordString(rec, "cwd"), Model: recordString(rec, "model"),
+			Effort: recordString(rec, "effort"), Mode: recordString(rec, "mode"),
+		})
+	}
+}
+
+func canonicalClaudeControlRoute(route string) string {
+	switch strings.TrimSpace(route) {
+	case "desktop_computer_use":
+		return "desktop_computer_use"
+	case "stream_json_cli":
+		return "stream_json_cli"
+	default:
+		return ""
+	}
+}
+
+func claudeControlRouteFromProvider(p provider.Provider, sessionID string) string {
+	if p == nil || canonicalProviderID(p.ID()) != "claude" {
+		return ""
+	}
+	if router, ok := p.(interface{ ClaudeControlRoute(string) string }); ok {
+		return canonicalClaudeControlRoute(router.ClaudeControlRoute(sessionID))
+	}
+	return ""
+}
+
+const claudeControlCommittedKey = "claude_control_committed"
+
+func (s *Server) installClaudeControlRouteCommitHandler(
+	providerID string, host provider.ClaudeControlRouteCommitHost,
+) {
+	host.SetClaudeControlRouteCommitHandler(func(
+		ctx context.Context, sessionID string, route string,
+	) error {
+		return s.commitClaudeControlRoute(ctx, providerID, sessionID, route)
+	})
+}
+
+func (s *Server) commitClaudeControlRoute(
+	ctx context.Context, providerID string, sessionID string, route string,
+) error {
+	if ctx == nil {
+		return errors.New("Claude control route commit requires a context")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	providerID = canonicalProviderID(providerID)
+	if providerID != "claude" {
+		return errors.New("Claude control route commit requires the Claude provider")
+	}
+	if _, resolved, ok := s.getProvider(providerID); !ok || resolved != providerID {
+		return errors.New("unknown provider_id")
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if err := rejectUnsafeSessionID(sessionID); err != nil {
+		return err
+	}
+	route = canonicalClaudeControlRoute(route)
+	if route == "" {
+		return errors.New("invalid Claude control route")
+	}
+
+	_, found, err := s.store.UpdateSessionFields(sessionID, func(rec state.Record) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if canonicalProviderID(recordString(rec, "provider_id")) != providerID {
+			return errors.New("Claude control route commit session belongs to another provider")
+		}
+		storedRoute := canonicalClaudeControlRoute(recordString(rec, "claude_control_route"))
+		committed := claudeControlCommittedForBinding(rec, "")
+		if committed && storedRoute != "" && storedRoute != route {
+			return errors.New("Claude control route is already committed to another owner")
+		}
+		rec["claude_control_route"] = route
+		rec[claudeControlCommittedKey] = true
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("persist Claude control route commitment: %w", err)
+	}
+	if !found {
+		return errors.New("Claude control route commit requires a stored logical session")
+	}
+	return nil
+}
+
+func bindClaudeControlCommitted(p provider.Provider, sessionID string, committed bool) {
+	if p == nil || sessionID == "" || canonicalProviderID(p.ID()) != "claude" {
+		return
+	}
+	if binder, ok := p.(interface{ BindClaudeControlCommitted(string, bool) }); ok {
+		binder.BindClaudeControlCommitted(sessionID, committed)
+	}
+}
+
+func claudeControlCommittedForBinding(rec state.Record, transcriptID string) bool {
+	if canonicalClaudeControlRoute(recordString(rec, "claude_control_route")) == "stream_json_cli" ||
+		strings.TrimSpace(transcriptID) != "" ||
+		firstNonEmpty(recordString(rec, "transcript_id"), recordString(rec, "native_session_id")) != "" {
+		return true
+	}
+	if committed, ok := rec[claudeControlCommittedKey].(bool); ok {
+		return committed
+	}
+	// A pre-field record may already have delivered through Desktop. Treating it
+	// as tentative would permit a CLI fallback after restart and risk a second
+	// owner, so legacy/invalid state is committed fail-closed.
+	return true
+}
+
+func normalizeClaudeControlCommitted(rec state.Record) bool {
+	if rec == nil || canonicalProviderID(recordString(rec, "provider_id")) != "claude" {
+		return false
+	}
+	committed := claudeControlCommittedForBinding(rec, "")
+	current, ok := rec[claudeControlCommittedKey].(bool)
+	if ok && current == committed {
+		return false
+	}
+	rec[claudeControlCommittedKey] = committed
+	return true
+}
+
+func claudeControlCommittedFromProvider(p provider.Provider, sessionID string) (bool, bool) {
+	if p == nil || canonicalProviderID(p.ID()) != "claude" {
+		return false, false
+	}
+	if tracker, ok := p.(interface{ ClaudeControlRouteCommitted(string) bool }); ok {
+		return tracker.ClaudeControlRouteCommitted(sessionID), true
+	}
+	return false, false
+}
+
+func claudeControlRouteForBinding(p provider.Provider, rec state.Record, sessionID string) string {
+	if route := canonicalClaudeControlRoute(recordString(rec, "claude_control_route")); route != "" {
+		return route
+	}
+	return claudeControlRouteFromProvider(p, sessionID)
+}
+
+// setClaudeControlRoute snapshots the provider's current per-session route.
+// It is intentionally called only after a provider operation (or after a
+// persisted route has first been rebound during hydration), so an old stored
+// CLI owner is never overwritten by the provider's fresh-process default.
+func setClaudeControlRoute(rec state.Record, p provider.Provider, sessionID string) bool {
+	if rec == nil || canonicalProviderID(recordString(rec, "provider_id")) != "claude" {
+		return false
+	}
+	changed := false
+	route := claudeControlRouteFromProvider(p, sessionID)
+	if route != "" && recordString(rec, "claude_control_route") != route {
+		rec["claude_control_route"] = route
+		changed = true
+	}
+	committed := claudeControlCommittedForBinding(rec, "")
+	if route == "desktop_computer_use" {
+		// Commitment is monotonic. A provider can promote a new tentative
+		// Desktop route after a verified mutation, but cannot uncommit persisted
+		// ownership merely because a fresh process has no in-memory evidence yet.
+		if providerCommitted, ok := claudeControlCommittedFromProvider(p, sessionID); ok {
+			committed = committed || providerCommitted
+		}
+	}
+	if current, ok := rec[claudeControlCommittedKey].(bool); !ok || current != committed {
+		rec[claudeControlCommittedKey] = committed
+		changed = true
+	}
+	return changed
 }
 
 func codexPreferredNativeDeliveryRoute(p provider.Provider) string {
@@ -398,7 +683,7 @@ func codexControlRouteForProvider(p provider.Provider, rec state.Record) string 
 	if codexDesktopDeliveryRecord(rec) {
 		return codexPreferredNativeDeliveryRoute(p)
 	}
-	// A logical session created by remote-agent is provider-owned, not a
+	// A logical session created by AgentHalo is provider-owned, not a
 	// native Desktop preview. Let the provider bind it to its configured
 	// app-server transport. This preserves legacy stdio sessions without
 	// silently changing them into Desktop-owned sessions after a restart.

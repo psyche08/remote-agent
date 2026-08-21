@@ -171,8 +171,8 @@ func codexBridgeInitialize(conn net.Conn) (string, []map[string]any, error) {
 		"type": "request", "requestId": rid, "sourceClientId": "initializing-client",
 		"version": 0, "method": "initialize",
 		"params": map[string]any{
-			"clientType": "remote-agent",
-			"clientInfo": map[string]any{"name": "remote-agent", "title": "remote-agent", "version": remoteCodingClientVersion()},
+			"clientType": "agenthalo",
+			"clientInfo": map[string]any{"name": "AgentHalo", "title": "AgentHalo", "version": agentHaloClientVersion()},
 		},
 	}); err != nil {
 		return "", nil, err
@@ -202,7 +202,7 @@ func codexBridgeInitialize(conn net.Conn) (string, []map[string]any, error) {
 			}
 			cid := firstNonEmpty(stringAny(res["clientId"]), stringAny(res["client_id"]))
 			if cid == "" {
-				cid = "remote-agent"
+				cid = "agenthalo"
 			}
 			return cid, pending, nil
 		}
@@ -350,7 +350,7 @@ func (b *codexDesktopBridge) maybeResync(threadID string, owner string) {
 }
 
 func (b *codexDesktopBridge) requestSnapshot(threadID string, owner string) {
-	client := &CodexDesktopIPCClient{SocketPath: b.socketPath, Timeout: 8 * time.Second, ClientType: "remote-agent", HostID: b.hostID, clientID: "initializing-client"}
+	client := &CodexDesktopIPCClient{SocketPath: b.socketPath, Timeout: 8 * time.Second, ClientType: "agenthalo", HostID: b.hostID, clientID: "initializing-client"}
 	_, _ = client.request("thread-follower-load-complete-history", map[string]any{
 		"hostId": b.hostID, "conversationId": threadID,
 	}, 8*time.Second, owner)
@@ -358,7 +358,7 @@ func (b *codexDesktopBridge) requestSnapshot(threadID string, owner string) {
 
 // RefreshThread asks the Desktop owner to rebroadcast a complete conversation
 // snapshot and briefly waits for the persistent bridge to observe it. This is
-// required when remote-agent attaches after an approval/question was already
+// required when AgentHalo attaches after an approval/question was already
 // created: incremental broadcasts alone cannot reconstruct the old request.
 func (b *codexDesktopBridge) RefreshThread(threadID string, owner string, timeout time.Duration) bool {
 	if threadID == "" {

@@ -154,7 +154,7 @@ func uploadSource(ctx context.Context, client *http.Client, opts Options, st Sta
 		return 0, err
 	}
 	req.Header.Set("Content-Type", "text/plain; charset=utf-8")
-	req.Header.Set("X-Remote-Agent-Log-Source", filepath.Base(src))
+	req.Header.Set("X-AgentHalo-Log-Source", filepath.Base(src))
 	resp, err := client.Do(req)
 	if err != nil {
 		return 0, err
@@ -170,13 +170,13 @@ func uploadSource(ctx context.Context, client *http.Client, opts Options, st Sta
 
 func applyDefaults(opts *Options) {
 	if opts.Namespace == "" {
-		opts.Namespace = "remocoding"
+		opts.Namespace = "agenthalo"
 	}
 	if opts.CertDir == "" {
 		opts.CertDir = "/opt/private-tunnel/certs"
 	}
 	if opts.StatePath == "" {
-		opts.StatePath = "/opt/private-tunnel/state/remote-agent/data/log-upload-state.json"
+		opts.StatePath = "/opt/private-tunnel/state/agenthalo/data/log-upload-state.json"
 	}
 	if opts.MaxChunk <= 0 {
 		opts.MaxChunk = 1024 * 1024
@@ -185,7 +185,7 @@ func applyDefaults(opts *Options) {
 		opts.Interval = time.Minute
 	}
 	if len(opts.Sources) == 0 {
-		opts.Sources = []string{"~/Library/Logs/private-services/remote-agent.log"}
+		opts.Sources = []string{"~/Library/Logs/private-services/agenthalo.log"}
 	}
 }
 

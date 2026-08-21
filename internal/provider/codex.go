@@ -97,6 +97,10 @@ type Codex struct {
 	interruptingThreads     map[string]string
 	pendingTools            map[string]map[string]map[string]any
 	turnThreads             map[string]string
+	computerUseMu           sync.Mutex
+	computerUseToolHandler  ComputerUseToolHandler
+	computerUseThreads      map[string]uint64
+	computerUseInspected    map[codexComputerUseTurnKey]string
 	planType                string
 	lastState               string
 	lastError               string
@@ -138,6 +142,8 @@ func NewCodex(id string, cfg config.ProviderConfig) *Codex {
 		interruptingThreads:     map[string]string{},
 		pendingTools:            map[string]map[string]map[string]any{},
 		turnThreads:             map[string]string{},
+		computerUseThreads:      map[string]uint64{},
+		computerUseInspected:    map[codexComputerUseTurnKey]string{},
 		desktopRefreshAt:        map[string]time.Time{},
 		lastState:               "idle",
 	}
@@ -181,7 +187,7 @@ func (c *Codex) NativeDeliveryRoute() string {
 }
 
 // AppServerDeliveryRoute identifies the concrete writer used for sessions
-// created by remote-agent itself. Persisting this value keeps a restart or
+// created by AgentHalo itself. Persisting this value keeps a restart or
 // config change from silently moving an existing thread between the shared
 // daemon and a legacy stdio child.
 func (c *Codex) AppServerDeliveryRoute() string {
@@ -204,7 +210,7 @@ func codexAppServerTransport(transport string) string {
 
 // Installed reports whether the selected transport has its required Codex
 // executable. Authentication is owned by Codex/ChatGPT's shared CODEX_HOME;
-// remote-agent does not require a second provider-specific login.
+// AgentHalo does not require a second provider-specific login.
 func (c *Codex) Installed() bool {
 	if c.appServerTransport == "shared_daemon" {
 		_, err := c.resolveSharedDaemonCommand()
@@ -494,6 +500,8 @@ func (c *Codex) OpenOrCreateSession(sessionID string, opts StartOptions) (string
 		return "", err
 	}
 	startOpts := c.threadStartOptions(opts.Cwd, opts.Model, opts.Effort, opts.Mode)
+	_, generation := c.currentClientRoute()
+	computerUseAdvertised := startOpts["dynamicTools"] != nil
 	tid, err := client.ThreadStart(startOpts)
 	if err != nil {
 		c.setLastError(err.Error())
@@ -503,7 +511,12 @@ func (c *Codex) OpenOrCreateSession(sessionID string, opts StartOptions) (string
 	c.BindSessionRoute(sessionID, tid, c.appServerTransport, opts.Cwd)
 	c.markAppServerSessionReady(sessionID)
 	c.markAppServerThread(tid)
-	c.setStartOptions(sessionID, startOpts)
+	if computerUseAdvertised {
+		c.enableComputerUseThread(generation, tid)
+	}
+	// dynamicTools belongs to thread/start only. Passing it back on turn/start
+	// is outside that method's protocol and can make a valid thread unusable.
+	c.setStartOptions(sessionID, codexTurnStartOptions(startOpts))
 	c.setLastError("")
 	c.setLastState("idle")
 	return tid, nil
@@ -1621,6 +1634,7 @@ func (c *Codex) finishThreadRoute(threadID string, turnID string) {
 		}
 	}
 	c.runtimeMu.Unlock()
+	c.forgetComputerUseTurn(threadID, turnID)
 	if threadID != "" {
 		c.sessMu.Lock()
 		delete(c.pendingTools, threadID)
@@ -1628,7 +1642,7 @@ func (c *Codex) finishThreadRoute(threadID string, turnID string) {
 	}
 }
 
-func (c *Codex) clearAppServerRuntime() []string {
+func (c *Codex) clearAppServerRuntime(generation uint64) []string {
 	c.runtimeMu.Lock()
 	affected := []string{}
 	owned := []string{}
@@ -1646,6 +1660,7 @@ func (c *Codex) clearAppServerRuntime() []string {
 		}
 	}
 	c.runtimeMu.Unlock()
+	c.clearComputerUseGeneration(generation)
 	c.sessMu.Lock()
 	for _, threadID := range owned {
 		delete(c.pendingTools, threadID)
@@ -1852,7 +1867,7 @@ func (c *Codex) ensureClient() (codexAppClient, error) {
 		c.clientGeneration = generation
 		c.clientMu.Unlock()
 
-		if err := client.Initialize("remote-agent"); err != nil {
+		if err := client.Initialize("AgentHalo"); err != nil {
 			c.clientMu.Lock()
 			detached := c.client == client && c.clientGeneration == generation
 			if detached {
@@ -1895,7 +1910,7 @@ func (c *Codex) onAppServerExit(generation uint64, client codexAppClient, err er
 }
 
 func (c *Codex) handleAppServerLoss(generation uint64, client codexAppClient, err error) {
-	affected := c.clearAppServerRuntime()
+	affected := c.clearAppServerRuntime(generation)
 	approvalThreads := c.appServerApprovalThreadIDs()
 	c.clearAllAppServerApprovals()
 	for _, threadID := range approvalThreads {
@@ -1907,6 +1922,7 @@ func (c *Codex) handleAppServerLoss(generation uint64, client codexAppClient, er
 	c.setLastError("codex app-server connection lost: " + err.Error())
 	c.setLastState("error")
 	for _, threadID := range affected {
+		c.publishComputerUseTerminal(threadID, "codex app-server connection lost")
 		if !stringIn(approvalThreads, threadID) {
 			c.publishApprovalChanged(threadID)
 		}
@@ -2065,6 +2081,7 @@ func (c *Codex) threadStartOptions(cwd string, model string, effort string, mode
 		"sandbox":         sandbox,
 		"model":           firstNonEmpty(model, nextModel),
 		"reasoningEffort": firstNonEmpty(effort, nextEffort),
+		"dynamicTools":    c.computerUseDynamicTools(),
 	})
 }
 
@@ -2587,6 +2604,10 @@ func (c *Codex) onNotification(method string, params map[string]any) {
 
 func (c *Codex) trackThreadRuntime(method string, params map[string]any, threadID string) {
 	switch method {
+	case "turn/started":
+		turnID := firstNonEmpty(stringAny(params["turnId"]), stringAny(mapAny(params["turn"])["id"]))
+		c.setThreadActive(threadID, true)
+		c.bindTurnThread(threadID, turnID)
 	case "thread/status/changed":
 		status := stringAny(mapAny(params["status"])["type"])
 		if status == "active" {
@@ -2678,6 +2699,12 @@ func (c *Codex) bindTurnThread(threadID string, turnID string) {
 
 func (c *Codex) framesForNotification(method string, params map[string]any, threadID string) []map[string]any {
 	switch method {
+	case "turn/started":
+		turnID := firstNonEmpty(stringAny(params["turnId"]), stringAny(mapAny(params["turn"])["id"]))
+		if turnID == "" {
+			return nil
+		}
+		return []map[string]any{{"type": "turn", "status": "started", "turn_id": turnID}}
 	case "item/agentMessage/delta":
 		text := firstNonEmpty(stringAny(params["delta"]), stringAny(params["text"]))
 		if text == "" {
@@ -2697,13 +2724,20 @@ func (c *Codex) framesForNotification(method string, params map[string]any, thre
 		status := stringAny(mapAny(params["status"])["type"])
 		turnID := firstNonEmpty(stringAny(params["turnId"]), stringAny(mapAny(params["turn"])["id"]))
 		if status == "active" {
+			// A status-only active notification is not an authoritative turn
+			// identity. Publishing started(nil) after turn/started would revoke
+			// the genuine lease in the API's fail-closed lifecycle tracker.
+			if turnID == "" {
+				return nil
+			}
 			return []map[string]any{{"type": "turn", "status": "started", "turn_id": nullableNonEmpty(turnID)}}
 		}
-		if status == "idle" || status == "completed" {
-			return []map[string]any{{"type": "turn", "status": "completed", "turn_id": nullableNonEmpty(turnID)}}
+		if codexThreadStatusTerminal(status) {
+			return []map[string]any{{"type": "turn", "status": status, "turn_id": nullableNonEmpty(turnID)}}
 		}
 	case "turn/completed":
-		return []map[string]any{{"type": "turn", "status": "completed", "turn_id": nullableString(params["turnId"])}}
+		turnID := firstNonEmpty(stringAny(params["turnId"]), stringAny(mapAny(params["turn"])["id"]))
+		return []map[string]any{{"type": "turn", "status": "completed", "turn_id": nullableNonEmpty(turnID)}}
 	default:
 		if strings.HasPrefix(method, "item/") {
 			if item := mapAny(params["item"]); len(item) > 0 {
@@ -2751,7 +2785,10 @@ func (c *Codex) onServerRequest(requestID any, method string, params map[string]
 
 func (c *Codex) handleServerRequest(generation uint64, requestID any, method string, params map[string]any) {
 	if method == "item/tool/call" {
-		_ = c.answerDynamicTool(generation, requestID, params)
+		// A desktop operation may take tens of seconds. Keep the app-server read
+		// loop free so a concurrent terminal notification can revoke the lease
+		// and wait for the in-flight helper operation instead of being starved.
+		go func() { _ = c.answerDynamicTool(generation, requestID, params) }()
 		return
 	}
 	// Only genuine human requests become approvals. Machine requests (token
@@ -2761,7 +2798,7 @@ func (c *Codex) handleServerRequest(generation uint64, requestID any, method str
 	if !codexHumanRequestMethod(method) {
 		client := c.clientForGeneration(generation)
 		if client != nil {
-			_ = client.RespondError(requestID, -32601, "method not supported by remote-agent: "+method)
+			_ = client.RespondError(requestID, -32601, "method not supported by AgentHalo: "+method)
 		}
 		return
 	}
@@ -2803,13 +2840,16 @@ func (c *Codex) answerDynamicTool(generation uint64, requestID any, params map[s
 			"contentItems": []map[string]any{{"type": "inputText", "text": workspaceDependenciesText()}},
 		})
 	}
+	if ns == codexComputerUseNamespace {
+		return c.answerComputerUseDynamicTool(client, generation, requestID, params)
+	}
 	label := tool
 	if ns != "" {
 		label = ns + "." + tool
 	}
 	return client.Respond(requestID, map[string]any{
 		"success":      false,
-		"contentItems": []map[string]any{{"type": "inputText", "text": "Unsupported dynamic tool in remote-agent: " + label}},
+		"contentItems": []map[string]any{{"type": "inputText", "text": "Unsupported dynamic tool in AgentHalo: " + label}},
 	})
 }
 

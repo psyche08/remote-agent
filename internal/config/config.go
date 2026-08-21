@@ -20,6 +20,76 @@ type Config struct {
 	PushVAPID       map[string]string         `json:"push_vapid"`
 	DefaultProvider string                    `json:"default_provider"`
 	Providers       map[string]ProviderConfig `json:"providers"`
+	ComputerUse     ComputerUseConfig         `json:"computer_use"`
+}
+
+// ComputerUseConfig gates the device-scoped computer-use control surface (the
+// agent operating the desktop directly) and its Locked Use extension. Both are
+// opt-in and disabled by default: an unset block means the feature is off and
+// every endpoint reports unavailable.
+type ComputerUseConfig struct {
+	// Enabled turns on the computer-use action surface (screenshot/click/type/
+	// key/move/scroll). When false, /computer_use/action returns not_enabled.
+	Enabled bool `json:"enabled"`
+	// DebugHTTPActions permits the public HTTP window-open/action/AX routes
+	// while Locked Use is configured. It is deliberately off by default: the
+	// normal locked-screen boundary is the in-process model tool broker, which
+	// binds calls to an authoritative provider turn without trusting HTTP input.
+	// Window close and runtime deactivation remain available regardless because
+	// they can only remove authority and relock the device.
+	DebugHTTPActions bool `json:"debug_http_actions"`
+	// HelperRefreshFailed is process-local startup state, never device config.
+	// It keeps legacy on-disk capture closed when an old helper could not be
+	// safely reconciled/restarted, including during a true -> false deployment.
+	HelperRefreshFailed bool `json:"-"`
+	// LockedUse participates in the macOS unlock flow so an authorized turn can
+	// drive the desktop after the screen locks. It requires Enabled and the
+	// separately installed Apple Authorization Plug-in.
+	LockedUse LockedUseConfig `json:"locked_use"`
+	// HelperSocket is where agenthalo-desktop listens. The helper owns the
+	// desktop surface and the whole Locked Use state machine; this process only
+	// forwards to it. Defaults to
+	// ~/Library/Application Support/AgentHalo/desktop.sock.
+	//
+	// Note that the helper reads this same config file for its own settings.
+	// Nothing about the feature is configured over the socket: Locked Use lets
+	// a machine unlock itself, so the capability is granted on the device.
+	HelperSocket string `json:"helper_socket"`
+}
+
+// LockedUseConfig configures Locked Use. Every field fails closed: an unset or
+// invalid value collapses to the most restrictive safe default rather than a
+// wider unlock window.
+type LockedUseConfig struct {
+	// Enabled opts this device into Locked Use. Off by default. Turning it on
+	// still requires the provisioned Authorization Plug-in; without a verifiable
+	// key pair the controller stays disarmed.
+	Enabled bool `json:"enabled"`
+	// GrantDir is where the controller writes signed unlock grants for the
+	// Authorization Plug-in to read. Defaults to <state_dir>/data/locked-use.
+	GrantDir string `json:"grant_dir"`
+	// GrantTTLSeconds bounds how long a single signed grant is valid. A grant
+	// is minted just before an unlock attempt and consumed by it, so this is
+	// deliberately tiny: a grant that lingers on disk is ambient authorization
+	// any local process could ride. The Authorization Plug-in independently
+	// enforces its own hard ceiling and ignores a longer self-declared expiry.
+	// Clamped to [2, 15]; default 10.
+	GrantTTLSeconds int `json:"grant_ttl_seconds"`
+	// WindowTTLSeconds is the hard ceiling on a single per-turn unlock window
+	// regardless of turn activity. Clamped to [15, 900]; default 300.
+	WindowTTLSeconds int `json:"window_ttl_seconds"`
+	// InputRelockGraceMs is how long the machine must already have been idle of
+	// local input before a window may open. It does NOT set the monitor's poll
+	// cadence: that is a fixed fast interval so this knob cannot be widened
+	// into a window where a present human types unnoticed.
+	// Clamped to [100, 5000]; default 250.
+	InputRelockGraceMs int `json:"input_relock_grace_ms"`
+	// RequireDisplayShield refuses to open a window unless the privacy shield
+	// covering the screen engages first. Locked Use always normalizes this to
+	// true: the same shield lifecycle also owns the physical-input guard, so an
+	// opt-out would disable two hard boundaries rather than only visual privacy.
+	// A false value is retained only while Locked Use itself is disabled.
+	RequireDisplayShield *bool `json:"require_display_shield"`
 }
 
 type ProviderConfig struct {
@@ -83,6 +153,73 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.Providers == nil {
 		cfg.Providers = map[string]ProviderConfig{}
 	}
+	applyComputerUseDefaults(&cfg.ComputerUse)
+}
+
+const (
+	DefaultGrantTTLSeconds    = 10
+	DefaultWindowTTLSeconds   = 300
+	DefaultInputRelockGraceMs = 250
+	// MaxGrantTTLSeconds mirrors the ceiling the Authorization Plug-in enforces
+	// independently. Keeping both sides in step means a config change can only
+	// ever shorten a grant's life, never extend it past what the plugin accepts.
+	MaxGrantTTLSeconds = 15
+)
+
+// DefaultHelperSocket is where agenthalo-desktop listens unless config says
+// otherwise. It is under the user's own Application Support directory because
+// the helper runs in the user's GUI session — the only place a process can hold
+// the display shield and post synthetic input.
+const DefaultHelperSocket = "~/Library/Application Support/AgentHalo/desktop.sock"
+
+func applyComputerUseDefaults(cu *ComputerUseConfig) {
+	if cu.HelperSocket == "" {
+		cu.HelperSocket = DefaultHelperSocket
+	}
+	lu := &cu.LockedUse
+	lu.GrantTTLSeconds = clampInt(lu.GrantTTLSeconds, 2, MaxGrantTTLSeconds, DefaultGrantTTLSeconds)
+	lu.WindowTTLSeconds = clampInt(lu.WindowTTLSeconds, 15, 900, DefaultWindowTTLSeconds)
+	lu.InputRelockGraceMs = clampInt(lu.InputRelockGraceMs, 100, 5000, DefaultInputRelockGraceMs)
+	if lu.RequireDisplayShield == nil {
+		shield := true
+		lu.RequireDisplayShield = &shield
+	}
+	// Locked Use extends computer use; it can never be the only thing enabled.
+	if !cu.Enabled {
+		lu.Enabled = false
+	}
+	if lu.Enabled {
+		// Shield engagement and physical-input isolation share one lifecycle in
+		// the helper. Locked Use cannot safely opt out of either half.
+		shield := true
+		lu.RequireDisplayShield = &shield
+	}
+	// A grant TTL at or above the window ceiling would let one minted grant
+	// outlive the window it was issued for.
+	if lu.GrantTTLSeconds > lu.WindowTTLSeconds {
+		lu.GrantTTLSeconds = lu.WindowTTLSeconds
+	}
+}
+
+// clampInt keeps an out-of-range or unset value from widening a security
+// window. Zero means "unset" and takes the default; anything else is clamped.
+func clampInt(v, min, max, fallback int) int {
+	if v == 0 {
+		return fallback
+	}
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+// ShieldRequired reports whether a window may open without the display shield.
+// It reads as fail-closed for a zero-valued struct built outside Load.
+func (l LockedUseConfig) ShieldRequired() bool {
+	return l.RequireDisplayShield == nil || *l.RequireDisplayShield
 }
 
 func ResolvePath(explicit string, baseDir string) (string, error) {

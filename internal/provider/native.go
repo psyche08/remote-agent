@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -100,6 +101,8 @@ func claudeDesktopSessions(base string, limit int) []map[string]any {
 			"bridge_session_ids": rec["bridgeSessionIds"],
 			"title":              firstNonEmpty(stringAny(rec["title"]), "(untitled)"),
 			"cwd":                firstNonEmpty(stringAny(rec["cwd"]), stringAny(rec["originCwd"])),
+			"origin_cwd":         nullableString(rec["originCwd"]),
+			"permission_mode":    nullableString(rec["permissionMode"]),
 			"branch":             nullableString(rec["branch"]),
 			"worktree":           nullableString(rec["worktreeName"]),
 			"model":              nullableString(rec["model"]),
@@ -162,17 +165,120 @@ func claudeCLISessions(base string, limit int) []map[string]any {
 }
 
 func claudeCLILastReplyAt(path string) string {
-	return jsonlTailTimestamp(path, jsonlTailScanBytes, func(rec map[string]any) bool {
-		return stringAny(rec["type"]) == "assistant" && stringAny(rec["timestamp"]) != ""
-	})
+	v, _ := claudeCLIReplyAtCache.get(path, func() any {
+		return jsonlTailTimestamp(path, jsonlTailScanBytes, func(rec map[string]any) bool {
+			return stringAny(rec["type"]) == "assistant" && stringAny(rec["timestamp"]) != ""
+		})
+	}).(string)
+	return v
 }
 
+// fileDerivedCache memoizes a per-file derived value until the file's
+// (mtime, size) changes. Session transcripts are append-only, so a stable
+// stat means the previous parse is still valid; this keeps the 2s push
+// monitor from re-parsing every transcript on every tick.
+type fileDerivedCache struct {
+	mu      sync.Mutex
+	entries map[string]fileDerivedEntry
+}
+
+type fileDerivedEntry struct {
+	mtime time.Time
+	size  int64
+	value any
+}
+
+const fileDerivedCacheMax = 4096
+
+var (
+	claudeCLIMetaCache         = &fileDerivedCache{}
+	claudeCLIReplyAtCache      = &fileDerivedCache{}
+	codexReplyAtCache          = &fileDerivedCache{}
+	claudePendingQuestionCache = &fileDerivedCache{}
+	claudeNativeUIPromptCache  = &fileDerivedCache{}
+)
+
+func (c *fileDerivedCache) get(key string, compute func() any) any {
+	path := key
+	if i := strings.IndexByte(key, '\x00'); i >= 0 {
+		path = key[:i]
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return compute()
+	}
+	c.mu.Lock()
+	if e, ok := c.entries[key]; ok && e.mtime.Equal(st.ModTime()) && e.size == st.Size() {
+		c.mu.Unlock()
+		return e.value
+	}
+	c.mu.Unlock()
+	v := compute()
+	c.mu.Lock()
+	if c.entries == nil {
+		c.entries = map[string]fileDerivedEntry{}
+	}
+	if len(c.entries) >= fileDerivedCacheMax {
+		c.entries = map[string]fileDerivedEntry{}
+	}
+	c.entries[key] = fileDerivedEntry{mtime: st.ModTime(), size: st.Size(), value: v}
+	c.mu.Unlock()
+	return v
+}
+
+// jsonlTailTimestamp returns the timestamp of the last record within the
+// trailing maxBytes of path that satisfies match. It scans backward from the
+// end in blocks and stops at the first match, so it normally decodes a few
+// records instead of the whole window.
 func jsonlTailTimestamp(path string, maxBytes int64, match func(map[string]any) bool) string {
-	records := jsonlTailRecords(path, maxBytes)
-	for i := len(records) - 1; i >= 0; i-- {
-		if match(records[i]) {
-			return stringAny(records[i]["timestamp"])
+	f, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() <= 0 {
+		return ""
+	}
+	lowest := int64(0)
+	if maxBytes > 0 && st.Size() > maxBytes {
+		lowest = st.Size() - maxBytes
+	}
+	const block = int64(256 * 1024)
+	end := st.Size()
+	carry := ""
+	for end > lowest {
+		start := end - block
+		if start < lowest {
+			start = lowest
 		}
+		buf := make([]byte, end-start)
+		if _, err := f.ReadAt(buf, start); err != nil && err != io.EOF {
+			return ""
+		}
+		segs := strings.Split(string(buf)+carry, "\n")
+		first := 0
+		if start > 0 {
+			// segs[0] may be the tail of a line beginning before start:
+			// defer it to the next (earlier) block, or drop it at the
+			// maxBytes boundary exactly like the forward scan does.
+			carry = segs[0]
+			first = 1
+		}
+		for i := len(segs) - 1; i >= first; i-- {
+			line := strings.TrimSpace(segs[i])
+			if line == "" {
+				continue
+			}
+			var rec map[string]any
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				continue
+			}
+			if match(rec) {
+				return stringAny(rec["timestamp"])
+			}
+		}
+		end = start
 	}
 	return ""
 }
@@ -216,6 +322,15 @@ func jsonlTailRecords(path string, maxBytes int64) []map[string]any {
 }
 
 func claudeCLIMeta(path string, maxLines int) map[string]any {
+	v, _ := claudeCLIMetaCache.get(path+"\x00"+strconv.Itoa(maxLines), func() any {
+		return claudeCLIMetaUncached(path, maxLines)
+	}).(map[string]any)
+	return v
+}
+
+// claudeCLIMetaUncached reads head-of-file metadata; callers get a shared
+// cached map and must not mutate it.
+func claudeCLIMetaUncached(path string, maxLines int) map[string]any {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
@@ -337,6 +452,13 @@ func claudePendingQuestion(sessionID string, projectsDir string) map[string]any 
 	if path == "" {
 		return nil
 	}
+	v, _ := claudePendingQuestionCache.get(path, func() any {
+		return claudePendingQuestionUncached(path)
+	}).(map[string]any)
+	return v
+}
+
+func claudePendingQuestionUncached(path string) map[string]any {
 	pending := map[string]map[string]any{}
 	order := []string{}
 	for _, rec := range jsonlTailRecords(path, jsonlTailScanBytes) {
@@ -399,6 +521,13 @@ func claudePendingNativeUIPrompt(sessionID string, projectsDir string) map[strin
 	if path == "" {
 		return nil
 	}
+	v, _ := claudeNativeUIPromptCache.get(path, func() any {
+		return claudePendingNativeUIPromptUncached(path)
+	}).(map[string]any)
+	return v
+}
+
+func claudePendingNativeUIPromptUncached(path string) map[string]any {
 	pending := map[string]map[string]any{}
 	order := []string{}
 	for _, rec := range jsonlTailRecords(path, jsonlTailScanBytes) {
@@ -1486,6 +1615,13 @@ func codexRolloutLastReplyAt(path string) string {
 	if path == "" {
 		return ""
 	}
+	v, _ := codexReplyAtCache.get(path, func() any {
+		return codexRolloutLastReplyAtUncached(path)
+	}).(string)
+	return v
+}
+
+func codexRolloutLastReplyAtUncached(path string) string {
 	return jsonlTailTimestamp(path, jsonlTailScanBytes, func(rec map[string]any) bool {
 		if stringAny(rec["timestamp"]) == "" {
 			return false

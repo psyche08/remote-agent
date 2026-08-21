@@ -593,3 +593,74 @@ func writeJSONFile(t *testing.T, path string, row map[string]any) {
 		t.Fatal(err)
 	}
 }
+
+func TestJsonlTailTimestampCrossesBlockBoundary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.jsonl")
+	writeJSONL(t, path, []map[string]any{
+		{"type": "assistant", "timestamp": "2026-08-18T01:00:00Z", "message": map[string]any{"content": strings.Repeat("a", 600*1024)}},
+		{"type": "user", "message": map[string]any{"content": strings.Repeat("b", 300*1024)}},
+	})
+	got := jsonlTailTimestamp(path, jsonlTailScanBytes, func(rec map[string]any) bool {
+		return stringAny(rec["type"]) == "assistant" && stringAny(rec["timestamp"]) != ""
+	})
+	if got != "2026-08-18T01:00:00Z" {
+		t.Fatalf("expected block-boundary-crossing record to match, got %q", got)
+	}
+}
+
+func TestJsonlTailTimestampHonorsMaxBytes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "trunc.jsonl")
+	writeJSONL(t, path, []map[string]any{
+		{"type": "assistant", "timestamp": "2026-08-18T01:00:00Z"},
+		{"type": "user", "message": map[string]any{"content": strings.Repeat("x", 8*1024)}},
+	})
+	got := jsonlTailTimestamp(path, 4*1024, func(rec map[string]any) bool {
+		return stringAny(rec["type"]) == "assistant" && stringAny(rec["timestamp"]) != ""
+	})
+	if got != "" {
+		t.Fatalf("record before the maxBytes window must not match, got %q", got)
+	}
+}
+
+func TestClaudeCLILastReplyAtCacheInvalidatesOnAppend(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "s1.jsonl")
+	writeJSONL(t, path, []map[string]any{
+		{"type": "assistant", "timestamp": "2026-08-18T01:00:00Z"},
+	})
+	if got := claudeCLILastReplyAt(path); got != "2026-08-18T01:00:00Z" {
+		t.Fatalf("bad initial last_reply_at: %q", got)
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(`{"type":"assistant","timestamp":"2026-08-18T02:00:00Z"}` + "\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := claudeCLILastReplyAt(path); got != "2026-08-18T02:00:00Z" {
+		t.Fatalf("stale cached last_reply_at after append: %q", got)
+	}
+}
+
+func TestClaudeCLIMetaCacheInvalidatesOnChange(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "m1.jsonl")
+	writeJSONL(t, path, []map[string]any{
+		{"type": "user", "cwd": "/a", "message": map[string]any{"content": "first title"}},
+	})
+	if got := stringAny(claudeCLIMeta(path, 80)["cwd"]); got != "/a" {
+		t.Fatalf("bad initial meta cwd: %q", got)
+	}
+	writeJSONL(t, path, []map[string]any{
+		{"type": "user", "cwd": "/bb", "message": map[string]any{"content": "second title"}},
+	})
+	if got := stringAny(claudeCLIMeta(path, 80)["cwd"]); got != "/bb" {
+		t.Fatalf("stale cached meta after rewrite: %q", got)
+	}
+}

@@ -1,51 +1,49 @@
 #!/usr/bin/env bash
-# remote-agent 统一发布脚本 —— 每次发布设备二进制都走这里,取代
+# AgentHalo 统一发布脚本 —— 每次发布设备二进制都走这里,取代
 # 旧的 publish-static.sh + 设备端 git pull 编译。
 #
 # 做什么:
 #   1. 交叉编译 darwin-arm64 二进制(ldflags 注入 commit + 东八区 built_at)
 #   2. 生成 assets/release/manifest.json(commit / built_at / sha256)
-#   3. 上传到 relay 的 remotecoding release 目录:
-#        assets/release/remote-agent-darwin-arm64
+#   3. 上传到 relay 的 AgentHalo release 目录:
+#        assets/release/agenthalo-darwin-arm64
 #        assets/release/update.sh
 #        assets/release/manifest.json     ←最后上传,设备不会读到半套发布
-#   4. 配置 RC_UPDATE_RELAY_URL 的设备每 5 分钟对比 manifest 并自动更新
+#   4. 配置 AGENTHALO_UPDATE_RELAY_URL 的设备每 5 分钟对比 manifest 并自动更新
 #
 # 完整控制台已嵌入设备二进制并由 /d/<device>/ 提供。relay 根路径只有稳定
 # 的设备选择壳，普通 release 不再覆盖它。仅在壳本身确实变化时显式设置:
-#   RC_PUBLISH_SHELL=1 remote-agent/deploy/publish-release.sh
+#   AGENTHALO_PUBLISH_SHELL=1 deploy/publish-release.sh
 #
 # `/assets/` 前缀在 relay 静态白名单内(private-tunnel route.go
 # rootStaticPrefixes),设备用 agent mTLS 证书即可下载;relay 无需改动。
 #
 # Usage:
-#   remote-agent/deploy/publish-release.sh [ssh_target]
-#   RC_RELAY_SSH=user@host remote-agent/deploy/publish-release.sh
+#   deploy/publish-release.sh [ssh_target]
+#   AGENTHALO_RELAY_SSH=user@host deploy/publish-release.sh
 #
-# ssh_target 必须通过参数或 $RC_RELAY_SSH 显式提供。
-# RC_ALLOW_DIRTY=1 跳过脏树检查(版本章会失真,慎用)。
+# ssh_target 必须通过参数或 $AGENTHALO_RELAY_SSH 显式提供。
+# AGENTHALO_ALLOW_DIRTY=1 跳过脏树检查(版本章会失真,慎用)。
 set -euo pipefail
 
-# The public relay namespace remains the compatibility route `remotecoding`;
-# only the executable and host supervisor identity are renamed.
-SSH_TARGET="${1:-${RA_RELAY_SSH:-${RC_RELAY_SSH:-}}}"
-USER_ID="${RA_RELAY_USER:-${RC_RELAY_USER:-remote-coding}}"
-STATIC_DIR="/var/lib/private-tunnel/static/${USER_ID}/remotecoding"
+SSH_TARGET="${1:-${AGENTHALO_RELAY_SSH:-}}"
+USER_ID="${AGENTHALO_RELAY_USER:-agenthalo}"
+STATIC_DIR="/var/lib/private-tunnel/static/${USER_ID}/agenthalo"
 RELEASE_DIR="${STATIC_DIR}/assets/release"
 SRC_DIR="$(cd "$(dirname "$0")/.." && pwd)"          # .../remote-agent
 REPO_DIR="$SRC_DIR"
 GO="${GO:-go}"
-GOCACHE="${GOCACHE:-/private/tmp/remote-agent-gocache}"
+GOCACHE="${GOCACHE:-/private/tmp/agenthalo-gocache}"
 PLATFORM="darwin-arm64"
-BIN_NAME="remote-agent-${PLATFORM}"
+BIN_NAME="agenthalo-${PLATFORM}"
 NOTARY_TEAM_ID="${NOTARY_TEAM_ID:-}"
 NOTARY_APPLE_ID="${NOTARY_APPLE_ID:-}"
 NOTARY_PASSWORD="${NOTARY_PASSWORD:-}"
 
 die() { echo "error: $*" >&2; exit 1; }
 
-[[ -n "$SSH_TARGET" ]] || die "relay SSH target required: pass user@host or set RC_RELAY_SSH"
-[[ "$(uname -s)" = "Darwin" ]] || die "signed/notarized remote-agent releases must be published on macOS"
+[[ -n "$SSH_TARGET" ]] || die "relay SSH target required: pass user@host or set AGENTHALO_RELAY_SSH"
+[[ "$(uname -s)" = "Darwin" ]] || die "signed/notarized AgentHalo releases must be published on macOS"
 command -v security >/dev/null 2>&1 || die "security is required"
 command -v codesign >/dev/null 2>&1 || die "codesign is required"
 command -v xcrun >/dev/null 2>&1 || die "xcrun is required"
@@ -66,18 +64,22 @@ verify_team_signature() {
   [[ "$team" = "$NOTARY_TEAM_ID" ]] || die "signature team mismatch for $(basename "$path"): got ${team:-missing}, want $NOTARY_TEAM_ID"
 }
 
-# 版本章 = HEAD;脏树发布会让章与内容脱节(制造"版本永远对不齐"事故),默认拒绝。
-if [ "${RC_ALLOW_DIRTY:-0}" != "1" ] && ! git -C "$REPO_DIR" diff --quiet HEAD -- . 2>/dev/null; then
-  echo "仓库有未提交改动;先提交,或 RC_ALLOW_DIRTY=1 强行发布" >&2
+# 版本章 = HEAD;tracked 和 untracked 源码都必须已提交。只看 git diff 会
+# 漏掉新 cmd/Swift/Go 文件，进而用旧 commit 章发布未提交字节。
+if ! DIRTY_STATUS="$(git -C "$REPO_DIR" status --porcelain --untracked-files=normal -- . 2>/dev/null)"; then
+  die "cannot inspect repository status"
+fi
+if [ "${AGENTHALO_ALLOW_DIRTY:-0}" != "1" ] && [ -n "$DIRTY_STATUS" ]; then
+  echo "仓库有未提交或未跟踪改动;先提交,或 AGENTHALO_ALLOW_DIRTY=1 强行发布" >&2
   exit 1
 fi
 COMMIT="$(git -C "$REPO_DIR" rev-parse --short HEAD 2>/dev/null || echo dev)"
 BUILT_AT="$(TZ=Asia/Shanghai date +%Y-%m-%dT%H:%M:%S+08:00)"
 VERSION_BASE="$(tr -d '[:space:]' <"$SRC_DIR/VERSION")"
 VERSION_CURRENT="$VERSION_BASE"
-if [ -z "${RA_MODULE_VERSION:-}" ]; then
-	VERSION_INCREMENT="${RA_VERSION_INCREMENT:-1}"
-	[[ "$VERSION_INCREMENT" =~ ^[1-9][0-9]*$ ]] || die "invalid RA_VERSION_INCREMENT: $VERSION_INCREMENT"
+if [ -z "${AGENTHALO_MODULE_VERSION:-}" ]; then
+	VERSION_INCREMENT="${AGENTHALO_VERSION_INCREMENT:-1}"
+	[[ "$VERSION_INCREMENT" =~ ^[1-9][0-9]*$ ]] || die "invalid AGENTHALO_VERSION_INCREMENT: $VERSION_INCREMENT"
   REMOTE_MANIFEST="$(ssh -o RemoteCommand=none "$SSH_TARGET" "cat '${RELEASE_DIR}/manifest.json' 2>/dev/null || true")"
   REMOTE_VERSION="$(python3 -c 'import json,sys
 try: print(int(json.loads(sys.stdin.read()).get("module_version", 0)))
@@ -87,25 +89,64 @@ except Exception: print(0)' <<<"$REMOTE_MANIFEST")"
   fi
   MODULE_VERSION=$((VERSION_CURRENT + VERSION_INCREMENT))
 else
-  MODULE_VERSION="$RA_MODULE_VERSION"
+	MODULE_VERSION="$AGENTHALO_MODULE_VERSION"
 fi
-[[ "$MODULE_VERSION" =~ ^[1-9][0-9]*$ ]] || die "invalid remote-agent module version: $MODULE_VERSION"
+[[ "$MODULE_VERSION" =~ ^[1-9][0-9]*$ ]] || die "invalid AgentHalo module version: $MODULE_VERSION"
 
 OUT="$(mktemp -d)"
-trap 'rm -rf "$OUT"' EXIT
+DESKTOP_ASSET="$SRC_DIR/internal/desktopasset/assets/agenthalo-desktop"
+KEEP_OUT=0
+DESKTOP_ASSET_BUILD_STARTED=0
+cleanup() {
+  # The embedded helper is an input to this one release build, not a source
+  # artifact.  Leaving it behind lets an unrelated development build silently
+  # embed a helper from an older commit.
+  if [ "$DESKTOP_ASSET_BUILD_STARTED" = "1" ]; then
+    rm -f -- "$DESKTOP_ASSET"
+  fi
+  if [ "$KEEP_OUT" != "1" ]; then
+    rm -rf -- "$OUT"
+  fi
+}
+trap cleanup EXIT
 
-echo "==> building ${BIN_NAME} version=remote-agent.${MODULE_VERSION} commit=${COMMIT} built_at=${BUILT_AT}"
+# The macOS desktop helper travels inside the agent binary, so a release stays
+# one artifact with one sha256 and one signing team. It is built and signed
+# first, with the same Developer ID: the helper holds the Accessibility and
+# Screen Recording grants, and TCC binds those to a code signature, so a helper
+# signed with anything else would lose every permission the user granted.
+if [ -d "$SRC_DIR/mac/RemoteAgentDesktop" ]; then
+  [[ ! -e "$DESKTOP_ASSET" ]] || die "refusing to overwrite stale embedded helper: $DESKTOP_ASSET"
+  echo "==> building and signing the desktop helper"
+  DESKTOP_ASSET_BUILD_STARTED=1
+  AGENTHALO_SIGN_IDENTITY="$SIGN_IDENTITY" AGENTHALO_SIGN_TEAM_ID="$NOTARY_TEAM_ID" \
+    bash "$SRC_DIR/mac/RemoteAgentDesktop/build.sh" \
+    --out "$DESKTOP_ASSET"
+  verify_team_signature "$DESKTOP_ASSET"
+else
+  die "mac/RemoteAgentDesktop is missing; this checkout cannot produce a release"
+fi
+
+echo "==> building AgentHalo asset ${BIN_NAME} version=AgentHalo.${MODULE_VERSION} commit=${COMMIT} built_at=${BUILT_AT}"
 BUILDINFO_PKG="github.com/psyche08/remote-agent/internal/buildinfo"
 ( cd "$SRC_DIR" && GOCACHE="$GOCACHE" GOOS=darwin GOARCH=arm64 "$GO" build -trimpath \
-  -ldflags "-X ${BUILDINFO_PKG}.Version=remote-agent.${MODULE_VERSION} -X ${BUILDINFO_PKG}.Commit=${COMMIT} -X ${BUILDINFO_PKG}.BuiltAt=${BUILT_AT}" \
-  -o "$OUT/$BIN_NAME" ./cmd/remote-agent )
+  -ldflags "-X ${BUILDINFO_PKG}.Version=AgentHalo.${MODULE_VERSION} -X ${BUILDINFO_PKG}.Commit=${COMMIT} -X ${BUILDINFO_PKG}.BuiltAt=${BUILT_AT}" \
+  -o "$OUT/$BIN_NAME" ./cmd/agenthalo )
 
 echo "==> signing Darwin binaries with Developer ID team ${NOTARY_TEAM_ID}"
-codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$OUT/$BIN_NAME"
+codesign --force --identifier dev.linsheng.agenthalo --options runtime --timestamp \
+  --sign "$SIGN_IDENTITY" "$OUT/$BIN_NAME"
 verify_team_signature "$OUT/$BIN_NAME"
 
 mkdir -p "$OUT/notary-payload"
 cp "$OUT/$BIN_NAME" "$OUT/notary-payload/"
+# The helper is later materialized from go:embed and executed as its own
+# Mach-O.  Putting only the outer AgentHalo binary in the archive does not
+# give that extracted executable its own notarization ticket: opaque embedded
+# bytes are not a nested code object from the notary service's perspective.
+# Submit the exact same signed helper as a top-level payload entry as well, so
+# the ticket Apple records is keyed to the bytes that Materialize writes.
+cp "$DESKTOP_ASSET" "$OUT/notary-payload/agenthalo-desktop"
 ditto -c -k --keepParent "$OUT/notary-payload" "$OUT/notary-payload.zip"
 echo "==> notarizing signed release payload"
 xcrun notarytool submit "$OUT/notary-payload.zip" \
@@ -115,7 +156,7 @@ xcrun notarytool submit "$OUT/notary-payload.zip" \
   --wait
 verify_team_signature "$OUT/$BIN_NAME"
 
-sed "s/__REMOTE_AGENT_TEAM_ID__/${NOTARY_TEAM_ID}/g" "$SRC_DIR/deploy/update.sh" > "$OUT/update.sh"
+sed "s/__AGENTHALO_TEAM_ID__/${NOTARY_TEAM_ID}/g" "$SRC_DIR/deploy/update.sh" > "$OUT/update.sh"
 
 sha() { shasum -a 256 "$1" | awk '{print $1}'; }
 BIN_SHA="$(sha "$OUT/$BIN_NAME")"
@@ -134,11 +175,11 @@ cat > "$OUT/manifest.json" <<EOF
 }
 EOF
 
-if [ "${RC_PUBLISH_DRY_RUN:-0}" = "1" ]; then
+if [ "${AGENTHALO_PUBLISH_DRY_RUN:-0}" = "1" ]; then
   echo "==> dry run;产物在 $OUT:"
   ls -l "$OUT"
   cat "$OUT/manifest.json"
-  trap - EXIT
+  KEEP_OUT=1
   echo "==> (dry run 保留 $OUT,自行清理)"
   exit 0
 fi
@@ -156,10 +197,10 @@ put "$OUT/$BIN_NAME"  "${RELEASE_DIR}/${BIN_NAME}"
 put "$OUT/update.sh"  "${RELEASE_DIR}/update.sh"
 
 # 2) relay 稳定设备壳。普通设备/UI 发布跳过；只有壳本身变化时才显式更新。
-if [ "${RC_PUBLISH_SHELL:-0}" = "1" ]; then
-  SHELL_VERSION="${RC_SHELL_VERSION:-shell-v1}"
-  sed "s/__REMOTE_AGENT_SHELL_VERSION__/${SHELL_VERSION}/g" "$SRC_DIR/static/shell.html" > "$OUT/index.html"
-  sed "s/__REMOTE_AGENT_STATIC_VERSION__/${SHELL_VERSION}/g" "$SRC_DIR/static/sw.js" > "$OUT/sw.js"
+if [ "${AGENTHALO_PUBLISH_SHELL:-0}" = "1" ]; then
+  SHELL_VERSION="${AGENTHALO_SHELL_VERSION:-shell-v1}"
+  sed "s/__AGENTHALO_SHELL_VERSION__/${SHELL_VERSION}/g" "$SRC_DIR/static/shell.html" > "$OUT/index.html"
+  sed "s/__AGENTHALO_STATIC_VERSION__/${SHELL_VERSION}/g" "$SRC_DIR/static/sw.js" > "$OUT/sw.js"
   put "$OUT/index.html" "${STATIC_DIR}/index.html"
   put "$OUT/sw.js" "${STATIC_DIR}/sw.js"
   for f in manifest.webmanifest icon-192.png icon-512.png; do
@@ -168,10 +209,10 @@ if [ "${RC_PUBLISH_SHELL:-0}" = "1" ]; then
     put "$src" "${STATIC_DIR}/${f}"
   done
 else
-  echo "==> relay shell unchanged (set RC_PUBLISH_SHELL=1 only when shell changes)"
+  echo "==> relay shell unchanged (set AGENTHALO_PUBLISH_SHELL=1 only when shell changes)"
 fi
 
 # 3) manifest 最后落位 —— 设备要么看到旧发布,要么看到完整新发布
 put "$OUT/manifest.json" "${RELEASE_DIR}/manifest.json"
 
-echo "==> done. version=remote-agent.${MODULE_VERSION} commit=${COMMIT};设备将在 5 分钟内自动更新(或网页端触发 /update)。"
+echo "==> done. version=AgentHalo.${MODULE_VERSION} commit=${COMMIT};设备将在 5 分钟内自动更新(或网页端触发 /update)。"

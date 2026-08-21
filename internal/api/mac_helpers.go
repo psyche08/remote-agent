@@ -16,6 +16,12 @@ func (s *Server) screenshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// Locked Use devices capture only through the owner-bound, in-memory model
+	// broker. This legacy command writes a relay-served file and is permanently
+	// disabled there to avoid a phase-check/capture TOCTOU.
+	if !s.captureGate(w) {
+		return
+	}
 	dir := filepath.Join(filepath.Dir(s.store.DataDir()), "screenshots")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -35,6 +41,9 @@ func (s *Server) screenshot(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) lastScreenshotFile(w http.ResponseWriter, r *http.Request) {
+	if !s.captureGate(w) {
+		return
+	}
 	if s.lastScreenshot == "" {
 		writeError(w, http.StatusNotFound, "no screenshot captured yet")
 		return
@@ -81,6 +90,11 @@ func (s *Server) recover(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) ocr(w http.ResponseWriter, r *http.Request) {
+	// OCR turns a captured frame into text that flows onward, so it shares the
+	// permanent Locked Use legacy-capture boundary, including for old files.
+	if !s.captureGate(w) {
+		return
+	}
 	if s.lastScreenshot == "" {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "not_implemented", "engine": "apple_vision", "detail": "no screenshot available to OCR"})
 		return

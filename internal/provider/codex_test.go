@@ -1645,7 +1645,7 @@ func TestDesktopIPCRequestRespondsToClientDiscovery(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
-	client := &CodexDesktopIPCClient{Timeout: time.Second, ClientType: "remote-agent", HostID: "local", clientID: "remote-client"}
+	client := &CodexDesktopIPCClient{Timeout: time.Second, ClientType: "agenthalo", HostID: "local", clientID: "agenthalo-client"}
 	done := make(chan any, 1)
 	go func() {
 		res, err := client.requestOnConn(clientConn, "thread-follower-start-turn", map[string]any{
@@ -1704,7 +1704,7 @@ func TestDesktopIPCStartTurnAcceptsRunningBroadcast(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
-	client := &CodexDesktopIPCClient{Timeout: time.Second, ClientType: "remote-agent", HostID: "local", clientID: "remote-client"}
+	client := &CodexDesktopIPCClient{Timeout: time.Second, ClientType: "agenthalo", HostID: "local", clientID: "agenthalo-client"}
 	done := make(chan any, 1)
 	go func() {
 		res, err := client.requestOnConn(clientConn, "thread-follower-start-turn", map[string]any{
