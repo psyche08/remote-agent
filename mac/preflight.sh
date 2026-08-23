@@ -160,21 +160,30 @@ if grep -q 'UserPasswordTextField' "$INTERACTOR" 2>/dev/null && \
    grep -q 'try prepareGrant()' "$INTERACTOR" 2>/dev/null && \
    grep -q 'submissionDeadline' "$INTERACTOR" 2>/dev/null && \
    grep -q 'preflightEmptySubmission' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'preflightConfirmAction' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'revalidatePreparedFieldBeforeGrant' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'revalidateRetainedFieldIdentityAfterGrant' "$INTERACTOR" 2>/dev/null && \
    grep -q 'performCredentialFreeFieldReadiness' "$INTERACTOR" 2>/dev/null && \
    grep -q 'performGrantGatedSubmission' "$INTERACTOR" 2>/dev/null && \
    grep -q 'writeEmptySubmission' "$INTERACTOR" 2>/dev/null && \
-   grep -q 'performSingleEmptyValueSubmission' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'performSingleConfirmedSubmission' "$INTERACTOR" 2>/dev/null && \
    grep -q 'AXUIElementIsAttributeSettable' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'AXUIElementCopyActionNames' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'AXUIElementPerformAction' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'kAXConfirmAction' "$INTERACTOR" 2>/dev/null && \
    grep -q 'kAXValueAttribute as CFString, "" as CFString' "$INTERACTOR" 2>/dev/null; then
-  pass "exact-loginwindow PID, bounded field search, pregrant gate, and single empty-value submission wiring present"
+  pass "exact-loginwindow retained-field pregrant checks and single Set+AXConfirm wiring present"
 else
   fail "the bounded exact-PID two-phase credential-free loginwindow AX authorization interactor is missing"
 fi
-if grep -qE 'AXUIElementCopyActionNames|AXUIElementPerformAction|kAXConfirmAction|kAXPressAction' \
+CONFIRM_PERFORM_CALLS="$(grep -c 'AXUIElementPerformAction(' "$INTERACTOR" 2>/dev/null || true)"
+if [ "$CONFIRM_PERFORM_CALLS" -eq 1 ] && \
+   grep -q 'field, kAXConfirmAction as CFString' "$INTERACTOR" 2>/dev/null && \
+   ! grep -qE 'kAXPressAction|kAXButtonRole|kAXRoleAttribute|CGEventCreateKeyboardEvent|CGEventKeyboardSetUnicodeString|CGEventPost|IOHIDPostEvent' \
      "$INTERACTOR" 2>/dev/null; then
-  fail "lock-screen authorization discovers or performs an AX action after the empty-value trigger"
+  pass "lock-screen authorization performs only one retained-field AXConfirm with no input fallback"
 else
-  pass "lock-screen authorization contains no AX action discovery or performance path"
+  fail "lock-screen authorization must use exactly one field AXConfirm and no Press/button/keyboard/HID fallback"
 fi
 if grep -q 'kAXFocusedApplicationAttribute' "$INTERACTOR" 2>/dev/null || \
    grep -qE '\.activate[[:space:]]*\(|activateIgnoringOtherApps|SetFrontProcess' "$INTERACTOR" 2>/dev/null; then

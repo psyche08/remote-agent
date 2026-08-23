@@ -654,10 +654,38 @@ public final class LockedUseController: @unchecked Sendable {
                             self.audit(
                                 event: "grant_published", turnID: turnID,
                                 noncePrefix: Self.noncePrefix(minted.1.nonce))
+                            // The grant now exists but no AX mutation has run.
+                            // Re-check all controller-owned admission gates at
+                            // this last non-UI boundary before returning to the
+                            // interactor's retained-field envelope.
+                            try self.ensureOpening(opened)
+                            try self.ensureNoLocalInput(opened)
+                            guard try self.system.isLocked() else {
+                                throw LockedUseError.systemFailure(
+                                    "the screen unlocked after grant publication before authorization submission")
+                            }
+                            self.audit(
+                                event: "authorization_postgrant_gate_passed",
+                                turnID: turnID)
+                        },
+                        emptyValueWriteAttempted: {
+                            self.audit(
+                                event: "authorization_empty_value_write_attempted",
+                                turnID: turnID)
                         },
                         emptyValueWritten: {
                             self.audit(
                                 event: "authorization_empty_value_written",
+                                turnID: turnID)
+                        },
+                        confirmActionAttempted: {
+                            self.audit(
+                                event: "authorization_confirm_action_attempted",
+                                turnID: turnID)
+                        },
+                        confirmActionPerformed: {
+                            self.audit(
+                                event: "authorization_confirm_action_performed",
                                 turnID: turnID)
                         },
                         completionReceiptObserved: {

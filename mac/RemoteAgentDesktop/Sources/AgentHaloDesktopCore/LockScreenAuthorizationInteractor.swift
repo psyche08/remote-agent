@@ -11,7 +11,10 @@ public protocol LockScreenAuthorizationRequesting: Sendable {
         authorizationFieldReady: @Sendable () -> Void,
         releaseRemoteUserActivity: @Sendable () throws -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWriteAttempted: @Sendable () -> Void,
         emptyValueWritten: @Sendable () -> Void,
+        confirmActionAttempted: @Sendable () -> Void,
+        confirmActionPerformed: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool,
         isLocked: @Sendable () throws -> Bool
     ) throws
@@ -29,10 +32,10 @@ public struct LockScreenAuthorizationError: Error, Equatable, CustomStringConver
 
 /// Starts the screensaver/loginwindow authorization flow through the control
 /// macOS exposes for that purpose. It never reads the password value or writes
-/// a credential. After focusing the exact field it explicitly writes an empty
-/// AX value as the sole candidate trigger for loginwindow's authorization
-/// transaction. The empty assignment is the entire submission: this interactor
-/// deliberately does not discover or perform AX actions on the secure field.
+/// a credential. Before publishing a grant it verifies that the exact field
+/// supports `AXConfirm`. After the grant, it writes one empty AX value and then
+/// performs exactly one `AXConfirm` on that same verified field. It never finds
+/// or presses a button, sends a keyboard event, or retries either mutation.
 ///
 /// The exact identifier is intentionally the only selectable target. Falling
 /// back to a title such as "Unlock" would be localization-dependent and, more
@@ -52,7 +55,8 @@ public final class SystemLockScreenAuthorizationInteractor:
     /// controller publishes a grant, so this wait consumes none of its TTL.
     static let discoveryTimeout: TimeInterval = 8
     /// Once the exact field is focused and the grant has been published, the
-    /// empty assignment remains a short, single-attempt boundary.
+    /// empty assignment plus field-local AXConfirm remain one short,
+    /// single-attempt boundary.
     /// A fresh deadline prevents slow discovery from stealing this phase's
     /// bounded AX IPC budget.
     private static let submissionTimeout: TimeInterval = 1.5
@@ -247,48 +251,127 @@ public final class SystemLockScreenAuthorizationInteractor:
         }
     }
 
+    static func requireConfirmActionSupported(
+        queryStatus: AXError, actionNames: [String]
+    ) throws {
+        try requireResponsive(
+            queryStatus,
+            operation: "checking whether the lock-screen authorization field supports AXConfirm")
+        guard queryStatus == .success else {
+            throw LockScreenAuthorizationError(
+                "could not verify that the macOS lock-screen authorization field supports AXConfirm (AX error \(queryStatus.rawValue))")
+        }
+        guard actionNames.contains(kAXConfirmAction as String) else {
+            throw LockScreenAuthorizationError(
+                "the macOS lock-screen authorization field does not support AXConfirm")
+        }
+    }
+
+    static func requireConfirmActionPerformed(_ status: AXError) throws {
+        if status == .cannotComplete {
+            throw LockScreenAuthorizationError(
+                "AXConfirm on the macOS lock-screen authorization field timed out; its outcome is unknown and it will not be retried")
+        }
+        guard status == .success else {
+            throw LockScreenAuthorizationError(
+                "could not perform AXConfirm on the macOS lock-screen authorization field (AX error \(status.rawValue)); it will not be retried")
+        }
+    }
+
+    final class MutationAttempt {
+        private(set) var wasMarked = false
+
+        func mark() { wasMarked = true }
+    }
+
     /// The complete pregrant readiness vocabulary. In particular, this seam
-    /// has no action-discovery/action-performance closure: the only accepted
-    /// phases are exact-field resolution, focus/readback, and empty-value
-    /// settability. Production and deterministic tests share the same order.
+    /// has no action-performance closure: the only accepted phases are exact-
+    /// field resolution, focus/readback, empty-value settability, and checking
+    /// that this same field advertises AXConfirm. Production and deterministic
+    /// tests share the same order.
     static func performCredentialFreeFieldReadiness<Field>(
         locateExactField: () throws -> Field,
         focusAndReadBack: (Field) throws -> Void,
-        requireEmptyValueSettable: (Field) throws -> Void
+        requireEmptyValueSettable: (Field) throws -> Void,
+        requireConfirmActionSupported: (Field) throws -> Void
     ) rethrows -> Field {
         let field = try locateExactField()
         try focusAndReadBack(field)
         try requireEmptyValueSettable(field)
+        try requireConfirmActionSupported(field)
         return field
     }
 
-    /// The empty AX assignment can itself be the event that starts the system
-    /// authorization transaction. Keep the single mutation behind an explicit
-    /// non-retrying seam: any ambiguous result must flow to controller proof
-    /// verification/quarantine rather than causing a second write. The
-    /// nonescaping `didWrite` observer runs only after the successful write and
-    /// carries no grant material.
-    static func performSingleEmptyValueSubmission(
-        writeEmptyValue: () throws -> Void,
-        didWrite: () -> Void = {}
+    /// Keep the two field-local mutations behind one explicit non-retrying
+    /// seam. AXConfirm is attempted only after the empty write succeeds. Any
+    /// ambiguous result flows to controller proof verification/quarantine
+    /// rather than causing a second write or confirmation. Stage observers are
+    /// emitted only after the tight mutation envelope returns and carry no
+    /// grant material.
+    static func performSingleConfirmedSubmission(
+        emptyValueWriteAttempted: () -> Void = {},
+        writeEmptyValue: (MutationAttempt) throws -> Void,
+        didWrite: () -> Void = {},
+        confirmAttempted: () -> Void = {},
+        performConfirm: (MutationAttempt) throws -> Void,
+        didConfirm: () -> Void = {}
     ) throws {
-        try writeEmptyValue()
+        let emptyWriteAttempt = MutationAttempt()
+        let confirmAttempt = MutationAttempt()
+        var emptyValueWasWritten = false
+        do {
+            try writeEmptyValue(emptyWriteAttempt)
+            guard emptyWriteAttempt.wasMarked else {
+                throw LockScreenAuthorizationError(
+                    "the empty-value submission returned without entering its AX call boundary")
+            }
+            emptyValueWasWritten = true
+            try performConfirm(confirmAttempt)
+            guard confirmAttempt.wasMarked else {
+                throw LockScreenAuthorizationError(
+                    "the AXConfirm submission returned without entering its AX call boundary")
+            }
+        } catch {
+            // Do not run controller/audit callbacks inside the tight retained-
+            // field mutation envelope. Report completed/attempted stages only
+            // after AX has returned, then preserve the original failure.
+            if emptyWriteAttempt.wasMarked { emptyValueWriteAttempted() }
+            if emptyValueWasWritten { didWrite() }
+            if confirmAttempt.wasMarked { confirmAttempted() }
+            throw error
+        }
+        if emptyWriteAttempt.wasMarked { emptyValueWriteAttempted() }
         didWrite()
+        confirmAttempted()
+        didConfirm()
     }
 
     /// Retain and revalidate the exact prepared field immediately before the
-    /// only postgrant mutation. Tests use a value-token identity here so a
-    /// same-PID process/field replacement cannot disappear into AX plumbing.
-    static func writePreparedEmptyValue<PreparedField>(
+    /// only postgrant mutation sequence. Tests use a value-token identity here
+    /// so a same-PID process/field replacement cannot disappear into AX
+    /// plumbing.
+    static func submitPreparedAuthorization<PreparedField>(
         _ preparedField: PreparedField,
         revalidate: (PreparedField) throws -> Void,
-        write: (PreparedField) throws -> Void,
-        didWrite: () -> Void = {}
+        emptyValueWriteAttempted: () -> Void = {},
+        write: (PreparedField, MutationAttempt) throws -> Void,
+        didWrite: () -> Void = {},
+        confirmAttempted: () -> Void = {},
+        confirm: (PreparedField, MutationAttempt) throws -> Void,
+        didConfirm: () -> Void = {}
     ) throws {
         try revalidate(preparedField)
-        try performSingleEmptyValueSubmission(
-            writeEmptyValue: { try write(preparedField) },
-            didWrite: didWrite)
+        try performSingleConfirmedSubmission(
+            emptyValueWriteAttempted: emptyValueWriteAttempted,
+            writeEmptyValue: { attempt in
+                try write(preparedField, attempt)
+            },
+            didWrite: didWrite,
+            confirmAttempted: confirmAttempted,
+            performConfirm: { attempt in
+                try confirm(preparedField, attempt)
+            },
+            didConfirm: didConfirm)
     }
 
     /// Orders every non-authorizing readiness check before grant publication.
@@ -334,7 +417,10 @@ public final class SystemLockScreenAuthorizationInteractor:
         authorizationFieldReady: @Sendable () -> Void,
         releaseRemoteUserActivity: @Sendable () throws -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWriteAttempted: @Sendable () -> Void,
         emptyValueWritten: @Sendable () -> Void,
+        confirmActionAttempted: @Sendable () -> Void,
+        confirmActionPerformed: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool,
         isLocked: @Sendable () throws -> Bool
     ) throws {
@@ -367,6 +453,12 @@ public final class SystemLockScreenAuthorizationInteractor:
                             field.element,
                             expectedProcessIdentifier: field.processIdentifier,
                             deadline: deadline)
+                    },
+                    requireConfirmActionSupported: { field in
+                        try self.preflightConfirmAction(
+                            field.element,
+                            expectedProcessIdentifier: field.processIdentifier,
+                            deadline: deadline)
                     })
                 focusedField = field
                 break
@@ -382,16 +474,13 @@ public final class SystemLockScreenAuthorizationInteractor:
         }
 
         // The entire find/focus/value readiness phase above completed before
-        // this gate. From prepareGrant onward no readiness query is allowed,
-        // no AX action API exists in this interactor, and no failure is retried.
+        // this gate. From prepareGrant onward no readiness query or action-name
+        // discovery is allowed, and neither field mutation is retried.
         try Self.performGrantGatedSubmission(
             preflight: { focusedField },
             revalidateBeforeGrant: { preparedField in
-                try self.requireSameLoginwindowApplication(preparedField.application)
-                try self.requireProcessIdentifier(
-                    preparedField.element,
-                    expected: preparedField.processIdentifier,
-                    deadline: deadline)
+                try self.revalidatePreparedFieldBeforeGrant(
+                    preparedField, deadline: deadline)
             },
             // Keep the remote user-activity assertion alive through exact
             // field discovery, focus readback, value readiness, and identity
@@ -403,25 +492,32 @@ public final class SystemLockScreenAuthorizationInteractor:
             submit: { preparedField in
                 // Freshly bound after grant preparation, so slow wake,
                 // discovery, focus, and readiness checks consume none of this
-                // single empty write's bounded AX budget.
+                // single empty-write + AXConfirm sequence's bounded AX budget.
                 let submissionDeadline = Date().addingTimeInterval(
                     Self.submissionTimeout)
-                try Self.writePreparedEmptyValue(
+                try Self.submitPreparedAuthorization(
                     preparedField,
                     revalidate: { field in
-                        try self.requireSameLoginwindowApplication(field.application)
-                        try self.requireProcessIdentifier(
-                            field.element,
-                            expected: field.processIdentifier,
-                            deadline: submissionDeadline)
+                        try self.revalidateRetainedFieldIdentityAfterGrant(
+                            field, deadline: submissionDeadline)
                     },
-                    write: { field in
+                    emptyValueWriteAttempted: emptyValueWriteAttempted,
+                    write: { field, attempt in
                         try self.writeEmptySubmission(
                             field.element,
                             expectedProcessIdentifier: field.processIdentifier,
-                            deadline: submissionDeadline)
+                            deadline: submissionDeadline,
+                            attempt: attempt)
                     },
-                    didWrite: emptyValueWritten)
+                    didWrite: emptyValueWritten,
+                    confirmAttempted: confirmActionAttempted,
+                    confirm: { field, attempt in
+                        try self.performConfirmSubmission(
+                            field.element,
+                            deadline: submissionDeadline,
+                            attempt: attempt)
+                    },
+                    didConfirm: confirmActionPerformed)
             })
 
         // Never re-submit after this boundary. A lifecycle failure is
@@ -558,6 +654,36 @@ public final class SystemLockScreenAuthorizationInteractor:
             CFEqual(current.element, expected.element)
     }
 
+    private func revalidatePreparedFieldBeforeGrant(
+        _ field: LocatedPasswordField, deadline: Date
+    ) throws {
+        guard try samePasswordFieldIsReachable(field, deadline: deadline) else {
+            throw LockScreenAuthorizationError(
+                "the retained exact lock-screen authorization field is no longer reachable before grant publication")
+        }
+        try preflightEmptySubmission(
+            field.element,
+            expectedProcessIdentifier: field.processIdentifier,
+            deadline: deadline)
+        try preflightConfirmAction(
+            field.element,
+            expectedProcessIdentifier: field.processIdentifier,
+            deadline: deadline)
+    }
+
+    private func revalidateRetainedFieldIdentityAfterGrant(
+        _ field: LocatedPasswordField, deadline: Date
+    ) throws {
+        // This is identity verification, not AX tree/action discovery. Preserve
+        // the unique current AppKit-instance check so a same-PID replacement
+        // cannot inherit the retained AX field after grant publication.
+        try requireSameLoginwindowApplication(field.application)
+        try requireProcessIdentifier(
+            field.element,
+            expected: field.processIdentifier,
+            deadline: deadline)
+    }
+
     private func focus(
         _ field: AXUIElement,
         expectedProcessIdentifier: pid_t,
@@ -616,24 +742,59 @@ public final class SystemLockScreenAuthorizationInteractor:
             queryStatus: query, isSettable: settable.boolValue)
     }
 
-    private func writeEmptySubmission(
+    private func preflightConfirmAction(
         _ field: AXUIElement,
         expectedProcessIdentifier: pid_t,
         deadline: Date
     ) throws {
+        try requireProcessIdentifier(
+            field, expected: expectedProcessIdentifier, deadline: deadline)
+        try Self.configureTimeout(field, deadline: deadline)
+        try Self.before(
+            deadline,
+            operation: "checking whether the lock-screen authorization field supports AXConfirm")
+        var names: CFArray?
+        let query = AXUIElementCopyActionNames(field, &names)
+        try Self.requireConfirmActionSupported(
+            queryStatus: query,
+            actionNames: names as? [String] ?? [])
+    }
+
+    private func writeEmptySubmission(
+        _ field: AXUIElement,
+        expectedProcessIdentifier: pid_t,
+        deadline: Date,
+        attempt: MutationAttempt
+    ) throws {
         // This is a deliberately credential-free empty public AX assignment,
         // not a sentinel. Never copy/read the secure field's current value.
-        // Although the resulting field value is empty, the assignment itself
-        // may trigger authorization and therefore must never be retried.
-        // There is deliberately no following AX action. If loginwindow cannot
-        // acknowledge this edit, the authorization request is not attributable.
-        // `writePreparedEmptyValue` re-resolved the unique exact AppKit
-        // identity and AX field owner immediately before entering this write.
+        // Although the resulting field value is empty, the assignment is part
+        // of an authorization trigger and therefore must never be retried.
+        // `submitPreparedAuthorization` re-resolved the unique exact AppKit
+        // identity and AX field owner immediately before entering the compound
+        // write + AXConfirm sequence.
         try Self.before(
             deadline, operation: "writing an empty lock-screen authorization value")
+        attempt.mark()
         let written = AXUIElementSetAttributeValue(
             field, kAXValueAttribute as CFString, "" as CFString)
         try Self.requireEmptyValueWritten(written)
+    }
+
+    private func performConfirmSubmission(
+        _ field: AXUIElement,
+        deadline: Date,
+        attempt: MutationAttempt
+    ) throws {
+        // Capability discovery already happened before grant publication. Do
+        // not rediscover a target, a button, or the action set here: perform
+        // the one exact action on the same retained password-field element.
+        try Self.before(
+            deadline, operation: "performing AXConfirm on the lock-screen authorization field")
+        attempt.mark()
+        let confirmed = AXUIElementPerformAction(
+            field, kAXConfirmAction as CFString)
+        try Self.requireConfirmActionPerformed(confirmed)
     }
 
     private static func runningApplicationIdentity(

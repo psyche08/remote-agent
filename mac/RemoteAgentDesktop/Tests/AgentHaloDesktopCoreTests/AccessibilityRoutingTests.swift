@@ -687,7 +687,56 @@ final class AccessibilityRoutingTests: XCTestCase {
         }
     }
 
-    func testCredentialFreeFieldReadinessHasOnlyExactFocusAndValuePhases() throws {
+    func testExactPasswordFieldMustAdvertiseConfirmBeforeGrant() {
+        let confirm = kAXConfirmAction as String
+        XCTAssertNoThrow(
+            try SystemLockScreenAuthorizationInteractor.requireConfirmActionSupported(
+                queryStatus: .success, actionNames: ["AXShowMenu", confirm]))
+
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireConfirmActionSupported(
+                queryStatus: .success, actionNames: ["AXShowMenu"])) { error in
+            XCTAssertEqual(
+                (error as? LockScreenAuthorizationError)?.detail,
+                "the macOS lock-screen authorization field does not support AXConfirm")
+        }
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireConfirmActionSupported(
+                queryStatus: .attributeUnsupported, actionNames: [confirm])) { error in
+            XCTAssertTrue(
+                (error as? LockScreenAuthorizationError)?.detail.contains(
+                    "could not verify") == true)
+        }
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor.requireConfirmActionSupported(
+                queryStatus: .cannotComplete, actionNames: [confirm])) { error in
+            XCTAssertTrue(
+                (error as? LockScreenAuthorizationError)?.detail.contains(
+                    "timed out") == true)
+        }
+    }
+
+    func testConfirmResultIsFailClosedAndCannotCompleteIsUnknown() {
+        XCTAssertNoThrow(
+            try SystemLockScreenAuthorizationInteractor
+                .requireConfirmActionPerformed(.success))
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor
+                .requireConfirmActionPerformed(.failure)) { error in
+            let detail = (error as? LockScreenAuthorizationError)?.detail ?? ""
+            XCTAssertTrue(detail.contains("could not perform AXConfirm"))
+            XCTAssertTrue(detail.contains("will not be retried"))
+        }
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor
+                .requireConfirmActionPerformed(.cannotComplete)) { error in
+            let detail = (error as? LockScreenAuthorizationError)?.detail ?? ""
+            XCTAssertTrue(detail.contains("outcome is unknown"))
+            XCTAssertTrue(detail.contains("will not be retried"))
+        }
+    }
+
+    func testCredentialFreeFieldReadinessIncludesConfirmSupportBeforeGrant() throws {
         var events: [String] = []
         let prepared = SystemLockScreenAuthorizationInteractor
             .performCredentialFreeFieldReadiness(
@@ -702,11 +751,18 @@ final class AccessibilityRoutingTests: XCTestCase {
                 requireEmptyValueSettable: { field in
                     XCTAssertEqual(field, "field-token")
                     events.append("empty-value-settable")
+                },
+                requireConfirmActionSupported: { field in
+                    XCTAssertEqual(field, "field-token")
+                    events.append("confirm-action-supported")
                 })
         XCTAssertEqual(prepared, "field-token")
         XCTAssertEqual(
             events,
-            ["exact-loginwindow-field", "focus-readback", "empty-value-settable"])
+            [
+                "exact-loginwindow-field", "focus-readback",
+                "empty-value-settable", "confirm-action-supported",
+            ])
 
         events = []
         XCTAssertThrowsError(
@@ -722,48 +778,130 @@ final class AccessibilityRoutingTests: XCTestCase {
                     },
                     requireEmptyValueSettable: { _ in
                         events.append("empty-value-settable")
+                    },
+                    requireConfirmActionSupported: { _ in
+                        events.append("confirm-action-supported")
                     }))
         XCTAssertEqual(events, ["exact-loginwindow-field", "focus-readback"])
     }
 
-    func testSingleEmptyValueSubmissionWritesExactlyOnceAndNeverRetriesFailure() {
+    func testSingleConfirmedSubmissionIsOrderedExactOnceAndNeverRetries() {
         var successfulWriteCount = 0
-        var successfulCallbackCount = 0
+        var successfulConfirmCount = 0
         var successfulEvents: [String] = []
         XCTAssertNoThrow(
             try SystemLockScreenAuthorizationInteractor
-                .performSingleEmptyValueSubmission(
-                    writeEmptyValue: {
+                .performSingleConfirmedSubmission(
+                    emptyValueWriteAttempted: {
+                        successfulEvents.append("write-attempted-audit")
+                    },
+                    writeEmptyValue: { attempt in
+                        attempt.mark()
                         successfulWriteCount += 1
                         successfulEvents.append("write")
                     },
                     didWrite: {
-                        successfulCallbackCount += 1
-                        successfulEvents.append("audit")
+                        successfulEvents.append("write-audit")
+                    },
+                    confirmAttempted: {
+                        successfulEvents.append("confirm-attempted-audit")
+                    },
+                    performConfirm: { attempt in
+                        attempt.mark()
+                        successfulConfirmCount += 1
+                        successfulEvents.append("confirm")
+                    },
+                    didConfirm: {
+                        successfulEvents.append("confirm-performed-audit")
                     }))
         XCTAssertEqual(successfulWriteCount, 1)
-        XCTAssertEqual(successfulCallbackCount, 1)
-        XCTAssertEqual(successfulEvents, ["write", "audit"])
+        XCTAssertEqual(successfulConfirmCount, 1)
+        XCTAssertEqual(
+            successfulEvents,
+            [
+                "write", "confirm", "write-attempted-audit", "write-audit",
+                "confirm-attempted-audit", "confirm-performed-audit",
+            ])
 
         var failedWriteCount = 0
-        var failedCallbackCount = 0
+        var confirmAfterFailedWriteCount = 0
         XCTAssertThrowsError(
             try SystemLockScreenAuthorizationInteractor
-                .performSingleEmptyValueSubmission(
-                    writeEmptyValue: {
+                .performSingleConfirmedSubmission(
+                    writeEmptyValue: { attempt in
+                        attempt.mark()
                         failedWriteCount += 1
                         throw LockScreenAuthorizationError("empty value failed")
                     },
-                    didWrite: { failedCallbackCount += 1 })) { error in
+                    performConfirm: { _ in confirmAfterFailedWriteCount += 1 })) { error in
             XCTAssertEqual(
                 (error as? LockScreenAuthorizationError)?.detail,
                 "empty value failed")
         }
         XCTAssertEqual(failedWriteCount, 1)
-        XCTAssertEqual(failedCallbackCount, 0)
+        XCTAssertEqual(confirmAfterFailedWriteCount, 0)
+
+        var writeBeforeFailedConfirmCount = 0
+        var failedConfirmCount = 0
+        var failedConfirmEvents: [String] = []
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor
+                .performSingleConfirmedSubmission(
+                    writeEmptyValue: { attempt in
+                        attempt.mark()
+                        writeBeforeFailedConfirmCount += 1
+                    },
+                    didWrite: { failedConfirmEvents.append("write-audit") },
+                    confirmAttempted: {
+                        failedConfirmEvents.append("confirm-attempted-audit")
+                    },
+                    performConfirm: { attempt in
+                        attempt.mark()
+                        failedConfirmCount += 1
+                        throw LockScreenAuthorizationError(
+                            "AXConfirm outcome unknown")
+                    },
+                    didConfirm: {
+                        failedConfirmEvents.append("confirm-performed-audit")
+                    }))
+        XCTAssertEqual(writeBeforeFailedConfirmCount, 1)
+        XCTAssertEqual(failedConfirmCount, 1)
+        XCTAssertEqual(
+            failedConfirmEvents,
+            ["write-audit", "confirm-attempted-audit"])
+
+        var preCallAuditCount = 0
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor
+                .performSingleConfirmedSubmission(
+                    emptyValueWriteAttempted: { preCallAuditCount += 1 },
+                    writeEmptyValue: { _ in
+                        throw LockScreenAuthorizationError(
+                            "deadline expired before AX call")
+                    },
+                    performConfirm: { _ in }))
+        XCTAssertEqual(
+            preCallAuditCount, 0,
+            "a failure before the AX call was falsely audited as attempted")
+
+        var unmarkedConfirmAuditCount = 0
+        var unmarkedConfirmPerformedCount = 0
+        XCTAssertThrowsError(
+            try SystemLockScreenAuthorizationInteractor
+                .performSingleConfirmedSubmission(
+                    writeEmptyValue: { attempt in attempt.mark() },
+                    confirmAttempted: { unmarkedConfirmAuditCount += 1 },
+                    performConfirm: { _ in },
+                    didConfirm: { unmarkedConfirmPerformedCount += 1 })) { error in
+            XCTAssertTrue(
+                (error as? LockScreenAuthorizationError)?.detail.contains(
+                    "without entering its AX call boundary") == true)
+        }
+        XCTAssertEqual(unmarkedConfirmAuditCount, 0)
+        XCTAssertEqual(unmarkedConfirmPerformedCount, 0)
     }
 
-    func testLockScreenInteractorContainsNoAXActionDiscoveryOrPerformance() throws {
+    func testLockScreenInteractorUsesOnlyExactFieldConfirmWithoutInputFallback() throws {
         let packageDirectory = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
@@ -771,15 +909,20 @@ final class AccessibilityRoutingTests: XCTestCase {
         let sourceURL = packageDirectory.appendingPathComponent(
             "Sources/AgentHaloDesktopCore/LockScreenAuthorizationInteractor.swift")
         let source = try String(contentsOf: sourceURL, encoding: .utf8)
+        XCTAssertTrue(source.contains("AXUIElementCopyActionNames"))
+        XCTAssertTrue(source.contains("kAXConfirmAction"))
+        XCTAssertEqual(
+            source.components(separatedBy: "AXUIElementPerformAction(").count - 1,
+            1,
+            "AXConfirm must have exactly one production call site")
         for forbidden in [
-            "AXUIElementCopyActionNames",
-            "AXUIElementPerformAction",
-            "kAXConfirmAction",
-            "kAXPressAction",
+            "kAXPressAction", "kAXButtonRole", "kAXRoleAttribute",
+            "CGEventCreateKeyboardEvent", "CGEventKeyboardSetUnicodeString",
+            "CGEventPost", "IOHIDPostEvent",
         ] {
             XCTAssertFalse(
                 source.contains(forbidden),
-                "the lock-screen interactor regained forbidden AX action API \(forbidden)")
+                "the lock-screen interactor regained forbidden input fallback \(forbidden)")
         }
     }
 
@@ -794,7 +937,7 @@ final class AccessibilityRoutingTests: XCTestCase {
             try SystemLockScreenAuthorizationInteractor.performGrantGatedSubmission(
                 preflight: { () -> String in
                     throw LockScreenAuthorizationError(
-                        "the exact field's empty value is not settable")
+                        "the retained exact field does not support AXConfirm")
                 },
                 prepareGrant: {
                     grantPreparationCount += 1
@@ -806,13 +949,13 @@ final class AccessibilityRoutingTests: XCTestCase {
                 submit: { _ in submissionCount += 1 })) { error in
             XCTAssertEqual(
                 (error as? LockScreenAuthorizationError)?.detail,
-                "the exact field's empty value is not settable")
+                "the retained exact field does not support AXConfirm")
         }
         XCTAssertEqual(grantPreparationCount, 0)
         XCTAssertEqual(submissionCount, 0)
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: grantPath),
-            "failed empty-value readiness published ambient grant authority")
+            "failed AXConfirm readiness published ambient grant authority")
     }
 
     func testLoginwindowReplacementBeforeGrantPublishesAndSubmitsNothing() {
@@ -906,7 +1049,7 @@ final class AccessibilityRoutingTests: XCTestCase {
         var callbackCount = 0
 
         XCTAssertThrowsError(
-            try SystemLockScreenAuthorizationInteractor.writePreparedEmptyValue(
+            try SystemLockScreenAuthorizationInteractor.submitPreparedAuthorization(
                 prepared,
                 revalidate: { expected in
                     guard current == expected else {
@@ -914,8 +1057,9 @@ final class AccessibilityRoutingTests: XCTestCase {
                             "exact loginwindow instance changed after grant")
                     }
                 },
-                write: { _ in writeCount += 1 },
-                didWrite: { callbackCount += 1 })) { error in
+                write: { _, _ in writeCount += 1 },
+                didWrite: { callbackCount += 1 },
+                confirm: { _, _ in })) { error in
             XCTAssertEqual(
                 (error as? LockScreenAuthorizationError)?.detail,
                 "exact loginwindow instance changed after grant")
@@ -925,37 +1069,92 @@ final class AccessibilityRoutingTests: XCTestCase {
         XCTAssertEqual(callbackCount, 0)
     }
 
-    func testPreparedSubmissionOrdersReadinessRevalidationGrantAndSingleEmptyWrite() throws {
+    func testReplacementAfterWriteStillConfirmsOriginalRetainedFieldOnce() throws {
+        struct PreparedField: Equatable {
+            let applicationInstance: Int
+            let processIdentifier: pid_t
+            let elementInstance: Int
+        }
+        let prepared = PreparedField(
+            applicationInstance: 1, processIdentifier: 41, elementInstance: 7)
+        let replacement = PreparedField(
+            applicationInstance: 2, processIdentifier: 41, elementInstance: 8)
+        var current = prepared
+        var writtenField: PreparedField?
+        var confirmedField: PreparedField?
+        var confirmCount = 0
+
+        try SystemLockScreenAuthorizationInteractor.submitPreparedAuthorization(
+            prepared,
+            revalidate: { expected in XCTAssertEqual(current, expected) },
+            write: { field, attempt in
+                attempt.mark()
+                writtenField = field
+                current = replacement
+            },
+            confirm: { field, attempt in
+                attempt.mark()
+                confirmCount += 1
+                confirmedField = field
+            })
+
+        XCTAssertEqual(writtenField, prepared)
+        XCTAssertEqual(confirmedField, prepared)
+        XCTAssertEqual(confirmCount, 1)
+        XCTAssertEqual(current, replacement)
+    }
+
+    func testPreparedSubmissionOrdersFinalReadinessGrantAndTightConfirmEnvelope() throws {
         var events: [String] = []
         try SystemLockScreenAuthorizationInteractor.performGrantGatedSubmission(
             preflight: {
-                events.append("exact-field-focus-readback-value-settable")
+                events.append(
+                    "exact-field-focus-readback-value-settable-confirm-supported")
                 return "exact-ready-field"
             },
             revalidateBeforeGrant: { field in
                 XCTAssertEqual(field, "exact-ready-field")
-                events.append("identity-input-lock-revalidation")
+                events.append(
+                    "exact-field-reachable-confirm-support-final-revalidation")
             },
             prepareGrant: { events.append("grant") },
             submit: { field in
                 XCTAssertEqual(field, "exact-ready-field")
                 try SystemLockScreenAuthorizationInteractor
-                    .performSingleEmptyValueSubmission(
-                        writeEmptyValue: {
+                    .performSingleConfirmedSubmission(
+                        emptyValueWriteAttempted: {
+                            events.append("empty-value-write-attempted-audit")
+                        },
+                        writeEmptyValue: { attempt in
+                            attempt.mark()
                             events.append("single-empty-value-write")
                         },
                         didWrite: {
                             events.append("empty-value-written-audit")
+                        },
+                        confirmAttempted: {
+                            events.append("confirm-attempted-audit")
+                        },
+                        performConfirm: { attempt in
+                            attempt.mark()
+                            events.append("single-confirm-action")
+                        },
+                        didConfirm: {
+                            events.append("confirm-performed-audit")
                         })
             })
         XCTAssertEqual(
             events,
             [
-                "exact-field-focus-readback-value-settable",
-                "identity-input-lock-revalidation",
+                "exact-field-focus-readback-value-settable-confirm-supported",
+                "exact-field-reachable-confirm-support-final-revalidation",
                 "grant",
                 "single-empty-value-write",
+                "single-confirm-action",
+                "empty-value-write-attempted-audit",
                 "empty-value-written-audit",
+                "confirm-attempted-audit",
+                "confirm-performed-audit",
             ])
     }
 }

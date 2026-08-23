@@ -35,6 +35,9 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
     private var grantPreparationCallsPerRequest = 1
     private var authorizationFailureBeforePreparation: Error?
     private var authorizationFailureAfterPreparation: Error?
+    private var authorizationFailureAfterEmptyValue: Error?
+    private var confirmFailureStartsAuthorizationTransaction = false
+    private var confirmActionAttempts = 0
     private var mostRecentGrantPayload: GrantPayload?
     private var delayedUnlockGate: Latch?
     private var transactionDestroyGate: Latch?
@@ -124,7 +127,10 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
     func requestUnlockAuthorization(
         authorizationFieldReady: @Sendable () -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWriteAttempted: @Sendable () -> Void,
         emptyValueWritten: @Sendable () -> Void,
+        confirmActionAttempted: @Sendable () -> Void,
+        confirmActionPerformed: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool
     ) throws {
         mutex.lock()
@@ -150,11 +156,23 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
             mutex.unlock()
             try prepareGrant()
         }
+        emptyValueWriteAttempted()
         mutex.lock()
         let failureAfterPreparation = authorizationFailureAfterPreparation
         mutex.unlock()
         if let failureAfterPreparation { throw failureAfterPreparation }
         emptyValueWritten()
+        confirmActionAttempted()
+        mutex.lock()
+        confirmActionAttempts += 1
+        let failureAfterEmptyValue = authorizationFailureAfterEmptyValue
+        let startTransactionAfterConfirmFailure =
+            confirmFailureStartsAuthorizationTransaction
+        mutex.unlock()
+        if let failureAfterEmptyValue, !startTransactionAfterConfirmFailure {
+            throw failureAfterEmptyValue
+        }
+        if failureAfterEmptyValue == nil { confirmActionPerformed() }
 
         let grantPath = (directory as NSString)
             .appendingPathComponent(GrantContract.fileName)
@@ -209,6 +227,15 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
             }
             self?.publishTerminalAndApplyTransition(
                 payload, terminalSamplingFinished: terminalSamplingFinished)
+        }
+        if let failureAfterEmptyValue {
+            // AXConfirm may return cannotComplete even though loginwindow
+            // accepted it. Model that exact ambiguity: the API caller returns
+            // an error, while the authorization engine independently consumes
+            // the same grant and can still apply a delayed transition.
+            monitorStarted.close()
+            terminalSamplingFinished.close()
+            throw failureAfterEmptyValue
         }
         try waitForAuthorizationTransaction(
             completionReceiptObserved: completionReceiptObserved,
@@ -372,6 +399,11 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
         defer { mutex.unlock() }
         return grantPreparationCallbacks
     }
+    var confirmActionAttemptCount: Int {
+        mutex.lock()
+        defer { mutex.unlock() }
+        return confirmActionAttempts
+    }
     var lastGrantPayload: GrantPayload? {
         mutex.lock()
         defer { mutex.unlock() }
@@ -385,6 +417,12 @@ final class FakeSystem: LockedUseSystem, @unchecked Sendable {
     func setAuthorizationFailureAfterPreparation(_ error: Error?) {
         mutex.lock()
         authorizationFailureAfterPreparation = error
+        mutex.unlock()
+    }
+    func setAmbiguousConfirmFailure(_ error: Error?) {
+        mutex.lock()
+        authorizationFailureAfterEmptyValue = error
+        confirmFailureStartsAuthorizationTransaction = error != nil
         mutex.unlock()
     }
     func setAuthorizationFailureBeforePreparation(_ error: Error?) {
@@ -516,7 +554,10 @@ final class UnavailableSystem: LockedUseSystem, @unchecked Sendable {
     func requestUnlockAuthorization(
         authorizationFieldReady: @Sendable () -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWriteAttempted: @Sendable () -> Void,
         emptyValueWritten: @Sendable () -> Void,
+        confirmActionAttempted: @Sendable () -> Void,
+        confirmActionPerformed: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool
     ) throws { throw LockedUseError.unsupported }
     func run(_ action: Action) throws -> DesktopService.ActionResult {
@@ -1436,6 +1477,77 @@ final class LockedUseControllerTests: XCTestCase {
             "field loss before complete was incorrectly accepted as UI completion")
     }
 
+    func testAmbiguousConfirmFailureWithConsumedGrantQuarantinesAndRelocksLateUnlock() {
+        let system = FakeSystem()
+        let lateUnlock = Latch()
+        system.setDelayedUnlockGate(lateUnlock)
+        system.setAmbiguousConfirmFailure(
+            LockScreenAuthorizationError(
+                "AXConfirm outcome is unknown and will not be retried"))
+        let controller = makeController(
+            system: system, authorizationSettleTimeout: 0.15,
+            relockTimeout: 0.05, relockRetryInterval: 0.01)
+        let openDone = Latch()
+        let outcomes = NSMutableArray()
+
+        DispatchQueue.global().async {
+            do {
+                try controller.openWindow(turnID: "turn-confirm-ambiguous")
+                outcomes.add("opened")
+            } catch {
+                outcomes.add(error)
+            }
+            openDone.close()
+        }
+
+        XCTAssertTrue(system.pendingReceiptPublished.wait(timeout: 2))
+        XCTAssertTrue(system.receiptPublished.wait(timeout: 2))
+        XCTAssertTrue(system.completionReceiptPublished.wait(timeout: 2))
+        XCTAssertTrue(openDone.wait(timeout: 3))
+        XCTAssertFalse(outcomes.contains("opened"))
+        eventually("ambiguous AXConfirm quarantine", timeout: 3) {
+            !controller.windowRegistration().registered
+                && (controller.status()["locked_use"] as? [String: Any])?[
+                    "requires_manual_recovery"] as? Bool == true
+        }
+
+        XCTAssertEqual(system.confirmActionAttemptCount, 1)
+        XCTAssertEqual(system.grantPreparationCallbackCount, 1)
+        let events = controller.auditEntries().map(\.event)
+        XCTAssertEqual(events.filter { $0 == "grant_published" }.count, 1)
+        XCTAssertEqual(
+            events.filter { $0 == "authorization_empty_value_write_attempted" }.count,
+            1)
+        XCTAssertEqual(
+            events.filter { $0 == "authorization_empty_value_written" }.count,
+            1)
+        XCTAssertEqual(
+            events.filter { $0 == "authorization_confirm_action_attempted" }.count,
+            1)
+        XCTAssertEqual(
+            events.filter { $0 == "authorization_confirm_action_performed" }.count,
+            0,
+            "a cannotComplete result was falsely audited as confirmed")
+        XCTAssertFalse(events.contains("authorization_ui_completed"))
+        XCTAssertFalse(events.contains("window_opened"))
+        XCTAssertTrue(system.isScreenLocked)
+        XCTAssertTrue(system.isShieldUp)
+
+        // The API error does not cancel an authorization already accepted by
+        // loginwindow. Its delayed visible effect must be caught and relocked
+        // while manual recovery keeps the shield in place.
+        lateUnlock.close()
+        XCTAssertTrue(system.authorizationTransitionApplied.wait(timeout: 2))
+        eventually("ambiguous Confirm late unlock to be relocked", timeout: 3) {
+            system.isScreenLocked
+        }
+        XCTAssertTrue(system.isShieldUp)
+        XCTAssertFalse(
+            controller.auditEntries().contains {
+                $0.event == "quarantine_resolved"
+            })
+    }
+
     func testWithdrawalWaitsForVerifierAndRechecksProofAfterGrantDeadline() {
         let system = FakeSystem()
         let verifierGate = Latch()
@@ -2000,16 +2112,34 @@ extension LockedUseControllerTests {
         guard let fieldReadyIndex = authorizationEvents.firstIndex(
             of: "authorization_field_ready"),
             let grantIndex = authorizationEvents.firstIndex(of: "grant_published"),
+            let postGrantGateIndex = authorizationEvents.firstIndex(
+                of: "authorization_postgrant_gate_passed"),
+            let emptyAttemptIndex = authorizationEvents.firstIndex(
+                of: "authorization_empty_value_write_attempted"),
             let emptyWriteIndex = authorizationEvents.firstIndex(
-                of: "authorization_empty_value_written") else {
+                of: "authorization_empty_value_written"),
+            let confirmAttemptIndex = authorizationEvents.firstIndex(
+                of: "authorization_confirm_action_attempted"),
+            let confirmPerformedIndex = authorizationEvents.firstIndex(
+                of: "authorization_confirm_action_performed") else {
             return XCTFail("the authorization trigger audit sequence is incomplete")
         }
         XCTAssertLessThan(fieldReadyIndex, grantIndex)
-        XCTAssertLessThan(grantIndex, emptyWriteIndex)
-        XCTAssertEqual(
-            authorizationEvents.filter { $0 == "authorization_empty_value_written" }.count,
-            1,
-            "the successful empty-value trigger was not audited exactly once")
+        XCTAssertLessThan(grantIndex, postGrantGateIndex)
+        XCTAssertLessThan(postGrantGateIndex, emptyAttemptIndex)
+        XCTAssertLessThan(emptyAttemptIndex, emptyWriteIndex)
+        XCTAssertLessThan(emptyWriteIndex, confirmAttemptIndex)
+        XCTAssertLessThan(confirmAttemptIndex, confirmPerformedIndex)
+        for event in [
+            "authorization_empty_value_write_attempted",
+            "authorization_empty_value_written",
+            "authorization_confirm_action_attempted",
+            "authorization_confirm_action_performed",
+        ] {
+            XCTAssertEqual(
+                authorizationEvents.filter { $0 == event }.count, 1,
+                "\(event) was not audited exactly once")
+        }
         let payload = try? XCTUnwrap(system.lastGrantPayload)
         XCTAssertGreaterThanOrEqual(payload?.issuedAt ?? 0, fieldReadyReleasedAt)
         XCTAssertEqual(

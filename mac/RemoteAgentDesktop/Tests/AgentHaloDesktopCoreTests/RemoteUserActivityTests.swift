@@ -62,7 +62,10 @@ private final class StubLockScreenAuthorization:
         authorizationFieldReady: @Sendable () -> Void,
         releaseRemoteUserActivity: @Sendable () throws -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWriteAttempted: @Sendable () -> Void,
         emptyValueWritten: @Sendable () -> Void,
+        confirmActionAttempted: @Sendable () -> Void,
+        confirmActionPerformed: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool,
         isLocked: @Sendable () throws -> Bool
     ) throws {
@@ -82,7 +85,10 @@ private final class StubLockScreenAuthorization:
         try releaseRemoteUserActivity()
         if mode == .failAfterRelease { throw RemoteActivityTestError.expected }
         try prepareGrant()
+        emptyValueWriteAttempted()
         emptyValueWritten()
+        confirmActionAttempted()
+        confirmActionPerformed()
     }
 }
 
@@ -145,7 +151,9 @@ final class RemoteUserActivityTests: XCTestCase {
             remoteUserActivityPowerAPI: api)
 
         XCTAssertThrowsError(try system.requestUnlockAuthorization(
-            authorizationFieldReady: {}, prepareGrant: {}, emptyValueWritten: {},
+            authorizationFieldReady: {}, prepareGrant: {},
+            emptyValueWriteAttempted: {}, emptyValueWritten: {},
+            confirmActionAttempted: {}, confirmActionPerformed: {},
             completionReceiptObserved: { false }))
         XCTAssertEqual(authorization.requestCount, 0)
         XCTAssertEqual(releaseCount.count, 0)
@@ -189,7 +197,9 @@ final class RemoteUserActivityTests: XCTestCase {
                 XCTAssertFalse(activity.isActive)
                 grantCount.increment()
             },
-            emptyValueWritten: {}, completionReceiptObserved: { false })
+            emptyValueWriteAttempted: {}, emptyValueWritten: {},
+            confirmActionAttempted: {}, confirmActionPerformed: {},
+            completionReceiptObserved: { false })
 
         XCTAssertEqual(fieldReadyCount.count, 1)
         XCTAssertEqual(grantCount.count, 1)
@@ -209,7 +219,9 @@ final class RemoteUserActivityTests: XCTestCase {
         XCTAssertThrowsError(try system.requestUnlockAuthorization(
             authorizationFieldReady: {},
             prepareGrant: { grantCount.increment() },
-            emptyValueWritten: {}, completionReceiptObserved: { false }))
+            emptyValueWriteAttempted: {}, emptyValueWritten: {},
+            confirmActionAttempted: {}, confirmActionPerformed: {},
+            completionReceiptObserved: { false }))
         XCTAssertEqual(grantCount.count, 0)
         XCTAssertEqual(releaseCount.count, 1)
     }
@@ -227,7 +239,9 @@ final class RemoteUserActivityTests: XCTestCase {
         XCTAssertThrowsError(try system.requestUnlockAuthorization(
             authorizationFieldReady: {},
             prepareGrant: { grantCount.increment() },
-            emptyValueWritten: {}, completionReceiptObserved: { false })) {
+            emptyValueWriteAttempted: {}, emptyValueWritten: {},
+            confirmActionAttempted: {}, confirmActionPerformed: {},
+            completionReceiptObserved: { false })) {
             XCTAssertTrue(
                 String(describing: $0).contains(
                     "not released before grant preparation"))
@@ -248,7 +262,9 @@ final class RemoteUserActivityTests: XCTestCase {
 
         XCTAssertThrowsError(try system.requestUnlockAuthorization(
             authorizationFieldReady: {}, prepareGrant: {},
-            emptyValueWritten: {}, completionReceiptObserved: { false })) {
+            emptyValueWriteAttempted: {}, emptyValueWritten: {},
+            confirmActionAttempted: {}, confirmActionPerformed: {},
+            completionReceiptObserved: { false })) {
             let detail = String(describing: $0)
             XCTAssertTrue(detail.contains("authorization failed: expected"))
             XCTAssertTrue(detail.contains("cleanup also failed"))
@@ -274,7 +290,9 @@ final class RemoteUserActivityTests: XCTestCase {
 
             XCTAssertThrowsError(try system.requestUnlockAuthorization(
                 authorizationFieldReady: {}, prepareGrant: {},
-                emptyValueWritten: {}, completionReceiptObserved: { false }))
+                emptyValueWriteAttempted: {}, emptyValueWritten: {},
+                confirmActionAttempted: {}, confirmActionPerformed: {},
+                completionReceiptObserved: { false }))
             XCTAssertEqual(
                 releaseCount.count, 1,
                 "failure mode \(mode) did not release exactly once")

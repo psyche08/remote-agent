@@ -75,15 +75,20 @@ public protocol LockedUseSystem: AnyObject, Sendable {
     func physicalInputObserved() -> Bool
     /// Begins the real loginwindow authorization transaction. The production
     /// implementation wakes the lock screen, locates its password field through
-    /// Accessibility, and writes one empty value without supplying a credential.
+    /// Accessibility, verifies field-local AXConfirm support, then writes one
+    /// empty value and performs one AXConfirm without supplying a credential.
     /// The Authorization Plug-in is the branch that decides whether this exact
     /// transaction may retract the lock. `prepareGrant` runs exactly once only
-    /// after the exact field is ready, immediately before empty-value
-    /// submission, so lock-screen wake/discovery consumes no grant lifetime.
+    /// after the exact field is ready, immediately before the non-retrying
+    /// submission sequence, so lock-screen wake/discovery consumes no grant
+    /// lifetime.
     func requestUnlockAuthorization(
         authorizationFieldReady: @Sendable () -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWriteAttempted: @Sendable () -> Void,
         emptyValueWritten: @Sendable () -> Void,
+        confirmActionAttempted: @Sendable () -> Void,
+        confirmActionPerformed: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool
     ) throws
     /// Executes a validated action. The result is action-specific (e.g. PNG
@@ -150,7 +155,10 @@ public final class DesktopSystem: LockedUseSystem {
     public func requestUnlockAuthorization(
         authorizationFieldReady: @Sendable () -> Void,
         prepareGrant: @Sendable () throws -> Void,
+        emptyValueWriteAttempted: @Sendable () -> Void,
         emptyValueWritten: @Sendable () -> Void,
+        confirmActionAttempted: @Sendable () -> Void,
+        confirmActionPerformed: @Sendable () -> Void,
         completionReceiptObserved: @Sendable () throws -> Bool
     ) throws {
         // A grant on disk does not itself make loginwindow evaluate the unlock
@@ -172,7 +180,10 @@ public final class DesktopSystem: LockedUseSystem {
                     try activity.requireReleasedBeforeGrant()
                     try prepareGrant()
                 },
+                emptyValueWriteAttempted: emptyValueWriteAttempted,
                 emptyValueWritten: emptyValueWritten,
+                confirmActionAttempted: confirmActionAttempted,
+                confirmActionPerformed: confirmActionPerformed,
                 completionReceiptObserved: completionReceiptObserved,
                 isLocked: { [self] in try isLocked() })
         } catch {
