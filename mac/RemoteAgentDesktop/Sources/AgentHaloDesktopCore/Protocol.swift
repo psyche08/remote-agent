@@ -89,6 +89,78 @@ public struct Response {
     }
 }
 
+/// Helper-owned cross-request state binding one protected AX tree observation
+/// to later mutations in the same authoritative turn. The process pin itself
+/// never crosses the socket. A single operation lock also prevents two client
+/// connections from replacing/using a pin concurrently.
+final class TurnScopedTargetPinStore<Value>: @unchecked Sendable {
+    private struct Key: Hashable {
+        let turnID: String
+        let bundleIdentifier: String
+    }
+
+    private struct Entry {
+        let value: Value
+        let boundAt: Date
+    }
+
+    private let operationLock = NSLock()
+    private let stateLock = NSLock()
+    private var entries: [Key: Entry] = [:]
+    private let maximumEntries = 128
+    private let maximumAge: TimeInterval = 15 * 60
+
+    func withExclusiveOperation<T>(_ body: () throws -> T) rethrows -> T {
+        operationLock.lock()
+        defer { operationLock.unlock() }
+        return try body()
+    }
+
+    func bind(_ value: Value, turnID: String, bundleIdentifier: String) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        pruneLocked(now: Date())
+        let key = Key(turnID: turnID, bundleIdentifier: bundleIdentifier)
+        entries[key] = Entry(value: value, boundAt: Date())
+        if entries.count > maximumEntries,
+           let oldest = entries.min(by: { $0.value.boundAt < $1.value.boundAt })?.key {
+            entries.removeValue(forKey: oldest)
+        }
+    }
+
+    func value(turnID: String, bundleIdentifier: String) -> Value? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        pruneLocked(now: Date())
+        return entries[Key(
+            turnID: turnID, bundleIdentifier: bundleIdentifier)]?.value
+    }
+
+    func release(turnID: String) {
+        stateLock.lock()
+        entries = entries.filter { $0.key.turnID != turnID }
+        stateLock.unlock()
+    }
+
+    func releaseAll() {
+        stateLock.lock()
+        entries.removeAll()
+        stateLock.unlock()
+    }
+
+    var count: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return entries.count
+    }
+
+    private func pruneLocked(now: Date) {
+        entries = entries.filter {
+            now.timeIntervalSince($0.value.boundAt) <= maximumAge
+        }
+    }
+}
+
 /// Routes a request to the desktop and the Locked Use controller.
 ///
 /// The op set is closed for the same reason the action set is: an unknown op is
@@ -96,10 +168,17 @@ public struct Response {
 public struct RequestRouter: @unchecked Sendable {
     private let desktop: DesktopService
     private let controller: LockedUseController?
+    private let accessibilityTargetPolicies: [Accessibility.TargetPolicy]
+    private let accessibilityTargetPins =
+        TurnScopedTargetPinStore<Accessibility.TargetPin>()
 
-    public init(desktop: DesktopService, controller: LockedUseController? = nil) {
+    public init(
+        desktop: DesktopService, controller: LockedUseController? = nil,
+        accessibilityTargetPolicies: [Accessibility.TargetPolicy] = []
+    ) {
         self.desktop = desktop
         self.controller = controller
+        self.accessibilityTargetPolicies = accessibilityTargetPolicies
     }
 
     public func handle(_ request: Request) -> Response {
@@ -128,6 +207,7 @@ public struct RequestRouter: @unchecked Sendable {
             }
             do {
                 try controller.setLockedUseActive(active)
+                if !active { accessibilityTargetPins.releaseAll() }
                 return .ok(["status": controller.status()])
             } catch {
                 return Self.failure(for: error)
@@ -138,6 +218,9 @@ public struct RequestRouter: @unchecked Sendable {
             guard let turnID = request.turnID, !turnID.isEmpty else {
                 return .failure("turn_id is required", code: .badRequest)
             }
+            // A turn id denotes one controller lifecycle. Clear any bounded
+            // residue before admitting a new lifecycle with that identifier.
+            accessibilityTargetPins.release(turnID: turnID)
             do {
                 try controller.openWindow(turnID: turnID)
                 return .ok(windowState(controller))
@@ -150,6 +233,7 @@ public struct RequestRouter: @unchecked Sendable {
             guard let turnID = request.turnID, !turnID.isEmpty else {
                 return .failure("turn_id is required", code: .badRequest)
             }
+            defer { accessibilityTargetPins.release(turnID: turnID) }
             do {
                 try controller.closeWindow(
                     forTurn: turnID, reason: request.reason ?? "turn ended")
@@ -172,6 +256,7 @@ public struct RequestRouter: @unchecked Sendable {
                     "computer-use cleanup is not yet safe for restart; the current helper remains active",
                     code: .failed)
             }
+            accessibilityTargetPins.releaseAll()
             return .ok(["safe_to_restart": true])
 
         case "capture_allowed":
@@ -261,39 +346,102 @@ public struct RequestRouter: @unchecked Sendable {
                 "the helper is not trusted for Accessibility; grant it in System Settings",
                 code: .unsupported)
         }
-        switch request.op {
-        case "ax_read":
-            let nodes = try Accessibility.read(
-                bundleID: request.bundleID, name: request.app)
-            return .ok(["elements": nodes.map(Self.serializedAccessibilityNode)])
-        case "ax_press":
-            guard let path = request.path else {
-                return .failure("path is required", code: .badRequest)
-            }
-            try Accessibility.press(
-                bundleID: request.bundleID, name: request.app, path: path)
-            return .ok()
-        case "ax_setvalue":
-            guard let path = request.path else {
-                return .failure("path is required", code: .badRequest)
-            }
-            guard let value = request.value else {
-                return .failure("value is required", code: .badRequest)
-            }
-            try Accessibility.setValue(
-                bundleID: request.bundleID, name: request.app,
-                path: path, value: value)
-            return .ok()
-        case "ax_focus":
-            guard let path = request.path else {
-                return .failure("path is required", code: .badRequest)
-            }
-            try Accessibility.focus(
-                bundleID: request.bundleID, name: request.app, path: path)
-            return .ok()
-        default:
-            return .failure("unknown Accessibility op", code: .badRequest)
+        let targetPolicy = accessibilityTargetPolicy(for: request)
+        guard let turnID = request.turnID, !turnID.isEmpty else {
+            throw AccessibilityTargetError(
+                message: "a protected Accessibility operation requires a turn id")
         }
+        return try accessibilityTargetPins.withExclusiveOperation {
+            do {
+                switch request.op {
+                case "ax_read":
+                    let observation = try Accessibility.readPinned(
+                        bundleID: request.bundleID, name: request.app,
+                        policy: targetPolicy)
+                    if let targetPolicy {
+                        guard let pin = observation.targetPin else {
+                            throw AccessibilityTargetError(
+                                message: "the protected Accessibility read produced no process pin")
+                        }
+                        accessibilityTargetPins.bind(
+                            pin, turnID: turnID,
+                            bundleIdentifier: targetPolicy.bundleIdentifier)
+                    }
+                    return .ok([
+                        "elements": observation.nodes.map(
+                            Self.serializedAccessibilityNode)
+                    ])
+                case "ax_press":
+                    guard let path = request.path else {
+                        return .failure("path is required", code: .badRequest)
+                    }
+                    try Accessibility.pressPinned(
+                        bundleID: request.bundleID, name: request.app, path: path,
+                        policy: targetPolicy,
+                        targetPin: try requiredTargetPin(
+                            policy: targetPolicy, turnID: turnID))
+                    return .ok()
+                case "ax_setvalue":
+                    guard let path = request.path else {
+                        return .failure("path is required", code: .badRequest)
+                    }
+                    guard let value = request.value else {
+                        return .failure("value is required", code: .badRequest)
+                    }
+                    try Accessibility.setValuePinned(
+                        bundleID: request.bundleID, name: request.app,
+                        path: path, value: value, policy: targetPolicy,
+                        targetPin: try requiredTargetPin(
+                            policy: targetPolicy, turnID: turnID))
+                    return .ok()
+                case "ax_focus":
+                    guard let path = request.path else {
+                        return .failure("path is required", code: .badRequest)
+                    }
+                    try Accessibility.focusPinned(
+                        bundleID: request.bundleID, name: request.app, path: path,
+                        policy: targetPolicy,
+                        targetPin: try requiredTargetPin(
+                            policy: targetPolicy, turnID: turnID))
+                    return .ok()
+                default:
+                    return .failure("unknown Accessibility op", code: .badRequest)
+                }
+            } catch {
+                if error is AccessibilityTargetError {
+                    accessibilityTargetPins.release(turnID: turnID)
+                }
+                throw error
+            }
+        }
+    }
+
+    private func requiredTargetPin(
+        policy: Accessibility.TargetPolicy?, turnID: String
+    ) throws -> Accessibility.TargetPin? {
+        guard let policy else { return nil }
+        guard let pin = accessibilityTargetPins.value(
+            turnID: turnID, bundleIdentifier: policy.bundleIdentifier)
+        else {
+            throw AccessibilityTargetError(
+                message: "a protected Accessibility mutation requires a fresh read in the same turn")
+        }
+        return pin
+    }
+
+    /// A request can select a policy by its exact bundle id, or by the app name
+    /// only when no bundle id was supplied. Expected team/path values never
+    /// come from the socket and therefore cannot be weakened by the caller.
+    func accessibilityTargetPolicy(
+        for request: Request
+    ) -> Accessibility.TargetPolicy? {
+        if let bundleID = request.bundleID, !bundleID.isEmpty {
+            return accessibilityTargetPolicies.first {
+                $0.bundleIdentifier == bundleID
+            }
+        }
+        guard let app = request.app, !app.isEmpty else { return nil }
+        return accessibilityTargetPolicies.first { $0.appName == app }
     }
 
     static func serializedAccessibilityNode(
@@ -343,6 +491,9 @@ public struct RequestRouter: @unchecked Sendable {
             return .failure(error.message, code: .badRequest)
         }
         if let error = error as? AccessibilityIPCError {
+            return .failure(error.message, code: .failed)
+        }
+        if let error = error as? AccessibilityTargetError {
             return .failure(error.message, code: .failed)
         }
         if let error = error as? GrantError {

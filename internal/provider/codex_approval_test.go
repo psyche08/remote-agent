@@ -858,7 +858,11 @@ func TestCodexScopedStateDoesNotLeakFromAnotherThread(t *testing.T) {
 func TestClaudeInstalledDetection(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	missing := NewClaudeCLI("claude", config.ProviderConfig{Command: "/nonexistent/claude-e2e-missing"})
+	missingDesktop := filepath.Join(t.TempDir(), "missing-Claude.app")
+	cliOnlyConfig := func(command string) config.ProviderConfig {
+		return config.ProviderConfig{Command: command, Extra: map[string]any{"desktop_app_path": missingDesktop}}
+	}
+	missing := NewClaudeCLI("claude", cliOnlyConfig("/nonexistent/claude-e2e-missing"))
 	if missing.Installed() {
 		t.Fatal("claude must report not installed for a missing binary")
 	}
@@ -866,7 +870,7 @@ func TestClaudeInstalledDetection(t *testing.T) {
 	// warm before it is used (see writeWarmTestExecutable).
 	bin := writeWarmTestExecutable(t, filepath.Join(t.TempDir(), "claude"),
 		"#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true}'\n", 0o755)
-	present := NewClaudeCLI("claude", config.ProviderConfig{Command: bin})
+	present := NewClaudeCLI("claude", cliOnlyConfig(bin))
 	if !present.Installed() || !present.Status().Installed {
 		t.Fatal("claude must report installed when the binary exists")
 	}
@@ -876,13 +880,13 @@ func TestClaudeInstalledDetection(t *testing.T) {
 	}
 	writeWarmTestExecutable(t, userBin, "#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true}'\n", 0o755)
 	t.Setenv("PATH", t.TempDir())
-	userInstalled := NewClaudeCLI("claude", config.ProviderConfig{Command: "claude"})
+	userInstalled := NewClaudeCLI("claude", cliOnlyConfig("claude"))
 	if got := userInstalled.resolveCommand(); got != userBin {
 		t.Fatalf("bare claude command resolved to %q, want standard user install %q", got, userBin)
 	}
 	loggedOutBin := writeWarmTestExecutable(t, filepath.Join(t.TempDir(), "claude"),
 		"#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":false}'\n", 0o755)
-	loggedOut := NewClaudeCLI("claude", config.ProviderConfig{Command: loggedOutBin})
+	loggedOut := NewClaudeCLI("claude", cliOnlyConfig(loggedOutBin))
 	if loggedOut.Installed() || loggedOut.Status().Installed {
 		t.Fatal("unauthenticated Claude CLI provider must stay hidden")
 	}

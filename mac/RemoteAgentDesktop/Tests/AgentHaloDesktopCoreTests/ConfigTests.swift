@@ -76,4 +76,47 @@ final class ConfigTests: XCTestCase {
             AgentConfigFile.self, from: Data(#"{"device_id":"mac-1"}"#.utf8))
         XCTAssertNil(file.computerUse)
     }
+
+    func testClaudeAccessibilityIdentityUsesTheProviderDefaults() throws {
+        let file = try JSONDecoder().decode(
+            AgentConfigFile.self, from: Data(#"{"device_id":"mac-1"}"#.utf8))
+        let policy = try XCTUnwrap(file.accessibilityTargetPolicies().first)
+        XCTAssertEqual(policy.appName, "Claude")
+        XCTAssertEqual(policy.bundleIdentifier, "com.anthropic.claudefordesktop")
+        XCTAssertEqual(policy.teamIdentifier, "Q6L2SF6YDW")
+        XCTAssertEqual(policy.appPath, "/Applications/Claude.app")
+    }
+
+    func testClaudeAccessibilityIdentityReadsExactConfiguredValues() throws {
+        let file = try JSONDecoder().decode(
+            AgentConfigFile.self,
+            from: Data(#"""
+                {"providers":{"claude":{
+                  "app_name":"Claude Preview",
+                  "desktop_bundle_id":"dev.example.claude",
+                  "desktop_team_id":"A1B2C3D4E5",
+                  "desktop_app_path":"/Applications/Claude Preview.app"
+                }}}
+                """#.utf8))
+        let policy = try XCTUnwrap(file.accessibilityTargetPolicies().first)
+        XCTAssertEqual(policy.appName, "Claude Preview")
+        XCTAssertEqual(policy.bundleIdentifier, "dev.example.claude")
+        XCTAssertEqual(policy.teamIdentifier, "A1B2C3D4E5")
+        XCTAssertEqual(policy.appPath, "/Applications/Claude Preview.app")
+    }
+
+    func testMalformedClaudeAccessibilityIdentityFailsClosed() throws {
+        let file = try JSONDecoder().decode(
+            AgentConfigFile.self,
+            from: Data(#"""
+                {"providers":{"claude":{
+                  "desktop_bundle_id":"dev.example.claude\" or true",
+                  "desktop_team_id":"not-a-team",
+                  "desktop_app_path":"relative/Claude.app"
+                }}}
+                """#.utf8))
+        XCTAssertThrowsError(try file.accessibilityTargetPolicies()) { error in
+            XCTAssertTrue(error is AccessibilityTargetError)
+        }
+    }
 }

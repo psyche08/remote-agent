@@ -320,10 +320,12 @@ chmod 700 "$STATE_DIR" "$STATE_DIR/sockets" 2>/dev/null || true
 # Installing the helper does not enable anything. Computer use still requires
 # config.json, and Locked Use additionally requires the separately installed
 # authorization plug-in (see docs/computer-use-locked-user.md).
-if [ "$(uname -s)" = "Darwin" ]; then
+if [ "$PLATFORM" = "Darwin" ]; then
   if DESKTOP_HELPER="$("$RUNTIME_BIN" desktop install 2>/dev/null)"; then
     echo "==> installed desktop helper $DESKTOP_HELPER"
-    if [ -x "$REPO_AGENTHALO/mac/launchagent/install.sh" ] && [ "$(id -u)" != "0" ]; then
+    if [ "${AGENTHALO_SKIP_DESKTOP_LAUNCHAGENT:-0}" = "1" ]; then
+      echo "==> NOTE: skipped desktop LaunchAgent registration by explicit request"
+    elif [ -x "$REPO_AGENTHALO/mac/launchagent/install.sh" ] && [ "$(id -u)" != "0" ]; then
       DESKTOP_TARGET="gui/$(id -u)/dev.linsheng.agenthalo.desktop"
       if launchctl print "$DESKTOP_TARGET" >/dev/null 2>&1; then
         # Do not let the installer bootout a live helper: bootout does not

@@ -16,6 +16,51 @@ import (
 
 const computerUseAutomationTurnPrefix = "trusted-ui-"
 
+// installComputerUseReadinessHandler exposes only the helper's capability and
+// safety state. It deliberately drops its audit ring and public verifying key,
+// and the provider may use this snapshot only for status presentation.
+func (s *Server) installComputerUseReadinessHandler(host provider.ComputerUseReadinessHost) {
+	host.SetComputerUseReadinessHandler(func(ctx context.Context) provider.ComputerUseReadiness {
+		status := provider.ComputerUseReadiness{
+			Enabled:          s.cfg.ComputerUse.Enabled,
+			LockedUseEnabled: s.cfg.ComputerUse.LockedUse.Enabled,
+		}
+		if ctx == nil || ctx.Err() != nil {
+			status.Detail = "computer-use readiness check was cancelled"
+			return status
+		}
+		if s.computerUseCtl == nil {
+			status.Detail = "computer use is not configured on this device"
+			return status
+		}
+		raw := s.computerUseCtl.StatusContext(ctx)
+		if value, ok := raw["enabled"].(bool); ok {
+			status.Enabled = value
+		}
+		if value, ok := raw["available"].(bool); ok {
+			status.Available = value
+		}
+		status.Detail = strings.TrimSpace(stringAny(raw["detail"]))
+		lockedUse, _ := raw["locked_use"].(map[string]any)
+		if lockedUse == nil {
+			return status
+		}
+		if value, ok := lockedUse["enabled"].(bool); ok {
+			status.LockedUseEnabled = value
+		}
+		status.LockedUseArmed = truthy(lockedUse["armed"], false)
+		status.LockedUseActive = truthy(lockedUse["active"], false)
+		status.LockedUseSuppressed = truthy(lockedUse["suppressed_until_manual_unlock"], false)
+		status.LockedUseQuarantined = truthy(lockedUse["quarantined"], false)
+		status.RequiresManualRecovery = truthy(lockedUse["requires_manual_recovery"], false)
+		status.Stopping = truthy(lockedUse["stopping"], false)
+		if status.Detail == "" {
+			status.Detail = strings.TrimSpace(stringAny(lockedUse["error"]))
+		}
+		return status
+	})
+}
+
 // installComputerUseAutomationHandler gives a trusted provider adapter one
 // callback-scoped desktop transaction. Unlike model tool hosting, the server
 // creates the operation turn itself and fixes both provider and logical

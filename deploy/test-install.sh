@@ -56,6 +56,7 @@ run_install() {
   AGENTHALO_EXPECTED_TEAM_ID=TESTTEAM \
   CODESIGN_LOG="$codesign_log" \
   AGENTHALO_SKIP_BUILD=1 \
+  AGENTHALO_SKIP_DESKTOP_LAUNCHAGENT=1 \
   AGENTHALO_SKIP_HOOK_INSTALL=1 \
   AGENTHALO_SKIP_HEALTH_CHECK=1 \
     bash "$SCRIPT_DIR/install.sh" device-test --no-log-upload "$@"
@@ -90,6 +91,9 @@ jq -e --arg uds "$state_dir/sockets/backend.sock" --arg state "$state_dir" '
   .providers.claude.desktop_bundle_id == "com.anthropic.claudefordesktop" and
   .providers.claude.desktop_team_id == "Q6L2SF6YDW" and
   .providers.codex.shared_daemon_autostart == true and
+  .providers.catpaw.type == "catpaw" and
+  .providers.catpaw.app_path == "~/Applications/CatPaw.app" and
+  .providers.catpaw.history_db_path == "~/.sankuai/MCopilot/sqliteDB/globalCache.sqlite" and
   .computer_use.enabled == true and
   .computer_use.locked_use.enabled == true and
   .computer_use.debug_http_actions == false and
@@ -149,6 +153,7 @@ AGENTHALO_CODESIGN="$codesign" \
 AGENTHALO_EXPECTED_TEAM_ID=TESTTEAM \
 CODESIGN_LOG="$codesign_log" \
 AGENTHALO_SKIP_BUILD=1 \
+AGENTHALO_SKIP_DESKTOP_LAUNCHAGENT=1 \
 AGENTHALO_SKIP_HOOK_INSTALL=1 \
 AGENTHALO_SKIP_HEALTH_CHECK=1 \
   bash "$SCRIPT_DIR/install.sh" device-test --no-log-upload
@@ -203,6 +208,7 @@ AGENTHALO_CODESIGN="$codesign" \
 AGENTHALO_EXPECTED_TEAM_ID=TESTTEAM \
 CODESIGN_LOG="$codesign_log" \
 AGENTHALO_SKIP_BUILD=1 \
+AGENTHALO_SKIP_DESKTOP_LAUNCHAGENT=1 \
 AGENTHALO_SKIP_HOOK_INSTALL=1 \
   bash "$SCRIPT_DIR/install.sh" device-test --no-log-upload
 failure_rc=$?

@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import Security
 
 /// Distinguishes a bounded AX transport/deadline failure from a semantic
 /// request error. The controller uses this signal to close and relock an open
@@ -7,6 +8,116 @@ import ApplicationServices
 struct AccessibilityIPCError: Error, CustomStringConvertible, Sendable {
     let message: String
     var description: String { message }
+}
+
+/// A live AX target failed the identity boundary configured on this device.
+/// This is separate from a malformed selector: retrying against another
+/// same-bundle process would be an authority change, so callers fail closed.
+struct AccessibilityTargetError: Error, CustomStringConvertible, Sendable {
+    let message: String
+    var description: String { message }
+}
+
+/// Verifies the code object attached to the *running pid*. Verifying only the
+/// app bundle on disk leaves a gap: AX might have selected a different process
+/// with the same bundle identifier, or the selected process might have changed
+/// between discovery and the mutation.
+enum AccessibilityTargetCodeSigning {
+    struct Identity: Equatable, Sendable {
+        let identifier: String
+        let teamIdentifier: String
+        let codePath: String
+    }
+
+    static func permits(
+        policy: Accessibility.TargetPolicy, identity: Identity
+    ) -> Bool {
+        identity.identifier == policy.bundleIdentifier &&
+            identity.teamIdentifier == policy.teamIdentifier &&
+            canonicalPath(identity.codePath) == canonicalPath(policy.appPath)
+    }
+
+    static func verify(
+        processIdentifier: pid_t, policy: Accessibility.TargetPolicy
+    ) throws {
+        guard processIdentifier > 0 else {
+            throw AccessibilityTargetError(message: "the target application pid is invalid")
+        }
+
+        let attributes = [
+            kSecGuestAttributePid as String: NSNumber(value: processIdentifier)
+        ] as CFDictionary
+        var dynamicCode: SecCode?
+        let guestStatus = SecCodeCopyGuestWithAttributes(
+            nil, attributes, SecCSFlags(), &dynamicCode)
+        guard guestStatus == errSecSuccess, let dynamicCode else {
+            throw AccessibilityTargetError(
+                message: "could not inspect the running target signature (status \(guestStatus))")
+        }
+
+        let requirement = try makeRequirement(policy: policy)
+        let validity = SecCodeCheckValidity(
+            dynamicCode, SecCSFlags(rawValue: kSecCSStrictValidate), requirement)
+        guard validity == errSecSuccess else {
+            throw AccessibilityTargetError(
+                message: "the running target code signature does not match configuration")
+        }
+
+        var staticCode: SecStaticCode?
+        guard SecCodeCopyStaticCode(
+            dynamicCode, SecCSFlags(), &staticCode) == errSecSuccess,
+            let staticCode
+        else {
+            throw AccessibilityTargetError(
+                message: "could not resolve the running target code object")
+        }
+
+        var information: CFDictionary?
+        let informationStatus = SecCodeCopySigningInformation(
+            staticCode, SecCSFlags(rawValue: kSecCSSigningInformation), &information)
+        var codeURL: CFURL?
+        let pathStatus = SecCodeCopyPath(staticCode, SecCSFlags(), &codeURL)
+        guard informationStatus == errSecSuccess,
+              pathStatus == errSecSuccess,
+              let values = information as? [String: Any],
+              let identifier = values[kSecCodeInfoIdentifier as String] as? String,
+              let teamIdentifier = values[kSecCodeInfoTeamIdentifier as String] as? String,
+              let codeURL
+        else {
+            throw AccessibilityTargetError(
+                message: "the running target signing identity is unavailable")
+        }
+
+        let identity = Identity(
+            identifier: identifier,
+            teamIdentifier: teamIdentifier,
+            codePath: (codeURL as URL).path)
+        guard permits(policy: policy, identity: identity) else {
+            throw AccessibilityTargetError(
+                message: "the running target bundle, team, or app path does not match configuration")
+        }
+    }
+
+    static func canonicalPath(_ value: String) -> String {
+        URL(fileURLWithPath: value)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL.path
+    }
+
+    private static func makeRequirement(
+        policy: Accessibility.TargetPolicy
+    ) throws -> SecRequirement {
+        let text = "identifier \"\(policy.bundleIdentifier)\" and anchor apple generic " +
+            "and certificate leaf[subject.OU] = \"\(policy.teamIdentifier)\""
+        var requirement: SecRequirement?
+        let status = SecRequirementCreateWithString(
+            text as CFString, SecCSFlags(), &requirement)
+        guard status == errSecSuccess, let requirement else {
+            throw AccessibilityTargetError(
+                message: "could not compile the target signing requirement (status \(status))")
+        }
+        return requirement
+    }
 }
 
 /// Drives applications through the Accessibility element tree.
@@ -22,6 +133,79 @@ public enum Accessibility {
     /// operation also has an end-to-end deadline below the agent's 25s budget.
     static let messagingTimeout: Float = 1.0
     private static let operationTimeout: TimeInterval = 20
+
+    /// Immutable target identity loaded from the helper's own device config.
+    /// The wire request may select one of these policies, but cannot supply or
+    /// weaken the expected signing team or application path.
+    public struct TargetPolicy: Equatable, Sendable {
+        public let appName: String
+        public let bundleIdentifier: String
+        public let teamIdentifier: String
+        public let appPath: String
+
+        public init(
+            appName: String, bundleIdentifier: String,
+            teamIdentifier: String, appPath: String
+        ) throws {
+            let appName = appName.trimmingCharacters(in: .whitespacesAndNewlines)
+            let bundleIdentifier = bundleIdentifier.trimmingCharacters(
+                in: .whitespacesAndNewlines)
+            let teamIdentifier = teamIdentifier.trimmingCharacters(
+                in: .whitespacesAndNewlines)
+            let appPath = appPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            let identityCharacters = CharacterSet(
+                charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-")
+            guard !appName.isEmpty,
+                  !bundleIdentifier.isEmpty,
+                  bundleIdentifier.unicodeScalars.allSatisfy(identityCharacters.contains),
+                  teamIdentifier.count == 10,
+                  teamIdentifier.unicodeScalars.allSatisfy({
+                      CharacterSet.uppercaseLetters.contains($0) ||
+                          CharacterSet.decimalDigits.contains($0)
+                  }),
+                  appPath.hasPrefix("/"),
+                  URL(fileURLWithPath: appPath).pathExtension == "app"
+            else {
+                throw AccessibilityTargetError(
+                    message: "the configured Accessibility target identity is invalid")
+            }
+            self.appName = appName
+            self.bundleIdentifier = bundleIdentifier
+            self.teamIdentifier = teamIdentifier
+            self.appPath = URL(fileURLWithPath: appPath).standardizedFileURL.path
+        }
+    }
+
+    /// Value-only process snapshot used by production selection and pure unit
+    /// tests. AppKit object identity is carried separately for PID-reuse checks.
+    struct RunningApplicationIdentity: Equatable, Sendable {
+        let bundleIdentifier: String?
+        let bundlePath: String?
+        let isTerminated: Bool
+        let processIdentifier: pid_t
+    }
+
+    fileprivate struct LocatedApplication {
+        let application: NSRunningApplication
+        let element: AXUIElement
+        let processIdentifier: pid_t
+        let policy: TargetPolicy?
+    }
+
+    /// A process-generation token retained by the helper between one protected
+    /// `ax_read` and later mutations for the same turn. Keeping the AppKit
+    /// object as well as the PID lets revalidation reject PID reuse.
+    final class TargetPin: @unchecked Sendable {
+        fileprivate let application: NSRunningApplication
+        let processIdentifier: pid_t
+        let policy: TargetPolicy
+
+        fileprivate init(located: LocatedApplication, policy: TargetPolicy) {
+            self.application = located.application
+            self.processIdentifier = located.processIdentifier
+            self.policy = policy
+        }
+    }
 
     static func requireResponsive(_ status: AXError, operation: String) throws {
         if status == .cannotComplete {
@@ -76,26 +260,183 @@ public enum Accessibility {
         public let path: [Int]
     }
 
-    /// The application element for a running app chosen by bundle id or name.
-    private static func appElement(
-        bundleID: String?, name: String?, deadline: Date
-    ) throws -> AXUIElement {
-        let running = NSWorkspace.shared.runningApplications
-        // A bundle identifier is the stable, unambiguous address. When both
-        // fields are present it must win rather than being ORed with a display
-        // name: otherwise a stale name can select a different app before the
-        // requested bundle appears in `runningApplications`.
-        let match = running.first {
-            selectsApplication(
-                candidateBundleID: $0.bundleIdentifier, candidateName: $0.localizedName,
-                requestedBundleID: bundleID, requestedName: name)
+    /// Selects one unique live application whose AppKit identity already
+    /// matches the configured bundle and path. Signing is checked separately
+    /// against the running pid, so neither source is trusted on its own.
+    static func exactTargetApplication<Application>(
+        from applications: [Application], policy: TargetPolicy,
+        identity: (Application) -> RunningApplicationIdentity
+    ) throws -> Application {
+        let expectedPath = AccessibilityTargetCodeSigning.canonicalPath(policy.appPath)
+        let matches = applications.filter {
+            let value = identity($0)
+            guard !value.isTerminated,
+                  value.processIdentifier > 0,
+                  value.bundleIdentifier == policy.bundleIdentifier,
+                  let bundlePath = value.bundlePath
+            else { return false }
+            return AccessibilityTargetCodeSigning.canonicalPath(bundlePath) == expectedPath
         }
-        guard let match else {
-            throw ActionError("no running application matches the given app")
+        guard !matches.isEmpty else {
+            throw AccessibilityTargetError(
+                message: "the exact live target application was not found")
+        }
+        guard matches.count == 1 else {
+            throw AccessibilityTargetError(
+                message: "multiple exact live target applications were found")
+        }
+        return matches[0]
+    }
+
+    /// Re-resolves the unique exact target immediately before a sensitive AX
+    /// step. PID equality alone is insufficient because a restarted process
+    /// can reuse a PID, hence the independent AppKit-instance predicate.
+    @discardableResult
+    static func requireSameExactTarget<Application>(
+        _ expected: Application, from applications: [Application],
+        policy: TargetPolicy,
+        identity: (Application) -> RunningApplicationIdentity,
+        isSameInstance: (Application, Application) -> Bool,
+        verifySignature: (pid_t, TargetPolicy) throws -> Void
+    ) throws -> Application {
+        let current = try exactTargetApplication(
+            from: applications, policy: policy, identity: identity)
+        let expectedIdentity = identity(expected)
+        let currentIdentity = identity(current)
+        guard isSameInstance(expected, current),
+              expectedIdentity.processIdentifier > 0,
+              currentIdentity.processIdentifier == expectedIdentity.processIdentifier else {
+            throw AccessibilityTargetError(
+                message: "the target application process instance changed during the Accessibility operation")
+        }
+        try verifySignature(currentIdentity.processIdentifier, policy)
+        return current
+    }
+
+    private static func runningApplicationIdentity(
+        _ application: NSRunningApplication
+    ) -> RunningApplicationIdentity {
+        RunningApplicationIdentity(
+            bundleIdentifier: application.bundleIdentifier,
+            bundlePath: application.bundleURL?.path,
+            isTerminated: application.isTerminated,
+            processIdentifier: application.processIdentifier)
+    }
+
+    /// The application element for a single pinned running process. A protected
+    /// target is selected by exact bundle/path and then verified as a dynamic
+    /// code object for that pid before any AX attribute is touched.
+    private static func appElement(
+        bundleID: String?, name: String?, policy: TargetPolicy?,
+        targetPin: TargetPin? = nil, deadline: Date
+    ) throws -> LocatedApplication {
+        let running = NSWorkspace.shared.runningApplications
+        let match: NSRunningApplication
+        if let policy {
+            if let bundleID, !bundleID.isEmpty,
+               bundleID != policy.bundleIdentifier {
+                throw AccessibilityTargetError(
+                    message: "the requested bundle does not match the configured target")
+            }
+            if let targetPin {
+                guard targetPin.policy == policy else {
+                    throw AccessibilityTargetError(
+                        message: "the pinned target identity does not match this request")
+                }
+                match = try requireSameExactTarget(
+                    targetPin.application, from: running, policy: policy,
+                    identity: runningApplicationIdentity,
+                    isSameInstance: { $0.isEqual($1) },
+                    verifySignature: AccessibilityTargetCodeSigning.verify)
+                guard match.processIdentifier == targetPin.processIdentifier else {
+                    throw AccessibilityTargetError(
+                        message: "the pinned target pid changed between Accessibility requests")
+                }
+            } else {
+                match = try exactTargetApplication(
+                    from: running, policy: policy,
+                    identity: runningApplicationIdentity)
+                try AccessibilityTargetCodeSigning.verify(
+                    processIdentifier: match.processIdentifier, policy: policy)
+            }
+        } else {
+            // A bundle identifier is the stable, unambiguous address. When both
+            // fields are present it must win rather than being ORed with a
+            // display name: otherwise a stale name can select a different app.
+            guard let selected = running.first(where: {
+                selectsApplication(
+                    candidateBundleID: $0.bundleIdentifier,
+                    candidateName: $0.localizedName,
+                    requestedBundleID: bundleID, requestedName: name)
+            }) else {
+                throw ActionError("no running application matches the given app")
+            }
+            match = selected
+        }
+
+        guard !match.isTerminated, match.processIdentifier > 0 else {
+            throw AccessibilityTargetError(
+                message: "the selected target application is no longer running")
         }
         let app = AXUIElementCreateApplication(match.processIdentifier)
         try configureTimeout(app, deadline: deadline)
-        return app
+        try requireProcessIdentifier(
+            app, expected: match.processIdentifier, deadline: deadline)
+        return LocatedApplication(
+            application: match, element: app,
+            processIdentifier: match.processIdentifier, policy: policy)
+    }
+
+    /// Re-checks both the selected AppKit process instance and its AX root. For
+    /// protected targets this also re-evaluates the dynamic code signature.
+    private static func revalidate(
+        _ located: LocatedApplication, deadline: Date
+    ) throws {
+        try before(deadline, operation: "verifying the Accessibility target")
+        let running = NSWorkspace.shared.runningApplications
+        if let policy = located.policy {
+            _ = try requireSameExactTarget(
+                located.application, from: running, policy: policy,
+                identity: runningApplicationIdentity,
+                isSameInstance: { $0.isEqual($1) },
+                verifySignature: AccessibilityTargetCodeSigning.verify)
+        } else {
+            guard let current = running.first(where: {
+                $0.isEqual(located.application) &&
+                    !$0.isTerminated &&
+                    $0.processIdentifier == located.processIdentifier
+            }) else {
+                throw AccessibilityTargetError(
+                    message: "the target application process instance changed during the Accessibility operation")
+            }
+            guard selectsApplication(
+                candidateBundleID: current.bundleIdentifier,
+                candidateName: current.localizedName,
+                requestedBundleID: located.application.bundleIdentifier,
+                requestedName: located.application.localizedName)
+            else {
+                throw AccessibilityTargetError(
+                    message: "the target application identity changed during the Accessibility operation")
+            }
+        }
+        try requireProcessIdentifier(
+            located.element, expected: located.processIdentifier, deadline: deadline)
+    }
+
+    private static func requireProcessIdentifier(
+        _ element: AXUIElement, expected: pid_t, deadline: Date
+    ) throws {
+        try configureTimeout(element, deadline: deadline)
+        try before(deadline, operation: "verifying Accessibility element ownership")
+        var processIdentifier: pid_t = 0
+        let status = AXUIElementGetPid(element, &processIdentifier)
+        try requireResponsive(status, operation: "verifying Accessibility element ownership")
+        guard status == .success,
+              expected > 0,
+              processIdentifier == expected else {
+            throw AccessibilityTargetError(
+                message: "the Accessibility element is not owned by the pinned target process")
+        }
     }
 
     /// Pure routing seam: a supplied bundle id has strict priority over a
@@ -257,13 +598,17 @@ public enum Accessibility {
     /// otherwise the tree is just the native menu bar. Setting it is how a
     /// screen reader (and the reference implementation) makes an Electron app's
     /// buttons and fields addressable. Harmless if the app is not Electron.
-    private static func enableWebContent(_ app: AXUIElement, deadline: Date) throws {
+    private static func enableWebContent(
+        _ app: AXUIElement, expectedProcessIdentifier: pid_t, deadline: Date
+    ) throws {
         // Set on the application and on every window: Chromium exposes a
         // window's web content only when the flag is set on that window
         // element, not merely on the application. Both attributes are the
         // documented switches a screen reader uses; harmless on non-Electron
         // apps, which simply ignore them.
         for attribute in ["AXManualAccessibility", "AXEnhancedUserInterface"] {
+            try requireProcessIdentifier(
+                app, expected: expectedProcessIdentifier, deadline: deadline)
             try configureTimeout(app, deadline: deadline)
             try before(deadline, operation: "enabling Accessibility web content")
             let status = AXUIElementSetAttributeValue(
@@ -278,6 +623,8 @@ public enum Accessibility {
         if windowsStatus == .success,
            let windows = windowsRef as? [AXUIElement] {
             for window in windows {
+                try requireProcessIdentifier(
+                    window, expected: expectedProcessIdentifier, deadline: deadline)
                 try configureTimeout(window, deadline: deadline)
                 try before(deadline, operation: "enabling window web content")
                 let status = AXUIElementSetAttributeValue(
@@ -287,12 +634,29 @@ public enum Accessibility {
         }
     }
 
-    public static func read(bundleID: String?, name: String?) throws -> [Node] {
+    public static func read(
+        bundleID: String?, name: String?, policy: TargetPolicy? = nil
+    ) throws -> [Node] {
+        try readPinned(bundleID: bundleID, name: name, policy: policy).nodes
+    }
+
+    /// Returns the process-generation pin created by the same fully verified
+    /// read that produced these index paths. The router retains it under the
+    /// authoritative turn id; it is never serialized to or accepted from the
+    /// socket peer.
+    static func readPinned(
+        bundleID: String?, name: String?, policy: TargetPolicy? = nil
+    ) throws -> (nodes: [Node], targetPin: TargetPin?) {
         let deadline = Date().addingTimeInterval(operationTimeout)
-        let app = try appElement(bundleID: bundleID, name: name, deadline: deadline)
-        try enableWebContent(app, deadline: deadline)
+        let located = try appElement(
+            bundleID: bundleID, name: name, policy: policy, deadline: deadline)
+        try revalidate(located, deadline: deadline)
+        try enableWebContent(
+            located.element, expectedProcessIdentifier: located.processIdentifier,
+            deadline: deadline)
+        try revalidate(located, deadline: deadline)
         var out: [Node] = []
-        var stack: [(AXUIElement, [Int])] = [(app, [])]
+        var stack: [(AXUIElement, [Int])] = [(located.element, [])]
         var visited = 0
         // AX trees contain cycles: a child can reference an ancestor (an
         // Electron app's window points back at the application element), so an
@@ -306,6 +670,8 @@ public enum Accessibility {
             stack.removeFirst()
             if seen.contains(where: { CFEqual($0, element) }) { continue }
             seen.append(element)
+            try requireProcessIdentifier(
+                element, expected: located.processIdentifier, deadline: deadline)
             visited += 1
             if visited > maxNodes { break }
             if path.count > maxDepth { continue }
@@ -367,7 +733,10 @@ public enum Accessibility {
                 stack.append((child, path + [index]))
             }
         }
-        return out
+        try revalidate(located, deadline: deadline)
+        return (
+            out,
+            policy.map { TargetPin(located: located, policy: $0) })
     }
 
     /// Resolves an element by the index path `read` reports, so an action names
@@ -382,10 +751,13 @@ public enum Accessibility {
     }
 
     private static func resolve(
-        _ app: AXUIElement, path: [Int], deadline: Date
+        _ app: AXUIElement, path: [Int], expectedProcessIdentifier: pid_t,
+        deadline: Date
     ) throws -> AXUIElement {
         try validatePath(path)
         var element = app
+        try requireProcessIdentifier(
+            element, expected: expectedProcessIdentifier, deadline: deadline)
         for index in path {
             let kids = try children(element, deadline: deadline)
             // A negative index satisfies `index < kids.count` and then traps in
@@ -395,19 +767,48 @@ public enum Accessibility {
                 throw ActionError("the element path no longer resolves; re-read the tree")
             }
             element = kids[index]
+            try requireProcessIdentifier(
+                element, expected: expectedProcessIdentifier, deadline: deadline)
         }
         return element
     }
 
     /// Performs an element's press action — the click without a pointer.
-    public static func press(bundleID: String?, name: String?, path: [Int]) throws {
+    public static func press(
+        bundleID: String?, name: String?, path: [Int],
+        policy: TargetPolicy? = nil
+    ) throws {
+        try pressPinned(
+            bundleID: bundleID, name: name, path: path,
+            policy: policy, targetPin: nil)
+    }
+
+    static func pressPinned(
+        bundleID: String?, name: String?, path: [Int],
+        policy: TargetPolicy? = nil, targetPin: TargetPin? = nil
+    ) throws {
+        if policy != nil, targetPin == nil {
+            throw AccessibilityTargetError(
+                message: "a protected Accessibility mutation requires a fresh turn-bound read")
+        }
         let deadline = Date().addingTimeInterval(operationTimeout)
-        let app = try appElement(bundleID: bundleID, name: name, deadline: deadline)
-        try enableWebContent(app, deadline: deadline)
-        let element = try resolve(app, path: path, deadline: deadline)
+        let located = try appElement(
+            bundleID: bundleID, name: name, policy: policy,
+            targetPin: targetPin, deadline: deadline)
+        try revalidate(located, deadline: deadline)
+        try enableWebContent(
+            located.element, expectedProcessIdentifier: located.processIdentifier,
+            deadline: deadline)
+        try revalidate(located, deadline: deadline)
+        let element = try resolve(
+            located.element, path: path,
+            expectedProcessIdentifier: located.processIdentifier, deadline: deadline)
         guard try actionNames(element, deadline: deadline).contains(kAXPressAction) else {
             throw ActionError("the element does not accept a press")
         }
+        try revalidate(located, deadline: deadline)
+        try requireProcessIdentifier(
+            element, expected: located.processIdentifier, deadline: deadline)
         try configureTimeout(element, deadline: deadline)
         try before(deadline, operation: "pressing an Accessibility element")
         let status = AXUIElementPerformAction(element, kAXPressAction as CFString)
@@ -415,16 +816,39 @@ public enum Accessibility {
         guard status == .success else {
             throw ActionError("press failed (AX status \(status.rawValue))")
         }
+        try revalidate(located, deadline: deadline)
     }
 
     /// Sets an element's value — the text field fill without keystrokes.
     public static func setValue(
-        bundleID: String?, name: String?, path: [Int], value: String
+        bundleID: String?, name: String?, path: [Int], value: String,
+        policy: TargetPolicy? = nil
     ) throws {
+        try setValuePinned(
+            bundleID: bundleID, name: name, path: path, value: value,
+            policy: policy, targetPin: nil)
+    }
+
+    static func setValuePinned(
+        bundleID: String?, name: String?, path: [Int], value: String,
+        policy: TargetPolicy? = nil, targetPin: TargetPin? = nil
+    ) throws {
+        if policy != nil, targetPin == nil {
+            throw AccessibilityTargetError(
+                message: "a protected Accessibility mutation requires a fresh turn-bound read")
+        }
         let deadline = Date().addingTimeInterval(operationTimeout)
-        let app = try appElement(bundleID: bundleID, name: name, deadline: deadline)
-        try enableWebContent(app, deadline: deadline)
-        let element = try resolve(app, path: path, deadline: deadline)
+        let located = try appElement(
+            bundleID: bundleID, name: name, policy: policy,
+            targetPin: targetPin, deadline: deadline)
+        try revalidate(located, deadline: deadline)
+        try enableWebContent(
+            located.element, expectedProcessIdentifier: located.processIdentifier,
+            deadline: deadline)
+        try revalidate(located, deadline: deadline)
+        let element = try resolve(
+            located.element, path: path,
+            expectedProcessIdentifier: located.processIdentifier, deadline: deadline)
         var settable: DarwinBoolean = false
         try configureTimeout(element, deadline: deadline)
         try before(deadline, operation: "checking an Accessibility value")
@@ -435,6 +859,9 @@ public enum Accessibility {
               settable.boolValue else {
             throw ActionError("the element's value is not settable")
         }
+        try revalidate(located, deadline: deadline)
+        try requireProcessIdentifier(
+            element, expected: located.processIdentifier, deadline: deadline)
         try before(deadline, operation: "setting an Accessibility value")
         let status = AXUIElementSetAttributeValue(
             element, kAXValueAttribute as CFString, value as CFTypeRef)
@@ -442,16 +869,41 @@ public enum Accessibility {
         guard status == .success else {
             throw ActionError("setting the value failed (AX status \(status.rawValue))")
         }
+        try revalidate(located, deadline: deadline)
     }
 
     /// Focuses one exact element resolved from the latest tree. This is kept as
     /// an internal desktop primitive rather than a model-facing tool: focus is a
     /// prerequisite for a bounded provider adapter, not authority to send keys.
-    public static func focus(bundleID: String?, name: String?, path: [Int]) throws {
+    public static func focus(
+        bundleID: String?, name: String?, path: [Int],
+        policy: TargetPolicy? = nil
+    ) throws {
+        try focusPinned(
+            bundleID: bundleID, name: name, path: path,
+            policy: policy, targetPin: nil)
+    }
+
+    static func focusPinned(
+        bundleID: String?, name: String?, path: [Int],
+        policy: TargetPolicy? = nil, targetPin: TargetPin? = nil
+    ) throws {
+        if policy != nil, targetPin == nil {
+            throw AccessibilityTargetError(
+                message: "a protected Accessibility mutation requires a fresh turn-bound read")
+        }
         let deadline = Date().addingTimeInterval(operationTimeout)
-        let app = try appElement(bundleID: bundleID, name: name, deadline: deadline)
-        try enableWebContent(app, deadline: deadline)
-        let element = try resolve(app, path: path, deadline: deadline)
+        let located = try appElement(
+            bundleID: bundleID, name: name, policy: policy,
+            targetPin: targetPin, deadline: deadline)
+        try revalidate(located, deadline: deadline)
+        try enableWebContent(
+            located.element, expectedProcessIdentifier: located.processIdentifier,
+            deadline: deadline)
+        try revalidate(located, deadline: deadline)
+        let element = try resolve(
+            located.element, path: path,
+            expectedProcessIdentifier: located.processIdentifier, deadline: deadline)
         var settable: DarwinBoolean = false
         try configureTimeout(element, deadline: deadline)
         try before(deadline, operation: "checking Accessibility focus")
@@ -461,6 +913,9 @@ public enum Accessibility {
         guard query == .success, settable.boolValue else {
             throw ActionError("the element cannot be focused")
         }
+        try revalidate(located, deadline: deadline)
+        try requireProcessIdentifier(
+            element, expected: located.processIdentifier, deadline: deadline)
         try before(deadline, operation: "focusing an Accessibility element")
         let status = AXUIElementSetAttributeValue(
             element, kAXFocusedAttribute as CFString, kCFBooleanTrue)
@@ -471,5 +926,6 @@ public enum Accessibility {
         guard try boolean(element, kAXFocusedAttribute, deadline: deadline) == true else {
             throw ActionError("the element did not confirm focus")
         }
+        try revalidate(located, deadline: deadline)
     }
 }

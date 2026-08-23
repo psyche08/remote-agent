@@ -134,7 +134,8 @@ func TestDeviceUIShowsConfiguredProvidersAndMarksUnavailableOnes(t *testing.T) {
 	}
 	ui := string(body)
 	for _, want := range []string{
-		`fetch(browseUrl("/providers?include_uninstalled=1")`,
+		`fetch(deviceBase(providerDevice) + "providers?include_uninstalled=1"`,
+		`PROVIDERS_META_BY_DEVICE.set(providerDevice, allProviders)`,
 		`function providerReady(meta)`,
 		`meta.status.installed !== false`,
 		`!ready ? " unavailable" : ""`,
@@ -441,10 +442,10 @@ func TestDeviceUIDirectlySendsNativeCodexSessionWithoutAttach(t *testing.T) {
 	}
 	ui := string(body)
 	for _, want := range []string{
-		`const directCodex = !!(!sid && tab && tab.resumeId && providerIsCodex(tab.provider));`,
+		`const directCodex = !!(!sid && tab && tab.resumeId && providerIsCodex(tab.provider, tab.device));`,
 		`if (directCodex) sid = tab.resumeId;`,
 		`if (directCodex && tab && r.session_id)`,
-		`const canSend = hasSession || directCodex;`,
+		`const canSend = promptSend && (hasSession || directCodex);`,
 		`可直接发送到此 Codex thread`,
 	} {
 		if !strings.Contains(ui, want) {
@@ -465,7 +466,8 @@ func TestClaudePromptRequiresDurableBrowserOperationIdentity(t *testing.T) {
 	}
 	ui := string(body)
 	for _, want := range []string{
-		`function providerIsClaude(provider)`,
+		`function providerIsClaude(provider, deviceID)`,
+		`providerIsClaude(providerID, tab && tab.device)`,
 		`function persistedPromptOperationMatches(tab, operationID, digest)`,
 		`!tab || !STATE_READY || !STATE_PERSISTENT`,
 		`window.localStorage.getItem(stateKey("agenthalo_tabs"))`,
@@ -481,6 +483,42 @@ func TestClaudePromptRequiresDurableBrowserOperationIdentity(t *testing.T) {
 	}
 	if strings.Contains(ui, `if (tab && tab.promptOperationID && tab.promptOperationDigest === digest) return tab.promptOperationID;`) {
 		t.Fatal("Claude prompt identity may be reused from memory without durable read-back")
+	}
+}
+
+func TestDeviceUICanonicalizesProviderAliasesFromTypedMetadata(t *testing.T) {
+	body, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ui := string(body)
+	for _, want := range []string{
+		"const PROVIDER_ALIAS_FALLBACK = Object.freeze({",
+		"p.aliases.some(alias => alias && alias.provider_id === raw)",
+		"function canonicalProviderID(id, deviceID)",
+		"provider: canonicalProviderID(s && s.provider, s && s.device)",
+		"canonicalProviderID(spec && spec.provider, spec && spec.device)",
+		"const PROVIDERS_META_BY_DEVICE = new Map();",
+		"PROVIDERS_META_BY_DEVICE.set(providerDevice, allProviders);",
+		"providerMeta(providerID, deviceID)",
+		"function providerFamily(provider, deviceID)",
+		"return providerFamily(provider, deviceID) === \"codex\";",
+		"providerIsCodex(LIVE.provider, LIVE.device)",
+		"if (!meta) return false;",
+		"roleHTML(\"Unknown source\", m.ts || m.timestamp, false)",
+	} {
+		if !strings.Contains(ui, want) {
+			t.Fatalf("device UI missing canonical provider/role handling %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"String(provider || \"\").startsWith(\"codex\")",
+		"String(provider || \"\").startsWith(\"claude\")",
+		"? meta.actions : ACTIVE_ACTIONS",
+	} {
+		if strings.Contains(ui, forbidden) {
+			t.Fatalf("device UI still guesses provider ownership %q", forbidden)
+		}
 	}
 }
 

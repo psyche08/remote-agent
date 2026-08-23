@@ -21,6 +21,7 @@ import (
 	"github.com/psyche08/remote-agent/internal/config"
 	"github.com/psyche08/remote-agent/internal/provider"
 	"github.com/psyche08/remote-agent/internal/state"
+	"github.com/psyche08/remote-agent/internal/turnstatehook"
 )
 
 type blockingNativeProvider struct {
@@ -167,6 +168,129 @@ func (f *createCodexProvider) OpenOrCreateSession(string, provider.StartOptions)
 	return f.nativeID, nil
 }
 
+type failingClaudeCreateProvider struct {
+	fakePushProvider
+	createCalls int
+}
+
+func (f *failingClaudeCreateProvider) SupportsAction(provider.ActionID) bool { return true }
+func (f *failingClaudeCreateProvider) OpenOrCreateSession(string, provider.StartOptions) (string, error) {
+	f.createCalls++
+	return "", errors.New("Claude mutable route became unavailable")
+}
+
+type deniedActionProvider struct {
+	fakePushProvider
+	mutations int
+}
+
+func (f *deniedActionProvider) SupportsAction(provider.ActionID) bool { return false }
+func (f *deniedActionProvider) OpenOrCreateSession(string, provider.StartOptions) (string, error) {
+	f.mutations++
+	return "unexpected", nil
+}
+func (f *deniedActionProvider) SendPrompt(string, string) provider.SendResult {
+	f.mutations++
+	return provider.SendResult{OK: true}
+}
+func (f *deniedActionProvider) CloseSession(string) map[string]any {
+	f.mutations++
+	return map[string]any{"ok": true}
+}
+func (f *deniedActionProvider) RelayApproval(string, string) map[string]any {
+	f.mutations++
+	return map[string]any{"ok": true}
+}
+
+func TestExplicitReadOnlyActionPolicyIsEnforcedServerSide(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	if err := st.SaveSessions([]state.Record{{
+		"session_id": "logical-read-only", "provider_id": "catpaw",
+		"native_session_id": "native-read-only", "transcript_id": "native-read-only",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"catpaw": {}}}
+	config.ApplyDefaults(cfg)
+	p := &deniedActionProvider{fakePushProvider: fakePushProvider{
+		id: "catpaw",
+		native: []map[string]any{{
+			"native_session_id": "native-read-only",
+			"cli_session_id":    "native-read-only",
+		}},
+	}}
+	target := &resumeCodexProvider{directCodexProvider: directCodexProvider{
+		fakePushProvider: fakePushProvider{id: "codex"},
+	}}
+	srv := NewServer(cfg, provider.Registry{"catpaw": p, "codex": target}, st)
+
+	requests := []struct {
+		path string
+		body string
+	}{
+		{"/sessions", "{\"provider_id\":\"catpaw\",\"title\":\"blocked\"}"},
+		{"/send_prompt", "{\"provider_id\":\"catpaw\",\"session_id\":\"logical-read-only\",\"prompt\":\"blocked\"}"},
+		{"/close_session", "{\"provider_id\":\"catpaw\",\"session_id\":\"logical-read-only\"}"},
+		{"/push/approve", "{\"provider_id\":\"catpaw\",\"session_id\":\"logical-read-only\",\"decision\":\"allow\"}"},
+		{"/resume_native_session", "{\"provider_id\":\"catpaw\",\"native_session_id\":\"native-read-only\"}"},
+		{"/resume_native_session", "{\"provider_id\":\"catpaw\",\"target_provider_id\":\"codex\",\"native_session_id\":\"native-read-only\"}"},
+		{"/rewind_user_message", "{\"provider_id\":\"catpaw\",\"session_id\":\"logical-read-only\",\"turn_id\":\"turn-1\",\"prompt\":\"blocked\"}"},
+		{"/interrupt", "{\"provider_id\":\"catpaw\",\"session_id\":\"logical-read-only\"}"},
+		{"/keys", "{\"provider_id\":\"catpaw\",\"session_id\":\"logical-read-only\",\"keys\":[\"ENTER\"]}"},
+		{"/set_model", "{\"provider_id\":\"catpaw\",\"session_id\":\"logical-read-only\",\"model\":\"blocked\"}"},
+		{"/steer", "{\"provider_id\":\"catpaw\",\"session_id\":\"logical-read-only\",\"prompt\":\"blocked\"}"},
+		{"/approval", "{\"provider_id\":\"catpaw\",\"session_id\":\"logical-read-only\",\"decision\":\"allow\"}"},
+		{"/question_answer", "{\"provider_id\":\"catpaw\",\"session_id\":\"logical-read-only\",\"request_id\":\"request-1\",\"answers\":{\"question\":\"blocked\"}}"},
+	}
+	for _, tc := range requests {
+		rr := httptest.NewRecorder()
+		srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body)))
+		if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "provider action is disabled") {
+			t.Fatalf("%s status=%d body=%s", tc.path, rr.Code, rr.Body.String())
+		}
+	}
+	var uploadBody bytes.Buffer
+	writer := multipart.NewWriter(&uploadBody)
+	if err := writer.WriteField("provider_id", "catpaw"); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteField("session_id", "logical-read-only"); err != nil {
+		t.Fatal(err)
+	}
+	part, err := writer.CreateFormFile("file", "blocked.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write([]byte("blocked")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	uploadRequest := httptest.NewRequest(http.MethodPost, "/upload", &uploadBody)
+	uploadRequest.Header.Set("Content-Type", writer.FormDataContentType())
+	uploadResponse := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(uploadResponse, uploadRequest)
+	if uploadResponse.Code != http.StatusConflict ||
+		!strings.Contains(uploadResponse.Body.String(), "provider action is disabled") {
+		t.Fatalf("upload status=%d body=%s", uploadResponse.Code, uploadResponse.Body.String())
+	}
+	if p.mutations != 0 {
+		t.Fatalf("read-only provider received %d mutations", p.mutations)
+	}
+	if target.resumeID != "" {
+		t.Fatalf("read-only source created a cross-provider owner for %q", target.resumeID)
+	}
+	sessions, err := st.Sessions()
+	if err != nil || len(sessions) != 1 || recordString(sessions[0], "session_id") != "logical-read-only" {
+		t.Fatalf("blocked actions changed sessions: %#v err=%v", sessions, err)
+	}
+	tasks, err := st.Tasks()
+	if err != nil || len(tasks) != 0 {
+		t.Fatalf("blocked send created tasks: %#v err=%v", tasks, err)
+	}
+}
+
 type resumeCodexProvider struct {
 	directCodexProvider
 	resumeSession string
@@ -212,6 +336,83 @@ type claudeRouteProvider struct {
 	sendResult     *provider.SendResult
 	panicSend      bool
 	startOptions   map[string]provider.StartOptions
+}
+
+type failClosedPendingClaudeProvider struct {
+	fakePushProvider
+	mu                  sync.Mutex
+	transcriptID        string
+	owners              map[string]string
+	lookupIDs           []string
+	transcriptBindCalls int
+	routeBindCalls      int
+	commitBindCalls     int
+}
+
+func (f *failClosedPendingClaudeProvider) ID() string { return "claude" }
+
+func (f *failClosedPendingClaudeProvider) BindTranscript(sessionID string, transcriptID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.transcriptBindCalls++
+	if f.owners == nil {
+		f.owners = map[string]string{}
+	}
+	f.owners[sessionID] = transcriptID
+}
+
+func (f *failClosedPendingClaudeProvider) BindClaudeControlRoute(
+	sessionID string, transcriptID string, route string, _ string,
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.routeBindCalls++
+	if f.owners == nil {
+		f.owners = map[string]string{}
+	}
+	f.owners[sessionID] = route + "\x00" + transcriptID
+}
+
+func (f *failClosedPendingClaudeProvider) BindClaudeControlCommitted(string, bool) {
+	f.mu.Lock()
+	f.commitBindCalls++
+	f.mu.Unlock()
+}
+
+func (f *failClosedPendingClaudeProvider) ApprovalRequest(sessionID string) map[string]any {
+	f.mu.Lock()
+	f.lookupIDs = append(f.lookupIDs, sessionID)
+	owner := f.owners[sessionID]
+	transcriptID := f.transcriptID
+	f.mu.Unlock()
+	if owner != "" {
+		return map[string]any{
+			"type": "command", "request_id": "request-fail-closed",
+			"source": "claude_desktop_observer", "actionable": true,
+		}
+	}
+	if sessionID == transcriptID {
+		// Model stale provider state trying to promote transcript evidence into
+		// a control callback. The API must clamp this after persistence fails.
+		return map[string]any{
+			"type": "native_ui", "request_id": "request-fail-closed",
+			"source": "claude_transcript", "actionable": true,
+		}
+	}
+	return nil
+}
+
+func (f *failClosedPendingClaudeProvider) snapshot() (
+	map[string]string, []string, int, int, int,
+) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	owners := make(map[string]string, len(f.owners))
+	for sessionID, owner := range f.owners {
+		owners[sessionID] = owner
+	}
+	return owners, append([]string(nil), f.lookupIDs...),
+		f.transcriptBindCalls, f.routeBindCalls, f.commitBindCalls
 }
 
 type closeTrackingAutomationHost struct {
@@ -419,6 +620,15 @@ type attachmentSendProvider struct {
 
 type usagePreviewProvider struct{ fakePushProvider }
 
+type artifactPreviewProvider struct{ fakePushProvider }
+
+func (f *artifactPreviewProvider) SessionMessages(string) ([]map[string]any, error) {
+	return []map[string]any{
+		{"id": "message-1", "role": "user", "kind": "text", "text": "synthetic question", "ts": "2026-08-23T12:00:00Z"},
+		{"id": "message-2", "role": "assistant", "kind": "text", "text": "synthetic answer", "ts": "2026-08-23T12:00:01Z"},
+	}, nil
+}
+
 func (f *usagePreviewProvider) SessionMessages(string) ([]map[string]any, error) {
 	return []map[string]any{{
 		"role": "assistant", "kind": "turn_usage", "usage": map[string]any{
@@ -469,6 +679,112 @@ func TestSessionPreviewAddsAPIEstimatedCosts(t *testing.T) {
 	srv.Handler().ServeHTTP(rr, req)
 	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "platform.claude.com") {
 		t.Fatalf("pricing status=%d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSessionPreviewWritesProviderScopedArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	st := state.New(filepath.Join(dir, "data"))
+	if err := st.SaveSessions([]state.Record{{
+		"session_id": "logical-1", "provider_id": "catpaw",
+		"native_session_id": "native-1", "transcript_id": "native-1", "source": "catpaw_sqlite_legacy",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"catpaw": {}}}
+	config.ApplyDefaults(cfg)
+	p := &artifactPreviewProvider{fakePushProvider{id: "catpaw"}}
+	srv := NewServer(cfg, provider.Registry{"catpaw": p}, st)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/session_preview?provider_id=catpaw&session_id=logical-1", nil)
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	identity := state.SessionArtifactIdentity{
+		DeviceID: "device-a", ProviderID: "catpaw", LogicalSessionID: "logical-1",
+	}
+	binding, err := st.ReadSessionArtifactBinding(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if binding.NativeSessionID != "native-1" || binding.TranscriptID != "native-1" ||
+		binding.Source != "catpaw_sqlite_legacy" || binding.TranscriptSHA256 == "" {
+		t.Fatalf("binding=%#v", binding)
+	}
+	markdown, err := st.ReadSessionArtifactTranscript(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(markdown), "synthetic question") || !strings.Contains(string(markdown), "synthetic answer") {
+		t.Fatalf("transcript=%s", markdown)
+	}
+}
+
+func TestChatGPTAliasUsesCanonicalCodexAPIAndArtifactScope(t *testing.T) {
+	dir := t.TempDir()
+	st := state.New(filepath.Join(dir, "data"))
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"codex": {}}}
+	config.ApplyDefaults(cfg)
+	p := &artifactPreviewProvider{fakePushProvider{id: "codex"}}
+	srv := NewServer(cfg, provider.Registry{"codex": p}, st)
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/provider/select",
+		strings.NewReader("{\"provider_id\":\"chatgpt\"}")))
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "\"active_provider\":\"codex\"") {
+		t.Fatalf("provider select status=%d body=%s", rr.Code, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet,
+		"/session_preview?provider_id=chatgpt&session_id=alias-thread", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("preview status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var preview map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &preview); err != nil {
+		t.Fatal(err)
+	}
+	if preview["provider_id"] != "codex" {
+		t.Fatalf("preview provider=%#v", preview["provider_id"])
+	}
+	canonicalIdentity := state.SessionArtifactIdentity{
+		DeviceID: "device-a", ProviderID: "codex", LogicalSessionID: "alias-thread",
+	}
+	if _, err := st.ReadSessionArtifactBinding(canonicalIdentity); err != nil {
+		t.Fatalf("canonical artifact missing: %v", err)
+	}
+	aliasPaths, err := st.SessionArtifactPaths(state.SessionArtifactIdentity{
+		DeviceID: "device-a", ProviderID: "chatgpt", LogicalSessionID: "alias-thread",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(aliasPaths.Binding); !os.IsNotExist(err) {
+		t.Fatalf("alias artifact owner exists: %s err=%v", aliasPaths.Binding, err)
+	}
+
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet,
+		"/native_sessions?provider_id=chatgpt", nil))
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "\"provider_id\":\"codex\"") {
+		t.Fatalf("native sessions status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	srv.nativeMu.Lock()
+	_, hasAliasCache := srv.nativeCache["chatgpt"]
+	_, hasCanonicalCache := srv.nativeCache["codex"]
+	srv.nativeMu.Unlock()
+	if hasAliasCache || !hasCanonicalCache {
+		t.Fatalf("native cache keys alias=%v canonical=%v", hasAliasCache, hasCanonicalCache)
+	}
+	if _, exists := srv.registry["chatgpt"]; exists {
+		t.Fatal("registry contains a second ChatGPT owner")
+	}
+	sessions, err := st.Sessions()
+	if err != nil || len(sessions) != 0 {
+		t.Fatalf("alias preview created stored owners: %#v err=%v", sessions, err)
 	}
 }
 
@@ -1689,11 +2005,15 @@ func TestCreateAndCloseSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	claudeCommand := filepath.Join(dir, "claude-test")
+	if err := os.WriteFile(claudeCommand, []byte("#!/bin/sh\nprintf '%s\\n' '{\"loggedIn\":true}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	cfg := &config.Config{
 		DeviceID:        "device-a",
 		DefaultProvider: "claude",
 		Providers: map[string]config.ProviderConfig{
-			"claude": {AppName: "Claude Code CLI", Command: "claude", Cwd: work},
+			"claude": {AppName: "Claude Code CLI", Command: claudeCommand, Cwd: work},
 		},
 	}
 	config.ApplyDefaults(cfg)
@@ -1727,6 +2047,36 @@ func TestCreateAndCloseSession(t *testing.T) {
 	}
 	if len(records) != 0 {
 		t.Fatalf("session not removed: %#v", records)
+	}
+}
+
+func TestClaudeCreateReadinessRaceDoesNotPersistGhostSession(t *testing.T) {
+	st := state.New(filepath.Join(t.TempDir(), "data"))
+	cfg := &config.Config{
+		DeviceID: "device-a", DefaultProvider: "claude",
+		Providers: map[string]config.ProviderConfig{"claude": {}},
+	}
+	config.ApplyDefaults(cfg)
+	p := &failingClaudeCreateProvider{fakePushProvider: fakePushProvider{id: "claude"}}
+	srv := NewServer(cfg, provider.Registry{"claude": p}, st)
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/sessions", strings.NewReader(
+		`{"provider_id":"claude","title":"must not become a ghost"}`,
+	))
+	srv.Handler().ServeHTTP(rr, req)
+	if rr.Code != http.StatusConflict || !strings.Contains(rr.Body.String(), "mutable route became unavailable") {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if p.createCalls != 1 {
+		t.Fatalf("OpenOrCreateSession calls=%d, want 1", p.createCalls)
+	}
+	records, err := st.Sessions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("failed Claude create persisted ghost session: %#v", records)
 	}
 }
 
@@ -2081,6 +2431,174 @@ func TestClaudeCommitmentHydrationNormalizesLegacyAndKnownOwners(t *testing.T) {
 				t.Fatalf("route bindings=%#v want=%q", bindings, tc.wantRoute)
 			}
 		})
+	}
+}
+
+func TestPendingApprovalsHydratesClaudeDesktopRouteAfterRestart(t *testing.T) {
+	const transcriptID = "11111111-2222-4333-8444-555555555555"
+	tests := []struct {
+		name      string
+		toolName  string
+		eventName string
+		toolInput map[string]any
+		wantType  string
+	}{
+		{
+			name: "tool permission", toolName: "Bash", eventName: "PermissionRequest",
+			toolInput: map[string]any{"command": "pwd"}, wantType: "command",
+		},
+		{
+			name: "AskUserQuestion", toolName: "AskUserQuestion", eventName: "PreToolUse",
+			toolInput: map[string]any{"questions": []any{map[string]any{
+				"question": "Continue?", "header": "Choice", "multiSelect": false,
+				"options": []any{map[string]any{"label": "Yes", "description": "Continue the task"}},
+			}}},
+			wantType: "question",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			root, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			projectsDir := filepath.Join(root, "projects")
+			projectDir := filepath.Join(projectsDir, "project")
+			if err := os.MkdirAll(projectDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			transcriptPath := filepath.Join(projectDir, transcriptID+".jsonl")
+			toolUseID := "tool-restart-1"
+			line, err := json.Marshal(map[string]any{
+				"type": "assistant", "message": map[string]any{"content": []any{map[string]any{
+					"type": "tool_use", "id": toolUseID, "name": tc.toolName, "input": tc.toolInput,
+				}}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(transcriptPath, append(line, '\n'), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			interactionDir := filepath.Join(root, "interactions")
+			payload, err := json.Marshal(map[string]any{
+				"session_id": transcriptID, "transcript_path": transcriptPath,
+				"cwd": projectDir, "hook_event_name": tc.eventName,
+				"tool_name": tc.toolName, "tool_input": tc.toolInput, "tool_use_id": toolUseID,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := turnstatehook.ObserveInteraction(bytes.NewReader(payload), interactionDir); err != nil {
+				t.Fatal(err)
+			}
+
+			claude := provider.NewClaude("claude", config.ProviderConfig{Extra: map[string]any{
+				"claude_projects_dir": projectsDir, "interaction_dir": interactionDir,
+				"desktop_app_path": filepath.Join(root, "missing-Claude.app"),
+			}})
+			st := state.New(filepath.Join(root, "state"))
+			cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+			config.ApplyDefaults(cfg)
+			srv := NewServer(cfg, provider.Registry{"claude": claude}, st)
+			if err := st.UpsertSession(state.Record{
+				"provider_id": "claude", "session_id": "logical-restart-1",
+				"native_session_id": transcriptID, "transcript_id": transcriptID,
+				"claude_control_route": "desktop_computer_use", claudeControlCommittedKey: true,
+				"state": "waiting_approval", "updated_at": time.Now().UTC().Format(time.RFC3339Nano),
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, httptest.NewRequest(
+				http.MethodGet, "/pending_approvals?provider_id=claude", nil,
+			))
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			var body struct {
+				Approvals []map[string]any `json:"approvals"`
+			}
+			if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			if len(body.Approvals) != 1 {
+				t.Fatalf("approvals=%#v", body.Approvals)
+			}
+			row := body.Approvals[0]
+			if row["provider_id"] != "claude" || row["session_id"] != "logical-restart-1" ||
+				row["request_id"] != toolUseID || row["source"] != "claude_desktop_observer" ||
+				row["actionable"] != true || row["type"] != tc.wantType {
+				t.Fatalf("Desktop observer request was not restored exactly: %#v", row)
+			}
+		})
+	}
+}
+
+func TestPendingApprovalsHydrationPersistenceFailureIsTranscriptOnly(t *testing.T) {
+	const (
+		logicalID    = "logical-fail-closed-1"
+		transcriptID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	)
+	dataDir := filepath.Join(t.TempDir(), "state")
+	st := state.New(dataDir)
+	if err := st.UpsertSession(state.Record{
+		"provider_id": "claude", "session_id": logicalID,
+		"native_session_id": transcriptID, "transcript_id": transcriptID,
+		"claude_control_route": "desktop_computer_use",
+		"state":                "waiting_approval", "updated_at": time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Force only the atomic sessions write to fail. Reads remain available, so
+	// hydration reaches the durability barrier after normalizing the legacy
+	// missing commitment field.
+	if err := os.Mkdir(filepath.Join(dataDir, "sessions.json.tmp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	fp := &failClosedPendingClaudeProvider{
+		fakePushProvider: fakePushProvider{id: "claude"},
+		transcriptID:     transcriptID, owners: map[string]string{},
+	}
+	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
+	config.ApplyDefaults(cfg)
+	srv := NewServer(cfg, provider.Registry{"claude": fp}, st)
+
+	if err := srv.hydrateControlSession(fp, "claude", logicalID); !errors.Is(err, errControlSessionHydrationPersistence) {
+		t.Fatalf("hydration error=%v, want persistence barrier", err)
+	}
+	owners, lookups, transcriptBinds, routeBinds, commitBinds := fp.snapshot()
+	if len(owners) != 0 || transcriptBinds != 0 || routeBinds != 0 || commitBinds != 0 {
+		t.Fatalf("failed hydration changed provider owner memory: owners=%#v lookups=%#v transcript=%d route=%d commit=%d",
+			owners, lookups, transcriptBinds, routeBinds, commitBinds)
+	}
+
+	rows := srv.pendingApprovalEntries("claude")
+	if len(rows) != 1 {
+		t.Fatalf("pending rows=%#v", rows)
+	}
+	row := rows[0]
+	if row["session_id"] != logicalID || row["transcript_id"] != transcriptID ||
+		row["request_id"] != "request-fail-closed" || row["source"] != "claude_transcript" ||
+		truthy(row["actionable"], true) || row["interaction_state"] != "waiting_input" {
+		t.Fatalf("failed hydration did not remain transcript-only/non-actionable: %#v", row)
+	}
+	owners, lookups, transcriptBinds, routeBinds, commitBinds = fp.snapshot()
+	if len(owners) != 0 || transcriptBinds != 0 || routeBinds != 0 || commitBinds != 0 {
+		t.Fatalf("pending inbox bypassed persistence with an owner bind: owners=%#v transcript=%d route=%d commit=%d",
+			owners, transcriptBinds, routeBinds, commitBinds)
+	}
+	if !reflect.DeepEqual(lookups, []string{transcriptID}) {
+		t.Fatalf("failed hydration lookups=%#v, want only native transcript", lookups)
+	}
+	records, err := st.Sessions()
+	if err != nil || len(records) != 1 {
+		t.Fatalf("stored records=%#v err=%v", records, err)
+	}
+	if _, normalized := records[0][claudeControlCommittedKey]; normalized {
+		t.Fatalf("failed persistence appeared durable: %#v", records[0])
 	}
 }
 
@@ -3580,6 +4098,11 @@ func TestProvidersHideUninstalled(t *testing.T) {
 	row := rows[0].(map[string]any)
 	if actions, ok := row["actions"].([]any); !ok || len(actions) == 0 {
 		t.Fatalf("typed provider actions missing: %#v", row)
+	}
+	for _, key := range []string{"family", "adapter_kind", "runtime_namespace", "surface", "aliases", "routes"} {
+		if _, ok := row[key]; !ok {
+			t.Fatalf("typed provider profile field %q missing: %#v", key, row)
+		}
 	}
 	body = fetch("/providers?include_uninstalled=1")
 	if rows := body["providers"].([]any); len(rows) != 2 {

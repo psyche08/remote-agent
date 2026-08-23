@@ -75,6 +75,32 @@ type ComputerUseAutomationHost interface {
 	SetComputerUseAutomationHandler(ComputerUseAutomationHandler)
 }
 
+// ComputerUseReadiness is a read-only snapshot from the signed desktop
+// helper. It is status metadata only: providers must still pass every fresh
+// helper gate inside the actual operation, and must never treat this snapshot
+// as authority to unlock or mutate an application.
+type ComputerUseReadiness struct {
+	Enabled                bool
+	Available              bool
+	LockedUseEnabled       bool
+	LockedUseArmed         bool
+	LockedUseActive        bool
+	LockedUseSuppressed    bool
+	LockedUseQuarantined   bool
+	RequiresManualRecovery bool
+	Stopping               bool
+	Detail                 string
+}
+
+type ComputerUseReadinessHandler func(context.Context) ComputerUseReadiness
+
+// ComputerUseReadinessHost lets the API server inject the helper's
+// authoritative runtime status without coupling a provider to the helper
+// transport. The handler grants no Computer Use authority.
+type ComputerUseReadinessHost interface {
+	SetComputerUseReadinessHandler(ComputerUseReadinessHandler)
+}
+
 // ClaudeControlRouteCommitHandler is the synchronous durability barrier before
 // Claude Desktop or CLI performs its first external side effect. The server
 // fixes provider identity, accepts only an exact stored logical session, and
@@ -254,11 +280,17 @@ type Registry map[string]Provider
 func BuildRegistry(cfg *config.Config) Registry {
 	reg := Registry{}
 	for id, pc := range cfg.Providers {
-		if id == "claude" || id == "claude_cli" || id == "claude_desktop" {
+		// Product surfaces and compatibility ids are aliases of one canonical
+		// owner. Never let config register a second mutable provider for them.
+		if id == "claude" || CanonicalProviderID(id) != id {
 			continue
 		}
 		if id == "codex" {
 			reg[id] = NewCodex(id, pc)
+			continue
+		}
+		if id == "catpaw" {
+			reg[id] = NewCatPaw(id, pc)
 			continue
 		}
 		if pc.Type == "pty" {
@@ -270,11 +302,12 @@ func BuildRegistry(cfg *config.Config) Registry {
 	}
 	// Claude Desktop and standalone CLI transcripts share the same Claude
 	// session id. Expose one provider so discovery, stored records, streaming,
-	// approvals, questions, and interrupts cannot split across owners. The
-	// Desktop database contributes metadata only; control is stream-json CLI.
-	pc, ok := cfg.Providers["claude_cli"]
+	// approvals, questions, and interrupts cannot split across owners. Desktop
+	// Computer Use is primary; structured stream-json CLI is only the explicit
+	// fresh-session, pre-mutation fallback.
+	pc, ok := cfg.Providers["claude"]
 	if !ok {
-		pc, ok = cfg.Providers["claude"]
+		pc, ok = cfg.Providers["claude_cli"]
 	}
 	if !ok {
 		pc = config.ProviderConfig{Command: "claude", Cwd: "~/Developer"}
@@ -295,7 +328,7 @@ func (r Registry) IDs() []string {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool {
-		order := map[string]int{"codex": 0, "claude": 1}
+		order := map[string]int{"codex": 0, "claude": 1, "deepseek": 2, "catpaw": 3}
 		oi, okI := order[ids[i]]
 		oj, okJ := order[ids[j]]
 		if okI && okJ && oi != oj {

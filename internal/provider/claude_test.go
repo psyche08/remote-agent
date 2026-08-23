@@ -268,6 +268,10 @@ func buildWarmClaudeStreamFixture() (string, error) {
 	claudeStreamFixtureDir = dir
 	path := filepath.Join(dir, "fake-claude-stream")
 	script := `#!/bin/sh
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '{"loggedIn":true}\n'
+  exit 0
+fi
 if [ -n "$CLAUDE_STREAM_ARGS_FILE" ]; then
   if [ "$CLAUDE_STREAM_ARGS_APPEND" = "1" ]; then
     printf '%s\n' launch "$@" >> "$CLAUDE_STREAM_ARGS_FILE"

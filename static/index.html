@@ -747,6 +747,7 @@
     const SESSION_REFRESH_TIMEOUT_MS = 5000;
     const SESSION_REFRESH_POLL_MS = 5000;
     let PROVIDERS_META = [];
+    const PROVIDERS_META_BY_DEVICE = new Map();
     let BACKEND_VERSION = null;
     let AGENT_UPDATE_STATE = null;
     // ---- multi-device routing ----
@@ -848,7 +849,8 @@
     const u = (p) => deviceBase(activeDev()) + String(p).replace(/^\//, "");
     const browseUrl = (p) => deviceBase(CUR_DEVICE) + String(p).replace(/^\//, "");
     const tabUrl = (tab, p) => deviceBase(tab && tab.device) + String(p).replace(/^\//, "");
-    function setBrowseProvider(providerId) {
+    function setBrowseProvider(providerId, deviceID = CUR_DEVICE) {
+      providerId = canonicalProviderID(providerId, deviceID);
       if (!providerId) return;
       CUR_PROVIDER = providerId;
       stateSet("agenthalo_provider", providerId);
@@ -1289,20 +1291,24 @@
         // The default API intentionally hides providers that cannot currently
         // start. The device UI still needs the complete configured list so a
         // missing CLI/login is visible instead of looking like lost config.
-        const data = await (await fetch(browseUrl("/providers?include_uninstalled=1"), { headers: headers() })).json();
+        const providerDevice = CUR_DEVICE;
+        const data = await (await fetch(deviceBase(providerDevice) + "providers?include_uninstalled=1", { headers: headers() })).json();
         const sel = $("provider-select"), chips = $("provider-chips");
         sel.innerHTML = ""; chips.innerHTML = ""; let caps = {}, actions = [];
-        const order = { codex: 0, claude: 1 };
+        const order = { codex: 0, claude: 1, deepseek: 2, catpaw: 3 };
         const allProviders = (data.providers || []).slice().sort((a, b) =>
           (order[a.provider_id] ?? 99) - (order[b.provider_id] ?? 99) ||
           String(a.provider_id || "").localeCompare(String(b.provider_id || "")));
+        PROVIDERS_META_BY_DEVICE.set(providerDevice, allProviders);
+        if (providerDevice !== CUR_DEVICE) return;
         PROVIDERS_META = allProviders;
         const providers = visibleProviders(allProviders);
-        let selectedProvider = CUR_PROVIDER || data.active_provider || (providers[0] && providers[0].provider_id) || "";
+        let selectedProvider = canonicalProviderID(
+          CUR_PROVIDER || data.active_provider || (providers[0] && providers[0].provider_id) || "", providerDevice);
         if (!providers.some(p => p.provider_id === selectedProvider)) {
           selectedProvider = providers.some(p => p.provider_id === data.active_provider) ? data.active_provider : ((providers[0] && providers[0].provider_id) || "");
         }
-        if (selectedProvider) setBrowseProvider(selectedProvider);
+        if (selectedProvider) setBrowseProvider(selectedProvider, providerDevice);
         providers.forEach(p => {
           const o = document.createElement("option"); o.value = p.provider_id;
           if (p.provider_id === selectedProvider) {
@@ -1488,6 +1494,7 @@
     function renderSessions() {
       const q = ($("native-filter").value || "").toLowerCase();
       const pid = $("provider-select").value || CUR_PROVIDER;
+      const previewOnly = !providerActionSupported(pid, "prompt.send", "send_prompt", CUR_DEVICE);
       // Merge currently-driven and native rows first, then apply one global
       // activity ordering. A live badge must not pin an older session above a
       // newer inactive session.
@@ -1506,7 +1513,7 @@
       if (!rows.length) { list.innerHTML = '<div class="muted" style="padding:4px 2px">no sessions — “+ New”.</div>'; return; }
       rows.forEach(s => {
         const isLive = s._session_list_live === true;
-        const can = isLive || !!s.cli_session_id, when = sessionWhen(s), dir = (s.cwd || "").replace(/^.*\//, "");
+        const can = isLive || !!(s.cli_session_id || s.transcript_id || s.native_session_id), when = sessionWhen(s), dir = (s.cwd || "").replace(/^.*\//, "");
         const turns = (s.completed_turns != null) ? `<b>${esc(s.completed_turns)}</b> turns · ` : "";
         const it = document.createElement("div"); it.className = "nitem" + (can ? " clickable" : "");
         it.innerHTML = `<div class="t">${esc(s.title)}${s.archived ? ' <span class="muted">· archived</span>' : ""}</div>
@@ -1514,7 +1521,10 @@
         // Click a session to load its conversation (read-only); sending a message
         // activates it lazily (Codex attaches, Claude resumes). No explicit buttons.
         if (isLive) { it.title = "打开正在运行的会话（任意设备可见）"; it.onclick = () => openLive(s); }
-        else if (can) { it.title = `打开会话（发消息时自动${providerIsCodex(pid) ? "接入" : "恢复"}）`; it.onclick = () => previewSession(s); }
+        else if (can) {
+          it.title = previewOnly ? "打开只读会话预览" : `打开会话（发消息时自动${providerIsCodex(pid, CUR_DEVICE) ? "接入" : "恢复"}）`;
+          it.onclick = () => previewSession(s);
+        }
         else { it.title = "no transcript id"; }
         list.appendChild(it);
       });
@@ -1610,12 +1620,29 @@
       sel.value = id || ""; ACTIVE = { id: id || "", title: title || "" };
       $("active-title").textContent = title || id || "No session";
     }
-    function providerMeta(id) {
-      return (PROVIDERS_META || []).find(p => p && p.provider_id === id) || null;
+    const PROVIDER_ALIAS_FALLBACK = Object.freeze({
+      chatgpt: "codex", claude_cli: "claude", claude_desktop: "claude",
+    });
+    function providerMeta(id, deviceID) {
+      const raw = String(id || "");
+      const scoped = deviceID && PROVIDERS_META_BY_DEVICE.get(deviceID);
+      const rows = scoped || ((!deviceID || deviceID === CUR_DEVICE) ? PROVIDERS_META : []) || [];
+      const exact = rows.find(p => p && p.provider_id === raw);
+      if (exact) return exact;
+      const aliased = rows.find(p => p && Array.isArray(p.aliases) &&
+        p.aliases.some(alias => alias && alias.provider_id === raw));
+      if (aliased) return aliased;
+      const fallback = PROVIDER_ALIAS_FALLBACK[raw];
+      return fallback ? (rows.find(p => p && p.provider_id === fallback) || null) : null;
     }
-    function providerLabel(id, meta) {
-      meta = meta || providerMeta(id);
-      return ({ codex: "Codex", claude: "Claude", claude_cli: "Claude" })[id]
+    function canonicalProviderID(id, deviceID) {
+      const raw = String(id || "");
+      const meta = providerMeta(raw, deviceID);
+      return (meta && meta.provider_id) || PROVIDER_ALIAS_FALLBACK[raw] || raw;
+    }
+    function providerLabel(id, meta, deviceID) {
+      meta = meta || providerMeta(id, deviceID);
+      return ({ codex: "Codex / ChatGPT", chatgpt: "Codex / ChatGPT", claude: "Claude", claude_cli: "Claude", catpaw: "CatPaw", deepseek: "DeepSeek" })[id]
         || (meta && meta.status && meta.status.app_name) || id || "";
     }
     function syncNewProviderOptions() {
@@ -2212,6 +2239,7 @@
     }
     function openTab(spec) {
       // spec: {provider, device, tid, sessionId, resumeId, title}
+      spec = Object.assign({}, spec, { provider: canonicalProviderID(spec && spec.provider, spec && spec.device) });
       const key = tabKey(spec);
       const existing = TABS.find(t => t.key === key);
       if (existing) {
@@ -2245,7 +2273,7 @@
     function markTabActivated(tab, rr) {
       if (!tab || !rr || !rr.session_id) return;
       tab.sessionId = rr.session_id;
-      tab.provider = rr.provider_id || tab.provider;
+      tab.provider = canonicalProviderID(rr.provider_id || tab.provider, tab.device);
       tab.cwd = rr.cwd || tab.cwd || "";
       tab.resumeId = null;       // this tab is now a driving session, not a preview awaiting attach
       tab._needsSessionValidation = false;
@@ -2333,9 +2361,13 @@
       let saved = [], activeKey = "";
         try { saved = JSON.parse(stateGet("agenthalo_tabs") || "[]"); activeKey = stateGet("agenthalo_tab_active") || ""; } catch (e) {}
       if (!Array.isArray(saved) || !saved.length) return false;
-      TABS = saved.map(s => Object.assign({ key: tabKey(s), unchanged: 0, hasActivity: false, chat: null,
-        _needsSessionValidation: !!s.sessionId }, s));
-      const act = TABS.find(t => t.key === activeKey) || TABS[0];
+      const activeIndex = saved.findIndex(s => tabKey(s) === activeKey);
+      TABS = saved.map(s => {
+        const normalized = Object.assign({}, s, { provider: canonicalProviderID(s && s.provider, s && s.device) });
+        return Object.assign({ unchanged: 0, hasActivity: false, chat: null,
+          _needsSessionValidation: !!normalized.sessionId }, normalized, { key: tabKey(normalized) });
+      });
+      const act = TABS[activeIndex >= 0 ? activeIndex : 0];
       renderTabs();
       activateTab(act);                 // fetches the active tab's chat; others lazy-load
       return true;
@@ -2487,7 +2519,7 @@
     function canRewindUserMessage(m, tab) {
       if (!m || m.role !== "user" || m.kind !== "text") return false;
       const provider = (tab && tab.provider) || $("provider-select").value || CUR_PROVIDER;
-      if (!providerIsCodex(provider)) return false;
+      if (!providerIsCodex(provider, tab && tab.device)) return false;
       return !!((m.turn_id || m.turnId) && (m.thread_id || m.threadId || (tab && tab.tid)) && (m.text || "").trim());
     }
     function registerRewindTarget(m, tab) {
@@ -2612,7 +2644,14 @@
         }
         chat.appendChild(d); maybeStickToBottom(stick); return;
       }
-      const alabel = providerLabel((tab && tab.provider) || $("provider-select").value || CUR_PROVIDER || "");
+      if (m.role === "unknown") {
+        CST.turn = null;
+        const d = document.createElement("div"); d.className = "msg unknown";
+        d.innerHTML = roleHTML("Unknown source", m.ts || m.timestamp, false);
+        d.appendChild(renderItem(m, tab));
+        chat.appendChild(d); maybeStickToBottom(stick); return;
+      }
+      const alabel = providerLabel((tab && tab.provider) || $("provider-select").value || CUR_PROVIDER || "", null, tab && tab.device);
       if (!CST.turn) { CST.turn = document.createElement("div"); CST.turn.className = "turn";
         CST.turn.innerHTML = roleHTML(alabel, m.ts || m.timestamp, false); chat.appendChild(CST.turn); }
       const el = renderItem(m, tab);
@@ -3477,13 +3516,15 @@
                 title: ls.title, cwd: ls.cwd || "" });
     }
     async function previewSession(s) {
-      const tid = s && s.cli_session_id;
+      const tid = s && (s.cli_session_id || s.transcript_id || s.native_session_id);
       if (!tid) { alert("no transcript id for this session"); return; }
       const prov = $("provider-select").value || CUR_PROVIDER;
       // open (or focus) a tab for this session on the browse device; openTab ->
       // activateTab fetches the conversation. Sending activates it lazily.
       openTab({ provider: prov, device: CUR_DEVICE, tid, sessionId: null, resumeId: tid, title: s.title, cwd: s.cwd || s.worktree || "" });
-      $("send-out").textContent = providerIsCodex(prov) ? "可直接发送到此 Codex thread" : "发消息将恢复此会话";
+      const readOnly = !providerActionSupported(prov, "prompt.send", "send_prompt", CUR_DEVICE);
+      $("send-out").textContent = readOnly ? "已打开只读会话预览" :
+        (providerIsCodex(prov, CUR_DEVICE) ? "可直接发送到此 Codex thread" : "发消息将恢复此会话");
     }
 
     /* ---- send + output ---- */
@@ -3491,10 +3532,14 @@
       bumpActiveTabSeq();
       $("chat").style.display = "none"; $("output-pre").style.display = "";
       $("output-src").style.display = src ? "" : "none"; $("output-src").textContent = src || ""; $("output-pre").textContent = text || ""; $("output").scrollTop = 0; updateJumpBottom(); }
-    function providerIsCodex(provider) { return String(provider || "").startsWith("codex"); }
-    function providerIsClaude(provider) { return String(provider || "").startsWith("claude"); }
-    function activateLabel(tab) { return providerIsCodex(tab && tab.provider) ? "Send" : "恢复"; }
-    function activatingLabel(tab) { return providerIsCodex(tab && tab.provider) ? "发送中…" : "恢复中…"; }
+    function providerFamily(provider, deviceID) {
+      const meta = providerMeta(provider, deviceID);
+      return (meta && meta.family) || canonicalProviderID(provider, deviceID);
+    }
+    function providerIsCodex(provider, deviceID) { return providerFamily(provider, deviceID) === "codex"; }
+    function providerIsClaude(provider, deviceID) { return providerFamily(provider, deviceID) === "claude"; }
+    function activateLabel(tab) { return providerIsCodex(tab && tab.provider, tab && tab.device) ? "Send" : "恢复"; }
+    function activatingLabel(tab) { return providerIsCodex(tab && tab.provider, tab && tab.device) ? "发送中…" : "恢复中…"; }
     function taskFailureText(task) {
       if (!task) return "send failed";
       if (task.error) return task.error;
@@ -3573,16 +3618,20 @@
       if (isActiveTab(tab)) renderUploads();
     }
 
-    function actionSupported(id, capability) {
-      const providerID = (LIVE && LIVE.provider) || $("provider-select").value || CUR_PROVIDER;
-      const meta = providerMeta(providerID);
-      const actions = (meta && Array.isArray(meta.actions)) ? meta.actions : ACTIVE_ACTIONS;
-      const caps = (meta && meta.capabilities) || ACTIVE_CAPS;
+    function providerActionSupported(providerID, id, capability, deviceID) {
+      const meta = providerMeta(providerID, deviceID);
+      if (!meta) return false;
+      const actions = Array.isArray(meta.actions) ? meta.actions : [];
+      const caps = meta.capabilities || {};
       if (actions && actions.length) {
         const action = actions.find(row => row && row.id === id);
         if (action) return action.supported === true;
       }
       return !!(caps && caps[capability]);
+    }
+    function actionSupported(id, capability) {
+      const providerID = (LIVE && LIVE.provider) || $("provider-select").value || CUR_PROVIDER;
+      return providerActionSupported(providerID, id, capability, (LIVE && LIVE.device) || CUR_DEVICE);
     }
     function persistedPromptOperationMatches(tab, operationID, digest) {
       if (!tab || !STATE_READY || !STATE_PERSISTENT || !STATE_SCOPE) return false;
@@ -3599,7 +3648,7 @@
       }
     }
     async function promptOperationFor(tab, providerID, sessionID, text, attachmentIDs) {
-      const durableRequired = providerIsClaude(providerID);
+      const durableRequired = providerIsClaude(providerID, tab && tab.device);
       if (durableRequired && (!tab || !STATE_READY || !STATE_PERSISTENT)) {
         throw new Error("Claude 发送要求可读回的持久化幂等记录；当前浏览器存储不可用，已拒绝发送");
       }
@@ -3651,7 +3700,7 @@
           if (!ok) return false;
           sid = tab.sessionId;
         }
-        const directCodex = !!(!sid && tab && tab.resumeId && providerIsCodex(tab.provider));
+        const directCodex = !!(!sid && tab && tab.resumeId && providerIsCodex(tab.provider, tab.device));
         if (directCodex) sid = tab.resumeId;
         if (!sid && tab && tab.resumeId) {
           const seq = ACTIVE_TAB_SEQ;
@@ -3672,7 +3721,7 @@
           sid = tab.sessionId; prov = tab.provider;
           if (active) {
             await refreshProviders(); if (!isActiveTab(tab, seq)) return false;
-            setBrowseProvider(prov); setActive(sid, rr.title || tab.title); openStream(); renderComposer();
+            setBrowseProvider(prov, tab.device); setActive(sid, rr.title || tab.title); openStream(); renderComposer();
           }
         }
         if (!sid && !tab) sid = $("session-select").value;                 // fallback: the active session
@@ -3703,12 +3752,12 @@
           markTabActivated(tab, r);
           sid = tab.sessionId; prov = tab.provider;
           if (active && isActiveTab(tab, seq)) {
-            setBrowseProvider(prov); setActive(sid, r.title || tab.title);
+            setBrowseProvider(prov, tab.device); setActive(sid, r.title || tab.title);
             openStream(); renderComposer(); refreshProviders();
           }
         }
         if (r.accepted && r.task_id) {
-          const deliveryName = providerIsCodex(prov) ? "Codex Desktop" : "agent";
+          const deliveryName = providerIsCodex(prov, tab && tab.device) ? "Codex Desktop" : "agent";
           const attaching = r.state === "attaching";
           if (tab) { tab._deliveryTaskID = r.task_id; tab._delivering = true; tab._attaching = attaching; if (active) renderComposer(); }
           if (active || !tab) $("send-out").textContent = attaching
@@ -3764,7 +3813,7 @@
         validateTabSession(LIVE);
         return;
       }
-      const directCodex = !!(LIVE && LIVE.resumeId && providerIsCodex(LIVE.provider) && !LIVE._sessionInvalid);
+      const directCodex = !!(LIVE && LIVE.resumeId && providerIsCodex(LIVE.provider, LIVE.device) && !LIVE._sessionInvalid);
       if (!(LIVE && (LIVE.sessionId || directCodex) && !LIVE._sessionInvalid)) { resumeSession(); return; }
       const prompt = $("prompt");
       const text = prompt.value; if (!text.trim() && !((LIVE.attachments || []).length)) return;
@@ -3811,8 +3860,9 @@
     function renderComposer() {
       const validating = !!(LIVE && (LIVE._validatingSession || LIVE._needsSessionValidation));
       const hasSession = !!(LIVE && LIVE.sessionId && !LIVE._sessionInvalid);
-      const directCodex = !!(LIVE && LIVE.resumeId && providerIsCodex(LIVE.provider) && !LIVE._sessionInvalid);
-      const canSend = hasSession || directCodex;
+      const directCodex = !!(LIVE && LIVE.resumeId && providerIsCodex(LIVE.provider, LIVE.device) && !LIVE._sessionInvalid);
+      const promptSend = actionSupported("prompt.send", "send_prompt");
+      const canSend = promptSend && (hasSession || directCodex);
       const resuming = !!(LIVE && LIVE._resuming);
       const delivering = !!(LIVE && LIVE._delivering);
       const running = !!(LIVE && LIVE._running);
@@ -3831,6 +3881,12 @@
         show("send-btn", true); show("queue-btn", false); show("insert-btn", false); show("stop-btn", false);
         if (sb) { sb.textContent = "检查中…"; sb.disabled = true; }
         if (pr) { pr.disabled = true; pr.placeholder = "正在校验会话状态…"; }
+        return;
+      }
+      if (!promptSend) {
+        show("send-btn", true); show("queue-btn", false); show("insert-btn", false); show("stop-btn", false);
+        if (sb) { sb.textContent = "只读"; sb.disabled = true; }
+        if (pr) { pr.disabled = true; pr.placeholder = "该 provider 当前仅支持会话预览"; }
         return;
       }
       if (!canSend) {
@@ -3859,10 +3915,15 @@
     // Activation button: Claude previews resume explicitly; Codex previews
     // focus the composer and let the provider attach lazily on first send.
     async function resumeSession() {
+      if (!actionSupported("prompt.send", "send_prompt")) {
+        $("send-out").textContent = "该 provider 当前仅支持只读会话预览";
+        renderComposer();
+        return;
+      }
       if (LIVE && (LIVE._resuming || LIVE._validatingSession || (LIVE.sessionId && !LIVE._sessionInvalid))) { renderComposer(); return; }
       if (!LIVE || !LIVE.resumeId) { newSession(); return; }   // 初始空态：新建
       const tab = LIVE, seq = ACTIVE_TAB_SEQ;
-      const isCodex = providerIsCodex(LIVE.provider);
+      const isCodex = providerIsCodex(LIVE.provider, LIVE.device);
       if (isCodex) {
         renderComposer();
         const p = $("prompt"); if (p) p.focus();
@@ -3877,7 +3938,7 @@
         if (!rr.ok || !rr.session_id) { $("send-out").textContent = rr.error || "恢复失败，请重试"; renderComposer(); return; }
         markTabActivated(tab, rr);
         await refreshProviders(); if (!isActiveTab(tab, seq)) return;
-        setBrowseProvider(tab.provider);
+        setBrowseProvider(tab.provider, tab.device);
         setActive(tab.sessionId, rr.title || tab.title);
         $("send-out").textContent = "已恢复 — 可以输入了"; renderComposer();
         openStream(); const p = $("prompt"); if (p) p.focus(); refreshStatus();
@@ -4090,7 +4151,7 @@
         var turn = document.createElement("div");
         turn.id = "live-bubble";
         turn.className = "turn";
-        var alabel = providerLabel((tab && tab.provider) || $("provider-select").value || CUR_PROVIDER || "");
+        var alabel = providerLabel((tab && tab.provider) || $("provider-select").value || CUR_PROVIDER || "", null, tab && tab.device);
         var roleTpl = document.createElement("div");
         roleTpl.innerHTML = roleHTML(alabel, tab._liveTs || new Date().toISOString(), true);
         turn.appendChild(roleTpl.firstElementChild);

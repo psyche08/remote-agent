@@ -152,9 +152,11 @@ if selfCheck || checkShield || checkLock {
 
 var controller: LockedUseController?
 var computerUseEnabled = false
+var accessibilityTargetPolicies: [Accessibility.TargetPolicy] = []
 if !configPath.isEmpty {
     do {
         let file = try AgentConfigFile.load(path: configPath)
+        accessibilityTargetPolicies = try file.accessibilityTargetPolicies()
         // Configured production mode always installs a controller, including
         // when the block is absent or disabled. A nil controller is the
         // explicit no-config development mode and routes actions directly;
@@ -177,7 +179,9 @@ if !configPath.isEmpty {
 
 let server = SocketServer(
     configuration: .init(path: socketPath, computerUseEnabled: computerUseEnabled),
-    router: RequestRouter(desktop: desktop, controller: controller))
+    router: RequestRouter(
+        desktop: desktop, controller: controller,
+        accessibilityTargetPolicies: accessibilityTargetPolicies))
 do {
     try server.start()
 } catch {

@@ -36,6 +36,7 @@ layer:
 |--------|-----------|-------------------------|---------------------|
 | **Claude** | `claude` | drives the exact Claude Desktop session through short in-process Computer Use / Locked Use transactions; a managed `stream-json` CLI is a pre-mutation fallback for a brand-new session only | side-effect-free observer hooks + merged Desktop/CLI transcript metadata; CLI NDJSON only on the sticky fallback route |
 | **Codex Desktop/app-server** | `codex` | maps each logical session to a Codex thread and binds mutable control to the official shared app-server daemon; Desktop owner/follower IPC is an explicit compatibility route | merged app-server/local discovery, app-server notifications, and rollout preview tailing |
+| **CatPaw Desktop (phase one)** | `catpaw` | read-only: every typed action and server mutation is disabled | schema-detected immutable SQLite discovery and preview; full previews create AgentHalo-owned per-session Markdown |
 | **Generic terminal fallback** | configured `"type": "pty"` providers | starts one fixed executable + args in one PTY per logical session; no shell expansion | bounded, terminal-control-sanitized memory + WebSocket deltas |
 
 > **Account isolation is solved at the device layer.** One Mac ≈ one Claude
@@ -50,6 +51,12 @@ Use transactions. A managed CLI `stream-json` child is only a preselected
 `stream_json_cli` fallback when capability preflight for a brand-new session fails
 before any UI mutation. The legacy `claude_cli` and `claude_desktop` ids resolve
 to `claude`; they are not separate owners or retry routes.
+
+ChatGPT is an alias surface of the canonical `codex` owner and therefore shares
+its app-server thread namespace instead of registering a second provider. CatPaw
+is currently a read-only provider: it can discover and preview supported local
+history schemas, but cannot send prompts, answer questions, approve requests, or
+perform Computer Use / Locked Use mutations.
 
 All provider paths are intended for real coding work: Claude keeps Desktop as the
 primary owner and observes durable hook/transcript state without unlocking it;
@@ -84,11 +91,13 @@ agenthalo/
 
 ## Architecture: provider / adapter
 
-The production agent is the Go binary `bin/agenthalo`. Its registry exposes
-canonical `claude` and `codex` providers. Claude binds each logical session to a
-sticky Desktop-Computer-Use or CLI-fallback route and merges Desktop/CLI
+The production agent is the Go binary `bin/agenthalo`. Its registry always
+exposes canonical `claude` and `codex` providers and can register configured
+read-only `catpaw` and generic PTY providers. Claude binds each logical session
+to a sticky Desktop-Computer-Use or CLI-fallback route and merges Desktop/CLI
 discovery. Codex binds each logical session to either an app-server or
-Desktop-IPC delivery route.
+Desktop-IPC delivery route. Product aliases such as `chatgpt` resolve at the API
+boundary and never create a second mutable owner.
 
 The complete current model — provider contract, logical/native identity,
 discovery/runtime merge, delivery ownership, streaming and approvals — is in
@@ -139,6 +148,23 @@ available.
   Desktop identity. Only a brand-new session whose capability preflight fails
   at that point may be bound once to `stream_json_cli`; that choice remains
   sticky for the session.
+* **Installation and mutable readiness are separate truths.** A correctly
+  signed Claude Desktop installation remains visible for transcript discovery
+  when the desktop helper is unavailable. `/providers` reports
+  `desktop_app_verified`, `computer_use`, and `locked_use` independently;
+  Locked Use becomes ready only when the helper is enabled, available, armed,
+  active, unsuppressed, not stopping, and outside quarantine/manual recovery.
+  These status snapshots never authorize an operation; live helper gates still
+  run inside every transaction. If neither Computer Use nor authenticated CLI
+  is ready, Desktop history stays visible but `IsRunning`, mutable capabilities,
+  and every typed action are false; direct create/resume requests fail without
+  leaving a logical or native owner.
+* **The running target is verified, not only the bundle on disk.** The helper
+  selects the exact configured Claude app path, verifies the code object for
+  the actual AX PID against bundle id + Team id, pins that process for the
+  operation, and rechecks process/AX ownership before each sensitive write or
+  press. A same-bundle process at another path or a PID/process replacement
+  fails closed and tears down the Locked Use window.
 * **Desktop input is a short transaction, not a permanently unlocked UI.** Each
   prompt, `AskUserQuestion` answer, or Claude tool permission decision opens one
   bounded in-process Computer Use transaction, targets the exact configured
@@ -165,6 +191,9 @@ available.
   transaction. `allow` means the smallest one-time/“Allow Once” Claude tool
   permission; if Desktop offers only “Always” or session-wide authorization,
   AgentHalo refuses it. It never approves on the model's behalf.
+  The pending inbox rehydrates the session's durable Claude route after a
+  service restart before deciding whether an observer request is actionable;
+  hydration failure leaves only the non-actionable transcript representation.
 * **“Approval” is not operating-system authentication.** This route never
   enters or stores a macOS password, approves TCC, completes Touch ID, changes
   account/login state, or answers SSO/MFA. Those remain manual-only. `deny` is

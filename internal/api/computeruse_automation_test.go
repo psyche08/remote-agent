@@ -16,13 +16,20 @@ import (
 
 type fakeComputerUseAutomationHost struct {
 	fakePushProvider
-	handler provider.ComputerUseAutomationHandler
+	handler   provider.ComputerUseAutomationHandler
+	readiness provider.ComputerUseReadinessHandler
 }
 
 func (f *fakeComputerUseAutomationHost) SetComputerUseAutomationHandler(
 	handler provider.ComputerUseAutomationHandler,
 ) {
 	f.handler = handler
+}
+
+func (f *fakeComputerUseAutomationHost) SetComputerUseReadinessHandler(
+	handler provider.ComputerUseReadinessHandler,
+) {
+	f.readiness = handler
 }
 
 func newComputerUseAutomationServer(
@@ -47,7 +54,36 @@ func newComputerUseAutomationServer(
 	if host.handler == nil {
 		t.Fatal("NewServer did not install the trusted computer-use automation handler")
 	}
+	if host.readiness == nil {
+		t.Fatal("NewServer did not install the read-only computer-use readiness handler")
+	}
 	return srv, host
+}
+
+func TestComputerUseReadinessComesFromHelperSafetyState(t *testing.T) {
+	helper := startFakeHelper(t, func(req map[string]any) map[string]any {
+		if req["op"] != "status" {
+			return refuse("bad_request", "unexpected operation")
+		}
+		return map[string]any{"ok": true, "status": map[string]any{
+			"enabled": true, "available": true,
+			"audit": []any{map[string]any{"private": "must not escape"}},
+			"locked_use": map[string]any{
+				"enabled": true, "armed": true, "active": true,
+				"suppressed_until_manual_unlock": true,
+				"quarantined":                    true, "requires_manual_recovery": true,
+				"stopping": true, "error": "safe public detail",
+				"public_key": "must not escape",
+			},
+		}}
+	})
+	_, host := newComputerUseAutomationServer(t, helper.path)
+	got := host.readiness(context.Background())
+	if !got.Enabled || !got.Available || !got.LockedUseEnabled || !got.LockedUseArmed ||
+		!got.LockedUseActive || !got.LockedUseSuppressed || !got.LockedUseQuarantined ||
+		!got.RequiresManualRecovery || !got.Stopping || got.Detail != "safe public detail" {
+		t.Fatalf("unexpected helper readiness projection: %#v", got)
+	}
 }
 
 func storeComputerUseAutomationSession(t *testing.T, srv *Server) {

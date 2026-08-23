@@ -84,13 +84,12 @@ func (c *Claude) transcriptIDForDesktopRoute(sessionID string) string {
 	return transcriptID
 }
 
-func (c *Claude) claudeDesktopReady(ctx context.Context) bool {
+func (c *Claude) claudeDesktopAppVerified(ctx context.Context) bool {
 	runtime := claudeComputerUseRuntimeFor(c)
 	runtime.mu.Lock()
-	handler := runtime.handler
 	verify := runtime.deps.verifyApp
 	runtime.mu.Unlock()
-	if handler == nil || verify == nil {
+	if verify == nil {
 		return false
 	}
 	key := claudeDesktopReadinessKey{
@@ -205,6 +204,7 @@ type claudeComputerUseDependencies struct {
 type claudeComputerUseRuntime struct {
 	mu           sync.Mutex
 	handler      ComputerUseAutomationHandler
+	readiness    ComputerUseReadinessHandler
 	commitRoute  ClaudeControlRouteCommitHandler
 	deps         claudeComputerUseDependencies
 	routes       map[string]claudeComputerUseRouteBinding
@@ -321,6 +321,28 @@ func (c *Claude) SetComputerUseAutomationHandler(handler ComputerUseAutomationHa
 	runtime.handler = handler
 	runtime.mu.Unlock()
 	c.invalidateClaudeDesktopReadiness()
+}
+
+// SetComputerUseReadinessHandler installs a status-only view of the signed
+// desktop helper. Operations never use this snapshot as authority: every
+// prompt, answer, and permission decision still passes the helper's live gates.
+func (c *Claude) SetComputerUseReadinessHandler(handler ComputerUseReadinessHandler) {
+	runtime := claudeComputerUseRuntimeFor(c)
+	runtime.mu.Lock()
+	runtime.readiness = handler
+	runtime.mu.Unlock()
+}
+
+func (c *Claude) claudeComputerUseReadiness(ctx context.Context) (ComputerUseReadiness, bool) {
+	runtime := claudeComputerUseRuntimeFor(c)
+	runtime.mu.Lock()
+	automation := runtime.handler
+	readiness := runtime.readiness
+	runtime.mu.Unlock()
+	if automation == nil || readiness == nil || ctx == nil || ctx.Err() != nil {
+		return ComputerUseReadiness{}, false
+	}
+	return readiness(ctx), true
 }
 
 func (c *Claude) SetClaudeControlRouteCommitHandler(handler ClaudeControlRouteCommitHandler) {

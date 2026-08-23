@@ -51,18 +51,11 @@ func (s *Server) getProvider(id string) (provider.Provider, string, bool) {
 		id = s.activeProvider
 		s.mu.Unlock()
 	}
-	id = canonicalProviderID(id)
-	p, ok := s.registry[id]
-	return p, id, ok
+	return s.registry.Resolve(id)
 }
 
 func canonicalProviderID(id string) string {
-	switch id {
-	case "claude_cli", "claude_desktop":
-		return "claude"
-	default:
-		return id
-	}
+	return provider.CanonicalProviderID(id)
 }
 
 func sameProviderID(a string, b string) bool {
@@ -236,6 +229,20 @@ func promptRequestDigest(
 	return hex.EncodeToString(digest[:])
 }
 
+// requireProviderAction is the authoritative server-side guard for providers
+// that explicitly publish an action policy. Read-only adapters implement
+// ActionSupporter so a handcrafted HTTP request cannot bypass PWA controls.
+// Providers without an explicit policy keep their existing endpoint checks.
+func requireProviderAction(w http.ResponseWriter, p provider.Provider, action provider.ActionID) bool {
+	if policy, ok := p.(provider.ActionSupporter); ok && !policy.SupportsAction(action) {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"ok": false, "detail": "provider action is disabled", "action": action,
+		})
+		return false
+	}
+	return true
+}
+
 func (s *Server) findSessionAny(id string) (state.Record, bool, error) {
 	return s.findSessionForProviderAny("", id)
 }
@@ -277,6 +284,8 @@ func providerRuntimeSession(p provider.Provider, id string) (map[string]any, boo
 	return nil, false
 }
 
+var errControlSessionHydrationPersistence = errors.New("control-session hydration persistence failed")
+
 // hydrateControlSession restores the provider's in-memory logical->native
 // mapping before every mutating control operation. It also rejects IDs owned
 // by another provider instead of letting providers interpret an arbitrary
@@ -299,17 +308,20 @@ func (s *Server) hydrateControlSession(p provider.Provider, providerID string, i
 				claudeStateChanged = true
 			}
 		}
+		// Persist every normalization before exposing it to the provider's
+		// in-memory owner map. A failed store write must not leave a process that
+		// can operate a route which durable state did not accept.
+		if claudeStateChanged {
+			if err := s.store.UpsertSession(rec); err != nil {
+				return fmt.Errorf("%w: %w", errControlSessionHydrationPersistence, err)
+			}
+		}
 		logical := recordString(rec, "session_id")
 		transcript := firstNonEmpty(recordString(rec, "transcript_id"), recordString(rec, "native_session_id"))
 		if logical != "" && (transcript != "" || canonicalProviderID(providerID) == "claude") {
 			bindSessionTranscript(p, rec, logical, transcript)
 			if transcript != "" {
 				bindSessionTranscript(p, rec, id, transcript)
-			}
-		}
-		if claudeStateChanged {
-			if err := s.store.UpsertSession(rec); err != nil {
-				return err
 			}
 		}
 		return nil

@@ -1,0 +1,4 @@
+[
+  {"messageId":"legacy-user-1","role":"user","content":"synthetic legacy question","streamStatus":"done"},
+  {"messageId":"legacy-assistant-1","role":"assistant","content":"synthetic legacy answer","streamStatus":"done"}
+]

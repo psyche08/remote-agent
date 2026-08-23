@@ -2,6 +2,7 @@ package computeruse
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"net"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 // helper is a scripted stand-in for agenthalo-desktop.
@@ -178,6 +180,68 @@ func TestAnAbsentHelperReportsUnavailable(t *testing.T) {
 	}
 	if status["enabled"] != true {
 		t.Errorf("status hid the configured feature: %#v", status)
+	}
+}
+
+func TestStatusContextDoesNotQueueBehindMutableControllerCall(t *testing.T) {
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		if req["op"] == "status" {
+			return map[string]any{"ok": true, "status": map[string]any{
+				"enabled": true, "available": true,
+			}}
+		}
+		return nil
+	})
+	c := NewController(h.path, true, true)
+
+	// Model an in-flight prompt holding the persistent transport. A status
+	// probe must use its own read-only connection instead of waiting for this
+	// mutex and inheriting the prompt's 25-second latency.
+	c.mu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	status := c.StatusContext(ctx)
+	cancel()
+	c.mu.Unlock()
+	c.Stop()
+	if status["available"] != true {
+		t.Fatalf("status queued behind mutable call or lost helper state: %#v", status)
+	}
+}
+
+func TestStatusContextHonorsCallerCancellation(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	h := startHelper(t, func(req map[string]any) map[string]any {
+		if req["op"] == "status" {
+			close(started)
+			<-release
+		}
+		return map[string]any{"ok": true, "status": map[string]any{"available": true}}
+	})
+	c := NewController(h.path, true, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan map[string]any, 1)
+	go func() { result <- c.StatusContext(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("helper never received status probe")
+	}
+	start := time.Now()
+	cancel()
+	var status map[string]any
+	select {
+	case status = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("status did not stop after caller cancellation")
+	}
+	c.Stop()
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("status ignored caller cancellation for %s", elapsed)
+	}
+	if status["available"] != false {
+		t.Fatalf("cancelled status reported helper available: %#v", status)
 	}
 }
 

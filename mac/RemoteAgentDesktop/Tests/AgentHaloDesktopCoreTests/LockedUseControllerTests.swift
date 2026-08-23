@@ -1663,6 +1663,23 @@ final class LockedUseControllerTests: XCTestCase {
         XCTAssertFalse(system.isShieldUp)
     }
 
+    func testAccessibilityTargetReplacementClosesAndRelocks() throws {
+        let system = FakeSystem()
+        let controller = makeController(system: system)
+        try controller.openWindow(turnID: "turn-ax-replaced")
+
+        XCTAssertThrowsError(try controller.withAuthorizedTurn(
+            forTurn: "turn-ax-replaced"
+        ) {
+            throw AccessibilityTargetError(message: "target pid changed")
+        }) { error in
+            XCTAssertTrue(error is AccessibilityTargetError)
+        }
+        XCTAssertFalse(controller.windowRegistration().registered)
+        XCTAssertTrue(system.isScreenLocked)
+        XCTAssertFalse(system.isShieldUp)
+    }
+
     /// The controller lease closes the window-state TOCTOU: close blocks until
     /// an admitted action finishes, but once close flips the phase even that
     /// action's result is discarded; no later action is admitted at all.

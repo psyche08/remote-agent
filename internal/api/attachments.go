@@ -82,6 +82,9 @@ func (s *Server) upload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider_id")
 		return
 	}
+	if !requireProviderAction(w, p, provider.ActionUpload) {
+		return
+	}
 	if _, ok := p.(provider.AttachmentSender); !ok {
 		writeError(w, http.StatusBadRequest, "provider does not support attachments")
 		return

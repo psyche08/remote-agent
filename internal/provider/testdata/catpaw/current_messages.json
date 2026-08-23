@@ -1,0 +1,4 @@
+[
+  {"messageId":"current-user-1","role":"human","content":[{"type":"text","text":"synthetic current question"}],"createdAt":1767225600000},
+  {"messageId":"current-assistant-1","role":"model","content":"synthetic current answer","streamStatus":"completed"}
+]

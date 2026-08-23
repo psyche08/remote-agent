@@ -77,7 +77,10 @@ func TestNewWebPushRequestBuildsEncryptedRequest(t *testing.T) {
 }
 
 func TestPushMonitorEdgesAndPresence(t *testing.T) {
-	fp := &fakePushProvider{state: "idle", approval: "run ls"}
+	fp := &fakePushProvider{
+		state: "idle", approval: "run ls",
+		live: []map[string]any{{"session_id": "s1", "transcript_id": "s1", "state": "running"}},
+	}
 	cfg := &config.Config{DeviceID: "device-a", Providers: map[string]config.ProviderConfig{"claude": {}}}
 	config.ApplyDefaults(cfg)
 	srv := NewServer(cfg, provider.Registry{"claude": fp}, state.New(filepath.Join(t.TempDir(), "data")))

@@ -128,16 +128,52 @@ func NewClaudeCLI(id string, cfg config.ProviderConfig) *Claude {
 
 func (c *Claude) ID() string { return c.id }
 
-// Installed reports the union of the Desktop Computer Use primary and the
-// authenticated stream-json CLI fallback. Status exposes each readiness bit
-// separately; one backend being unavailable must not hide the other.
+// Installed reports whether either Claude surface is present. A valid Desktop
+// installation remains discoverable for transcript history even when the
+// Computer Use helper is temporarily unavailable; mutable route readiness is
+// reported separately by Status.
 func (c *Claude) Installed() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), claudeDesktopReadinessTimeout)
-	desktopReady := c.claudeDesktopReady(ctx)
+	desktopInstalled := c.claudeDesktopAppVerified(ctx)
 	cancel()
 	cli := c.resolveCommand()
 	cliReady := cli != "" && c.cliAuthenticated(cli)
-	return desktopReady || cliReady
+	return desktopInstalled || cliReady
+}
+
+// SupportsAction keeps the provider fail-closed for callers that have not
+// already obtained a Status snapshot. ActionsForStatus uses the status-aware
+// variant below so rendering /providers never repeats the bounded readiness
+// probes for every action.
+func (c *Claude) SupportsAction(action ActionID) bool {
+	return c.SupportsActionForStatus(action, c.Status())
+}
+
+// SupportsActionForStatus separates transcript discovery from mutation
+// authority. A verified Claude.app can remain installed and readable while
+// the helper is unavailable, but that read-only state must not expose an
+// action that can create an owner or alter a session.
+func (c *Claude) SupportsActionForStatus(action ActionID, status Status) bool {
+	computerUseReady := status.Capabilities["computer_use"]
+	cliReady := status.Capabilities["cli_fallback"]
+	if !computerUseReady && !cliReady {
+		return false
+	}
+	switch action {
+	case ActionSendPrompt, ActionCreate, ActionResume, ActionClose,
+		ActionApproval, ActionQuestion:
+		return true
+	case ActionInterrupt:
+		// Desktop-first sessions can already be committed to the CLI fallback;
+		// provider-level action metadata must not hide interrupt for those owners.
+		return cliReady
+	case ActionUpload:
+		// Claude Desktop does not accept attachments directly; they require the
+		// authenticated stream-json fallback before any Desktop mutation.
+		return cliReady
+	default:
+		return false
+	}
 }
 
 func (c *Claude) SetStreamPublisher(publish func(target string, frame map[string]any)) {
@@ -153,43 +189,68 @@ func (c *Claude) StopCLIStream() {
 }
 
 func (c *Claude) Status() Status {
-	ctx, cancel := context.WithTimeout(context.Background(), claudeDesktopReadinessTimeout)
-	desktopReady := c.claudeDesktopReady(ctx)
-	cancel()
+	appContext, cancelApp := context.WithTimeout(context.Background(), claudeDesktopReadinessTimeout)
+	desktopAppVerified := c.claudeDesktopAppVerified(appContext)
+	cancelApp()
+	helperContext, cancelHelper := context.WithTimeout(context.Background(), claudeDesktopReadinessTimeout)
+	computerUse, computerUseConnected := c.claudeComputerUseReadiness(helperContext)
+	cancelHelper()
 	cli := c.resolveCommand()
 	cliReady := cli != "" && c.cliAuthenticated(cli)
-	ready := desktopReady || cliReady
+	computerUseReady := desktopAppVerified && computerUseConnected &&
+		computerUse.Enabled && computerUse.Available
+	lockedUseReady := computerUseReady && computerUse.LockedUseEnabled &&
+		computerUse.LockedUseArmed && computerUse.LockedUseActive &&
+		!computerUse.LockedUseSuppressed && !computerUse.LockedUseQuarantined &&
+		!computerUse.RequiresManualRecovery && !computerUse.Stopping
+	installed := desktopAppVerified || cliReady
+	mutableReady := computerUseReady || cliReady
 	err := (*string)(nil)
 	if c.lastError != "" {
 		err = &c.lastError
 	}
-	backend := "claude_desktop_computer_use"
-	if !desktopReady {
+	backend := "claude_unavailable"
+	if computerUseReady {
+		backend = "claude_desktop_computer_use"
+	} else if cliReady {
 		backend = "claude_stream_json_cli_fallback"
+	} else if desktopAppVerified {
+		backend = "claude_desktop_transcript"
+	}
+	account := map[string]any{
+		"primary_route": c.claudePrimaryRoute(), "fallback_route": c.claudeFallbackRoute(),
+		"desktop_app_verified": desktopAppVerified, "desktop_ready": computerUseReady,
+		"computer_use_enabled": computerUse.Enabled, "computer_use_available": computerUse.Available,
+		"locked_use_enabled": computerUse.LockedUseEnabled, "locked_use_armed": computerUse.LockedUseArmed,
+		"locked_use_active": computerUse.LockedUseActive, "locked_use_suppressed": computerUse.LockedUseSuppressed,
+		"locked_use_quarantined":              computerUse.LockedUseQuarantined,
+		"locked_use_requires_manual_recovery": computerUse.RequiresManualRecovery,
+		"locked_use_stopping":                 computerUse.Stopping, "cli_fallback_ready": cliReady,
+	}
+	if computerUse.Detail != "" {
+		account["computer_use_detail"] = computerUse.Detail
 	}
 	return Status{
 		ProviderID:  c.id,
 		AppName:     firstNonEmpty(c.cfg.AppName, "Claude"),
-		IsRunning:   ready,
+		IsRunning:   mutableReady,
 		IsFrontmost: false,
-		Installed:   ready,
+		Installed:   installed,
 		State:       c.lastState,
 		LastError:   err,
 		Capabilities: map[string]bool{
 			"native_sessions": true, "native_task_status": true, "clipboard_output": true,
-			"screenshot": true, "ocr": false, "approval": true,
-			"interrupt": c.claudePrimaryRoute() == claudeRouteStreamJSONCLI, "steer": false,
-			"streaming": true, "desktop_wrapper": desktopReady, "computer_use": desktopReady,
-			"locked_use": desktopReady, "cli_fallback": cliReady, "tmux": false,
-			"stream_json": true, "create_session": true,
+			"screenshot": true, "ocr": false, "approval": mutableReady,
+			"interrupt": cliReady, "steer": false,
+			"streaming": mutableReady, "desktop_wrapper": desktopAppVerified, "desktop_transcript": desktopAppVerified,
+			"computer_use": computerUseReady, "locked_use": lockedUseReady,
+			"cli_fallback": cliReady, "tmux": false,
+			"stream_json": cliReady, "create_session": mutableReady,
 		},
 		Backend: backend,
 		Command: c.command,
 		Cwd:     c.cwd,
-		Account: map[string]any{
-			"primary_route": c.claudePrimaryRoute(), "desktop_ready": desktopReady,
-			"fallback_route": c.claudeFallbackRoute(), "cli_fallback_ready": cliReady,
-		},
+		Account: account,
 	}
 }
 
@@ -435,7 +496,18 @@ func mergeClaudeNativeRuntime(row map[string]any, native map[string]any) {
 	}
 }
 
-func (c *Claude) OpenOrCreateSession(sessionID string, opts StartOptions) (string, error) {
+func (c *Claude) OpenOrCreateSession(sessionID string, opts StartOptions) (nativeID string, resultErr error) {
+	if !c.SupportsAction(ActionCreate) {
+		return "", errors.New("Claude has no ready mutable route; Desktop transcript history is read-only")
+	}
+	newOwner := c.claudeComputerUseRoute(sessionID) == ""
+	if newOwner {
+		defer func() {
+			if resultErr != nil {
+				c.discardClaudeUnstartedSession(sessionID)
+			}
+		}()
+	}
 	c.rememberClaudeStartOptions(sessionID, opts)
 	if c.claudeComputerUseRoute(sessionID) == "" {
 		if c.claudePrimaryRoute() == claudeRouteDesktopComputerUse {
@@ -455,7 +527,7 @@ func (c *Claude) OpenOrCreateSession(sessionID string, opts StartOptions) (strin
 		return c.transcriptIDForDesktopRoute(sessionID), nil
 	}
 	if !c.ensureReady() {
-		return "", nil
+		return "", errors.New(firstNonEmpty(c.lastError, "Claude CLI unavailable"))
 	}
 	cid := c.transcriptID(sessionID)
 	if cid == sessionID && !claudeUUIDRE.MatchString(sessionID) {
@@ -484,7 +556,18 @@ func (c *Claude) OpenOrCreateSession(sessionID string, opts StartOptions) (strin
 	return cid, nil
 }
 
-func (c *Claude) OpenResumeSession(sessionID string, resumeID string, cwd string, fork bool) (string, error) {
+func (c *Claude) OpenResumeSession(sessionID string, resumeID string, cwd string, fork bool) (nativeID string, resultErr error) {
+	if !c.SupportsAction(ActionResume) {
+		return "", errors.New("Claude has no ready mutable route; Desktop transcript history is read-only")
+	}
+	newOwner := c.claudeComputerUseRoute(sessionID) == ""
+	if newOwner {
+		defer func() {
+			if resultErr != nil {
+				c.discardClaudeUnstartedSession(sessionID)
+			}
+		}()
+	}
 	c.rememberClaudeStartOptions(sessionID, StartOptions{Cwd: cwd})
 	if c.claudeComputerUseRoute(sessionID) == "" && c.claudePrimaryRoute() == claudeRouteDesktopComputerUse {
 		if fork {
@@ -544,6 +627,22 @@ func (c *Claude) OpenResumeSession(sessionID string, resumeID string, cwd string
 	c.lastState = "idle"
 	c.lastChange = time.Now()
 	return resumeID, nil
+}
+
+func (c *Claude) discardClaudeUnstartedSession(sessionID string) {
+	runtime := claudeComputerUseRuntimeFor(c)
+	runtime.mu.Lock()
+	delete(runtime.routes, sessionID)
+	delete(runtime.active, sessionID)
+	delete(runtime.startOptions, sessionID)
+	runtime.mu.Unlock()
+	c.mappingMu.Lock()
+	delete(c.cliIDs, sessionID)
+	c.mappingMu.Unlock()
+	delete(c.sessions, sessionID)
+	if c.lastSessionID == sessionID {
+		c.lastSessionID = ""
+	}
 }
 
 func (c *Claude) WaitResumable(resumeID string) bool {

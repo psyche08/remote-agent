@@ -42,6 +42,12 @@
       "cwd": "~/Developer",
       "shared_daemon_autostart": true
     },
+    "catpaw": {
+      "type": "catpaw",
+      "app_name": "CatPaw",
+      "app_path": "~/Applications/CatPaw.app",
+      "history_db_path": "~/.sankuai/MCopilot/sqliteDB/globalCache.sqlite"
+    },
     "terminal-agent": {
       "type": "pty",
       "app_name": "Terminal Agent",

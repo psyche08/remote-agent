@@ -20,6 +20,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/psyche08/remote-agent/internal/provider"
 )
 
 const (
@@ -172,6 +174,9 @@ func (s *Server) pushApprove(w http.ResponseWriter, r *http.Request) {
 	p, providerID, ok := s.getProvider(providerID)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "provider has no approval relay")
+		return
+	}
+	if !requireProviderAction(w, p, provider.ActionApproval) {
 		return
 	}
 	sessionID := firstNonEmpty(body.SessionID, body.NativeSessionID)

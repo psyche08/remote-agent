@@ -33,25 +33,36 @@ func (s *Server) pendingApprovalEntries(filterProvider string) []map[string]any 
 	candidates := s.pendingSessionCandidates(filterProvider)
 	out := make([]map[string]any, 0)
 	for _, c := range candidates {
-		p := s.registry[c.providerID]
-		if p == nil {
+		p, providerID, ok := s.getProvider(c.providerID)
+		if !ok {
 			continue
 		}
-		if binder, ok := p.(interface{ BindTranscript(string, string) }); ok {
-			binder.BindTranscript(c.sessionID, c.transcript)
-			binder.BindTranscript(c.transcript, c.transcript)
+		// Restarts discard provider in-memory bindings. Restore the stored
+		// Claude owner before asking for a pending observer request; otherwise a
+		// Desktop question or permission is downgraded to a transcript-only,
+		// non-actionable row even though its sticky Desktop route is durable.
+		// hydrateControlSession owns the provider binding because it persists any
+		// ownership normalization before changing provider memory. Never bypass
+		// that durability barrier with a read-side transcript alias here.
+		hydrationErr := s.hydrateControlSession(p, providerID, c.sessionID)
+		hydrationFailed := hydrationErr != nil
+		lookupID := c.sessionID
+		if hydrationFailed {
+			// The native transcript may still prove that a prompt exists, but a
+			// failed ownership hydration cannot authorize its control callback.
+			lookupID = c.transcript
 		}
 		var request map[string]any
 		if approvals, ok := p.(interface{ ApprovalRequest(string) map[string]any }); ok {
-			request = approvals.ApprovalRequest(c.sessionID)
-			if request == nil && c.sessionID != c.transcript {
+			request = approvals.ApprovalRequest(lookupID)
+			if request == nil && !hydrationFailed && c.sessionID != c.transcript {
 				request = approvals.ApprovalRequest(c.transcript)
 			}
 		}
 		if request == nil {
 			if questions, ok := p.(interface{ PendingQuestion(string) map[string]any }); ok {
-				request = questions.PendingQuestion(c.sessionID)
-				if request == nil && c.sessionID != c.transcript {
+				request = questions.PendingQuestion(lookupID)
+				if request == nil && !hydrationFailed && c.sessionID != c.transcript {
 					request = questions.PendingQuestion(c.transcript)
 				}
 			}
@@ -63,11 +74,16 @@ func (s *Server) pendingApprovalEntries(filterProvider string) []map[string]any 
 		for k, v := range request {
 			row[k] = v
 		}
-		row["provider_id"] = c.providerID
+		if hydrationFailed {
+			// Even a provider with stale in-memory state cannot turn a failed
+			// hydration into an actionable Desktop/CLI control request.
+			row["actionable"] = false
+		}
+		row["provider_id"] = providerID
 		row["session_id"] = c.sessionID
 		row["native_session_id"] = c.transcript
 		row["transcript_id"] = c.transcript
-		row["approval_key"] = approvalIdentity(c.providerID, c.transcript)
+		row["approval_key"] = approvalIdentity(providerID, c.transcript)
 		row["title"] = firstNonEmpty(c.title, c.transcript)
 		row["updated_at"] = c.updatedAt
 		if stringAny(row["source"]) == "" {

@@ -26,13 +26,13 @@ func TestBuildRegistryUsesOneClaudeStreamJSONProvider(t *testing.T) {
 	}
 }
 
-func TestBuildRegistryPrefersExplicitClaudeCLIConfig(t *testing.T) {
+func TestBuildRegistryPrefersCanonicalClaudeConfig(t *testing.T) {
 	reg := BuildRegistry(&config.Config{Providers: map[string]config.ProviderConfig{
-		"claude":     {Command: "/old/desktop-cli", Cwd: "/old"},
-		"claude_cli": {Command: "/standalone/claude", Cwd: "/work"},
+		"claude":     {Command: "/canonical/claude", Cwd: "/canonical"},
+		"claude_cli": {Command: "/legacy/claude", Cwd: "/legacy"},
 	}})
 	c := reg["claude"].(*Claude)
-	if c.command != "/standalone/claude" || c.cwd != "/work" {
-		t.Fatalf("explicit CLI config not selected: %#v", c.Status())
+	if c.command != "/canonical/claude" || c.cwd != "/canonical" {
+		t.Fatalf("canonical Claude config not selected: %#v", c.Status())
 	}
 }

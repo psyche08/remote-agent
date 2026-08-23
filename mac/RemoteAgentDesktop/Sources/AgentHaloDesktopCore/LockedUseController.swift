@@ -1572,10 +1572,11 @@ public final class LockedUseController: @unchecked Sendable {
             case .success(let result):
                 return result
             case .failure(let error):
-                // An AX transport timeout is an availability/safety failure,
-                // not a bad selector: end the window so a hung app cannot
-                // leave the shield up forever.
-                if error is AccessibilityIPCError {
+                // An AX transport timeout or target-identity change is a
+                // safety failure, not a bad selector: end the window so a
+                // hung/replaced app cannot retain the shielded authority.
+                if error is AccessibilityIPCError ||
+                    error is AccessibilityTargetError {
                     _ = closeWindowIf(
                         current, reason: "Accessibility IPC became unresponsive")
                 }

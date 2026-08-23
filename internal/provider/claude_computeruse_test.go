@@ -23,6 +23,12 @@ func TestClaudeDesktopReadinessAllowsDeepSignatureVerificationOverTwoSeconds(t *
 	c.SetComputerUseAutomationHandler(func(context.Context, string, ComputerUseAutomationCallback) error {
 		return nil
 	})
+	c.SetComputerUseReadinessHandler(func(context.Context) ComputerUseReadiness {
+		return ComputerUseReadiness{
+			Enabled: true, Available: true, LockedUseEnabled: true,
+			LockedUseArmed: true, LockedUseActive: true,
+		}
+	})
 	c.claudeComputerUseSetDependencies(claudeComputerUseDependencies{
 		verifyApp: func(ctx context.Context, _, _, _ string) error {
 			timer := time.NewTimer(2100 * time.Millisecond)
@@ -55,6 +61,12 @@ func TestClaudeDesktopReadinessCachesExactIdentityAndStillReverifiesOperations(t
 	}})
 	c.SetComputerUseAutomationHandler(func(context.Context, string, ComputerUseAutomationCallback) error {
 		return nil
+	})
+	c.SetComputerUseReadinessHandler(func(context.Context) ComputerUseReadiness {
+		return ComputerUseReadiness{
+			Enabled: true, Available: true, LockedUseEnabled: true,
+			LockedUseArmed: true, LockedUseActive: true,
+		}
 	})
 	var mu sync.Mutex
 	verifyCalls := 0
@@ -103,6 +115,155 @@ func TestClaudeDesktopReadinessCachesExactIdentityAndStillReverifiesOperations(t
 	defer mu.Unlock()
 	if verifyCalls != 2 {
 		t.Fatalf("operation preflight reused readiness cache: verification calls=%d, want 2", verifyCalls)
+	}
+}
+
+func TestClaudeStatusSeparatesDesktopInstallComputerUseAndLockedUseReadiness(t *testing.T) {
+	ready := ComputerUseReadiness{
+		Enabled: true, Available: true, LockedUseEnabled: true,
+		LockedUseArmed: true, LockedUseActive: true,
+	}
+	tests := []struct {
+		name            string
+		automation      bool
+		readiness       *ComputerUseReadiness
+		wantComputerUse bool
+		wantLockedUse   bool
+	}{
+		{name: "automation handler missing", readiness: &ready},
+		{name: "helper status missing", automation: true},
+		{name: "computer use disabled", automation: true, readiness: &ComputerUseReadiness{Available: true}},
+		{name: "helper unavailable", automation: true, readiness: &ComputerUseReadiness{Enabled: true}},
+		{name: "locked use disabled", automation: true, readiness: &ComputerUseReadiness{Enabled: true, Available: true}, wantComputerUse: true},
+		{name: "locked use disarmed", automation: true, readiness: &ComputerUseReadiness{Enabled: true, Available: true, LockedUseEnabled: true, LockedUseActive: true}, wantComputerUse: true},
+		{name: "locked use suppressed", automation: true, readiness: &ComputerUseReadiness{Enabled: true, Available: true, LockedUseEnabled: true, LockedUseArmed: true, LockedUseActive: true, LockedUseSuppressed: true}, wantComputerUse: true},
+		{name: "locked use quarantined", automation: true, readiness: &ComputerUseReadiness{Enabled: true, Available: true, LockedUseEnabled: true, LockedUseArmed: true, LockedUseActive: true, LockedUseQuarantined: true}, wantComputerUse: true},
+		{name: "manual recovery required", automation: true, readiness: &ComputerUseReadiness{Enabled: true, Available: true, LockedUseEnabled: true, LockedUseArmed: true, LockedUseActive: true, RequiresManualRecovery: true}, wantComputerUse: true},
+		{name: "helper stopping", automation: true, readiness: &ComputerUseReadiness{Enabled: true, Available: true, LockedUseEnabled: true, LockedUseArmed: true, LockedUseActive: true, Stopping: true}, wantComputerUse: true},
+		{name: "all ready", automation: true, readiness: &ready, wantComputerUse: true, wantLockedUse: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewClaude("claude", config.ProviderConfig{
+				Command: filepath.Join(t.TempDir(), "missing-claude"),
+				Extra:   map[string]any{"desktop_app_path": "/Applications/Test Claude.app"},
+			})
+			c.claudeComputerUseSetDependencies(claudeComputerUseDependencies{
+				verifyApp: func(context.Context, string, string, string) error { return nil },
+			})
+			if tc.automation {
+				c.SetComputerUseAutomationHandler(func(context.Context, string, ComputerUseAutomationCallback) error { return nil })
+			}
+			if tc.readiness != nil {
+				snapshot := *tc.readiness
+				c.SetComputerUseReadinessHandler(func(context.Context) ComputerUseReadiness { return snapshot })
+			}
+
+			status := c.Status()
+			if !status.Installed || !status.Capabilities["desktop_wrapper"] ||
+				status.Capabilities["computer_use"] != tc.wantComputerUse ||
+				status.Capabilities["locked_use"] != tc.wantLockedUse {
+				t.Fatalf("unexpected readiness status: %#v", status)
+			}
+			if status.IsRunning != tc.wantComputerUse ||
+				status.Capabilities["create_session"] != tc.wantComputerUse ||
+				status.Capabilities["approval"] != tc.wantComputerUse {
+				t.Fatalf("mutable readiness leaked into status: %#v", status)
+			}
+			wantBackend := "claude_desktop_transcript"
+			if tc.wantComputerUse {
+				wantBackend = "claude_desktop_computer_use"
+			}
+			if status.Backend != wantBackend || status.Account["desktop_app_verified"] != true ||
+				status.Account["desktop_ready"] != tc.wantComputerUse {
+				t.Fatalf("backend/account=%q/%#v, want %q", status.Backend, status.Account, wantBackend)
+			}
+		})
+	}
+}
+
+func TestClaudeDesktopTranscriptOnlyDisablesActionsAndSessionOwnership(t *testing.T) {
+	c := NewClaude("claude", config.ProviderConfig{
+		Command: filepath.Join(t.TempDir(), "missing-claude"),
+		Extra:   map[string]any{"desktop_app_path": "/Applications/Test Claude.app"},
+	})
+	c.claudeComputerUseSetDependencies(claudeComputerUseDependencies{
+		verifyApp: func(context.Context, string, string, string) error { return nil },
+	})
+
+	status := c.Status()
+	if !status.Installed || status.IsRunning || status.Backend != "claude_desktop_transcript" ||
+		!status.Capabilities["desktop_transcript"] || status.Capabilities["computer_use"] ||
+		status.Capabilities["cli_fallback"] || status.Capabilities["create_session"] ||
+		status.Capabilities["approval"] {
+		t.Fatalf("transcript-only status granted mutable readiness: %#v", status)
+	}
+	for _, action := range Actions(c) {
+		if action.Supported {
+			t.Fatalf("transcript-only Claude exposed action %#v", action)
+		}
+	}
+	if native, err := c.OpenOrCreateSession("ghost-create", StartOptions{}); err == nil || native != "" {
+		t.Fatalf("transcript-only Claude created a mutable owner: native=%q err=%v", native, err)
+	}
+	if native, err := c.OpenResumeSession("ghost-resume", claudeComputerUseTestTranscript, "", false); err == nil || native != "" {
+		t.Fatalf("transcript-only Claude resumed a mutable owner: native=%q err=%v", native, err)
+	}
+	runtime := claudeComputerUseRuntimeFor(c)
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if len(runtime.routes) != 0 || len(runtime.startOptions) != 0 || c.lastSessionID != "" {
+		t.Fatalf("failed mutation left ghost ownership: routes=%#v options=%#v last=%q", runtime.routes, runtime.startOptions, c.lastSessionID)
+	}
+}
+
+func TestClaudeTypedActionsMatchDesktopAndCLIRoutes(t *testing.T) {
+	desktop := Status{Capabilities: map[string]bool{"computer_use": true}}
+	cli := Status{Capabilities: map[string]bool{"cli_fallback": true}}
+	for _, status := range []Status{desktop, cli} {
+		for _, action := range []ActionID{
+			ActionSendPrompt, ActionCreate, ActionResume, ActionClose,
+			ActionApproval, ActionQuestion,
+		} {
+			if !NewClaude("claude", config.ProviderConfig{}).SupportsActionForStatus(action, status) {
+				t.Fatalf("ready Claude route hid %q", action)
+			}
+		}
+		if NewClaude("claude", config.ProviderConfig{}).SupportsActionForStatus(ActionSetModel, status) {
+			t.Fatalf("Claude exposed %q even though SetSessionModel is unsupported", ActionSetModel)
+		}
+	}
+	c := NewClaude("claude", config.ProviderConfig{})
+	if c.SupportsActionForStatus(ActionInterrupt, desktop) ||
+		!c.SupportsActionForStatus(ActionInterrupt, cli) ||
+		c.SupportsActionForStatus(ActionUpload, desktop) ||
+		!c.SupportsActionForStatus(ActionUpload, cli) {
+		t.Fatal("CLI-only interrupt/upload actions did not follow fallback readiness")
+	}
+}
+
+func TestClaudeCLIDisappearingAfterAuthLeavesNoGhostOwner(t *testing.T) {
+	dir := t.TempDir()
+	command := filepath.Join(dir, "claude-disappears")
+	script := "#!/bin/sh\nrm -f \"$0\"\nprintf '%s\\n' '{\"loggedIn\":true}'\n"
+	if err := os.WriteFile(command, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := NewClaudeCLI("claude", config.ProviderConfig{
+		Command: command, Cwd: dir,
+		Extra: map[string]any{"desktop_app_path": filepath.Join(dir, "missing-Claude.app")},
+	})
+	native, err := c.OpenOrCreateSession("readiness-race", StartOptions{Cwd: dir})
+	if err == nil || native != "" {
+		t.Fatalf("vanished CLI created a session: native=%q err=%v", native, err)
+	}
+	runtime := claudeComputerUseRuntimeFor(c)
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if len(runtime.routes) != 0 || len(runtime.startOptions) != 0 ||
+		len(c.sessions) != 0 || c.lastSessionID != "" {
+		t.Fatalf("vanished CLI left ghost owner: routes=%#v options=%#v sessions=%#v last=%q",
+			runtime.routes, runtime.startOptions, c.sessions, c.lastSessionID)
 	}
 }
 
@@ -372,6 +533,9 @@ func testClaudeComputerUse(t *testing.T, fake *fakeClaudeComputerUse) *Claude {
 		"desktop_bundle_id": claudeDesktopDefaultBundleID,
 	}})
 	c.SetComputerUseAutomationHandler(fake.handler)
+	c.SetComputerUseReadinessHandler(func(context.Context) ComputerUseReadiness {
+		return ComputerUseReadiness{Enabled: true, Available: true}
+	})
 	c.SetClaudeControlRouteCommitHandler(func(context.Context, string, string) error { return nil })
 	c.claudeComputerUseSetDependencies(claudeComputerUseDependencies{
 		verifyApp: func(context.Context, string, string, string) error { return nil },
@@ -438,6 +602,9 @@ func TestClaudeNewSessionAutoModeBindsAfterRelockAndConfirmsTranscript(t *testin
 		"desktop_bundle_id": claudeDesktopDefaultBundleID,
 	}})
 	c.SetComputerUseAutomationHandler(fake.handler)
+	c.SetComputerUseReadinessHandler(func(context.Context) ComputerUseReadiness {
+		return ComputerUseReadiness{Enabled: true, Available: true}
+	})
 	c.SetClaudeControlRouteCommitHandler(func(context.Context, string, string) error { return nil })
 	c.claudeComputerUseSetDependencies(claudeComputerUseDependencies{
 		verifyApp: func(context.Context, string, string, string) error { return nil },

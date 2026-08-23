@@ -22,6 +22,7 @@ package computeruse
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -355,7 +356,16 @@ func (c *Controller) closeLocked() {
 // rather than as disabled, so an operator sees a broken device instead of an
 // apparently switched-off one.
 func (c *Controller) Status() map[string]any {
-	res, err := c.call(quickTimeout, map[string]any{"op": "status"})
+	return c.StatusContext(context.Background())
+}
+
+// StatusContext probes the helper on a dedicated read-only connection. A
+// prompt or unlock operation can legitimately hold the controller's shared
+// request mutex for up to callTimeout; status presentation must not queue
+// behind that mutation or outlive the caller's deadline. The helper already
+// isolates connections, and this probe carries no grant or mutation authority.
+func (c *Controller) StatusContext(ctx context.Context) map[string]any {
+	res, err := c.statusContext(ctx)
 	if err != nil {
 		return map[string]any{
 			"enabled":   c.enabled,
@@ -368,6 +378,64 @@ func (c *Controller) Status() map[string]any {
 		status = map[string]any{}
 	}
 	return status
+}
+
+func (c *Controller) statusContext(ctx context.Context) (map[string]any, error) {
+	if ctx == nil {
+		return nil, errors.New("computer-use status requires a context")
+	}
+	callCtx, cancel := context.WithTimeout(ctx, quickTimeout)
+	defer cancel()
+	if err := callCtx.Err(); err != nil {
+		return nil, err
+	}
+	dialer := net.Dialer{Timeout: dialTimeout}
+	conn, err := dialer.DialContext(callCtx, "unix", c.socketPath)
+	if err != nil {
+		if callCtx.Err() != nil {
+			return nil, callCtx.Err()
+		}
+		return nil, fmt.Errorf("%w: %v", ErrHelperUnavailable, err)
+	}
+	defer conn.Close()
+	if deadline, ok := callCtx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+	}
+	stopCancellation := context.AfterFunc(callCtx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	defer stopCancellation()
+	if _, err := conn.Write([]byte("{\"op\":\"status\"}\n")); err != nil {
+		if callCtx.Err() != nil {
+			return nil, callCtx.Err()
+		}
+		return nil, err
+	}
+	line, err := bufio.NewReader(conn).ReadBytes('\n')
+	if err != nil {
+		if callCtx.Err() != nil {
+			return nil, callCtx.Err()
+		}
+		return nil, err
+	}
+	var res map[string]any
+	if err := json.Unmarshal(line, &res); err != nil {
+		return nil, errors.New("the computer-use helper returned malformed output")
+	}
+	if ok, _ := res["ok"].(bool); !ok {
+		detail, _ := res["error"].(string)
+		code, _ := res["code"].(string)
+		if code == "" {
+			code = "failed"
+		}
+		return nil, &Error{Code: code, Detail: detail}
+	}
+	if err := callCtx.Err(); err != nil {
+		return nil, err
+	}
+	return res, nil
 }
 
 // SetLockedUseActive is the console's runtime toggle. It can only move within

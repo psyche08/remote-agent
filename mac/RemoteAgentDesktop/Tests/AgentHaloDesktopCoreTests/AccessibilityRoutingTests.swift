@@ -206,6 +206,213 @@ final class AccessibilityRoutingTests: XCTestCase {
             requestedBundleID: nil, requestedName: "Duplicate"))
     }
 
+    func testProtectedTargetRequiresExactBundlePathAndOneLiveProcess() throws {
+        typealias Identity = Accessibility.RunningApplicationIdentity
+        struct App: Equatable {
+            let token: Int
+            let identity: Identity
+        }
+        let policy = try Accessibility.TargetPolicy(
+            appName: "Claude",
+            bundleIdentifier: "com.anthropic.claudefordesktop",
+            teamIdentifier: "Q6L2SF6YDW",
+            appPath: "/Applications/Claude.app")
+        let exact = App(token: 1, identity: Identity(
+            bundleIdentifier: policy.bundleIdentifier,
+            bundlePath: policy.appPath,
+            isTerminated: false,
+            processIdentifier: 501))
+        let sameBundleWrongPath = App(token: 2, identity: Identity(
+            bundleIdentifier: policy.bundleIdentifier,
+            bundlePath: "/tmp/Claude.app",
+            isTerminated: false,
+            processIdentifier: 502))
+        let wrongBundleExactPath = App(token: 3, identity: Identity(
+            bundleIdentifier: "dev.example.fake",
+            bundlePath: policy.appPath,
+            isTerminated: false,
+            processIdentifier: 503))
+
+        XCTAssertEqual(
+            try Accessibility.exactTargetApplication(
+                from: [sameBundleWrongPath, wrongBundleExactPath, exact],
+                policy: policy, identity: { $0.identity }),
+            exact)
+        XCTAssertThrowsError(try Accessibility.exactTargetApplication(
+            from: [sameBundleWrongPath, wrongBundleExactPath],
+            policy: policy, identity: { $0.identity }))
+        XCTAssertThrowsError(try Accessibility.exactTargetApplication(
+            from: [exact, App(token: 4, identity: exact.identity)],
+            policy: policy, identity: { $0.identity }))
+    }
+
+    func testRunningTargetSigningIdentityRejectsWrongBundleTeamAndPath() throws {
+        let policy = try Accessibility.TargetPolicy(
+            appName: "Claude",
+            bundleIdentifier: "com.anthropic.claudefordesktop",
+            teamIdentifier: "Q6L2SF6YDW",
+            appPath: "/Applications/Claude.app")
+        typealias Identity = AccessibilityTargetCodeSigning.Identity
+        XCTAssertTrue(AccessibilityTargetCodeSigning.permits(
+            policy: policy,
+            identity: Identity(
+                identifier: policy.bundleIdentifier,
+                teamIdentifier: policy.teamIdentifier,
+                codePath: policy.appPath)))
+        XCTAssertFalse(AccessibilityTargetCodeSigning.permits(
+            policy: policy,
+            identity: Identity(
+                identifier: "dev.example.fake",
+                teamIdentifier: policy.teamIdentifier,
+                codePath: policy.appPath)))
+        XCTAssertFalse(AccessibilityTargetCodeSigning.permits(
+            policy: policy,
+            identity: Identity(
+                identifier: policy.bundleIdentifier,
+                teamIdentifier: "A1B2C3D4E5",
+                codePath: policy.appPath)))
+        XCTAssertFalse(AccessibilityTargetCodeSigning.permits(
+            policy: policy,
+            identity: Identity(
+                identifier: policy.bundleIdentifier,
+                teamIdentifier: policy.teamIdentifier,
+                codePath: "/tmp/Claude.app")))
+    }
+
+    func testProtectedTargetRevalidationRejectsPIDAndInstanceSwap() throws {
+        typealias Identity = Accessibility.RunningApplicationIdentity
+        struct App: Equatable {
+            let token: Int
+            let identity: Identity
+        }
+        let policy = try Accessibility.TargetPolicy(
+            appName: "Claude",
+            bundleIdentifier: "com.anthropic.claudefordesktop",
+            teamIdentifier: "Q6L2SF6YDW",
+            appPath: "/Applications/Claude.app")
+        let identity = Identity(
+            bundleIdentifier: policy.bundleIdentifier,
+            bundlePath: policy.appPath,
+            isTerminated: false,
+            processIdentifier: 501)
+        let bound = App(token: 1, identity: identity)
+        var verifiedPID: pid_t = 0
+        XCTAssertNoThrow(try Accessibility.requireSameExactTarget(
+            bound, from: [bound], policy: policy,
+            identity: { $0.identity },
+            isSameInstance: { $0.token == $1.token },
+            verifySignature: { pid, _ in verifiedPID = pid }))
+        XCTAssertEqual(verifiedPID, 501)
+
+        let samePIDReplacement = App(token: 2, identity: identity)
+        XCTAssertThrowsError(try Accessibility.requireSameExactTarget(
+            bound, from: [samePIDReplacement], policy: policy,
+            identity: { $0.identity },
+            isSameInstance: { $0.token == $1.token },
+            verifySignature: { _, _ in XCTFail("replacement must fail before signature use") }))
+
+        let differentPID = App(token: 1, identity: Identity(
+            bundleIdentifier: identity.bundleIdentifier,
+            bundlePath: identity.bundlePath,
+            isTerminated: false,
+            processIdentifier: 777))
+        XCTAssertThrowsError(try Accessibility.requireSameExactTarget(
+            bound, from: [differentPID], policy: policy,
+            identity: { $0.identity },
+            isSameInstance: { $0.token == $1.token },
+            verifySignature: { _, _ in XCTFail("PID swap must fail before signature use") }))
+    }
+
+    func testProtectedTargetRevalidationPropagatesSignatureFailure() throws {
+        typealias Identity = Accessibility.RunningApplicationIdentity
+        struct App {
+            let token: Int
+            let identity: Identity
+        }
+        let policy = try Accessibility.TargetPolicy(
+            appName: "Claude",
+            bundleIdentifier: "com.anthropic.claudefordesktop",
+            teamIdentifier: "Q6L2SF6YDW",
+            appPath: "/Applications/Claude.app")
+        let bound = App(token: 1, identity: Identity(
+            bundleIdentifier: policy.bundleIdentifier,
+            bundlePath: policy.appPath,
+            isTerminated: false,
+            processIdentifier: 501))
+        XCTAssertThrowsError(try Accessibility.requireSameExactTarget(
+            bound, from: [bound], policy: policy,
+            identity: { $0.identity },
+            isSameInstance: { $0.token == $1.token },
+            verifySignature: { _, _ in
+                throw AccessibilityTargetError(message: "wrong signature")
+            })) { error in
+                XCTAssertEqual(
+                    (error as? AccessibilityTargetError)?.message,
+                    "wrong signature")
+            }
+    }
+
+    func testRouterSelectsProtectedPolicyWithoutAcceptingWireIdentity() throws {
+        let policy = try Accessibility.TargetPolicy(
+            appName: "Claude",
+            bundleIdentifier: "com.anthropic.claudefordesktop",
+            teamIdentifier: "Q6L2SF6YDW",
+            appPath: "/Applications/Claude.app")
+        let router = RequestRouter(
+            desktop: DesktopService(), accessibilityTargetPolicies: [policy])
+        let byBundle = try JSONDecoder().decode(
+            Request.self,
+            from: Data(#"{"op":"ax_read","bundle_id":"com.anthropic.claudefordesktop"}"#.utf8))
+        XCTAssertEqual(router.accessibilityTargetPolicy(for: byBundle), policy)
+
+        let byName = try JSONDecoder().decode(
+            Request.self,
+            from: Data(#"{"op":"ax_read","app":"Claude"}"#.utf8))
+        XCTAssertEqual(router.accessibilityTargetPolicy(for: byName), policy)
+
+        let foreignBundleWithSameName = try JSONDecoder().decode(
+            Request.self,
+            from: Data(#"{"op":"ax_read","app":"Claude","bundle_id":"dev.example.fake"}"#.utf8))
+        XCTAssertNil(router.accessibilityTargetPolicy(for: foreignBundleWithSameName))
+    }
+
+    func testTurnScopedTargetPinsDoNotCrossTurnsOrBundlesAndAreReleased() {
+        let pins = TurnScopedTargetPinStore<Int>()
+        pins.bind(501, turnID: "turn-a", bundleIdentifier: "dev.example.claude")
+        XCTAssertEqual(
+            pins.value(turnID: "turn-a", bundleIdentifier: "dev.example.claude"),
+            501)
+        XCTAssertNil(pins.value(
+            turnID: "turn-b", bundleIdentifier: "dev.example.claude"))
+        XCTAssertNil(pins.value(
+            turnID: "turn-a", bundleIdentifier: "dev.example.other"))
+
+        pins.bind(777, turnID: "turn-a", bundleIdentifier: "dev.example.claude")
+        XCTAssertEqual(
+            pins.value(turnID: "turn-a", bundleIdentifier: "dev.example.claude"),
+            777,
+            "a fresh read replaces the prior process generation for that turn")
+        pins.release(turnID: "turn-a")
+        XCTAssertNil(pins.value(
+            turnID: "turn-a", bundleIdentifier: "dev.example.claude"))
+        XCTAssertEqual(pins.count, 0)
+    }
+
+    func testProtectedMutationWithoutAFreshTurnPinFailsBeforeAX() throws {
+        let policy = try Accessibility.TargetPolicy(
+            appName: "Claude",
+            bundleIdentifier: "com.anthropic.claudefordesktop",
+            teamIdentifier: "Q6L2SF6YDW",
+            appPath: "/Applications/Claude.app")
+        XCTAssertThrowsError(try Accessibility.press(
+            bundleID: policy.bundleIdentifier, name: policy.appName,
+            path: [0], policy: policy)) { error in
+                XCTAssertEqual(
+                    (error as? AccessibilityTargetError)?.message,
+                    "a protected Accessibility mutation requires a fresh turn-bound read")
+            }
+    }
+
     func testCannotCompleteIsABoundedTransportFailure() {
         XCTAssertLessThan(Accessibility.messagingTimeout, 25)
         XCTAssertThrowsError(try Accessibility.requireResponsive(

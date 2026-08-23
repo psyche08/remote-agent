@@ -134,6 +134,9 @@ func NewServer(cfg *config.Config, registry provider.Registry, store *state.Stor
 		if host, ok := registeredProvider.(provider.ClaudeControlRouteCommitHost); ok {
 			s.installClaudeControlRouteCommitHandler(providerID, host)
 		}
+		if host, ok := registeredProvider.(provider.ComputerUseReadinessHost); ok {
+			s.installComputerUseReadinessHandler(host)
+		}
 		if s.computerUseCtl != nil {
 			if host, ok := registeredProvider.(provider.ComputerUseToolHost); ok {
 				s.installComputerUseToolHandler(providerID, host)
@@ -404,12 +407,19 @@ func (s *Server) providers(w http.ResponseWriter, r *http.Request) {
 		}
 		visible[id] = true
 		st := p.Status()
+		profile := provider.Profile(p)
 		rows = append(rows, map[string]any{
-			"provider_id":  id,
-			"status":       st,
-			"capabilities": st.Capabilities,
-			"actions":      provider.Actions(p),
-			"model_select": p.ModelSelect(),
+			"provider_id":       id,
+			"family":            profile.Family,
+			"adapter_kind":      profile.AdapterKind,
+			"runtime_namespace": profile.RuntimeNamespace,
+			"surface":           profile.Surface,
+			"aliases":           profile.Aliases,
+			"routes":            profile.Routes,
+			"status":            st,
+			"capabilities":      st.Capabilities,
+			"actions":           provider.ActionsForStatus(p, st),
+			"model_select":      p.ModelSelect(),
 		})
 	}
 	s.mu.Lock()
@@ -481,6 +491,9 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "unknown provider_id: "+body.ProviderID)
 			return
 		}
+		if !requireProviderAction(w, p, provider.ActionCreate) {
+			return
+		}
 		opts, err := validateStartOptions(p, body)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -489,6 +502,14 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 		session := newSessionRecord(s.cfg.DeviceID, providerID, body.Title, opts)
 		native, err := p.OpenOrCreateSession(recordString(session, "session_id"), opts)
 		if err != nil {
+			// Claude independently rechecks live Computer Use / CLI readiness at
+			// the provider boundary. If readiness disappeared after the HTTP
+			// action guard, persisting this new logical record would create a
+			// ghost mutable owner with no usable native route.
+			if providerID == "claude" {
+				writeError(w, http.StatusConflict, err.Error())
+				return
+			}
 			session["last_error"] = err.Error()
 		}
 		if native != "" {
@@ -560,6 +581,18 @@ func (s *Server) sendPrompt(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if p == nil && ok {
+		pid := recordString(session, "provider_id")
+		if resolvedProvider, resolvedProviderID, providerOK := s.getProvider(pid); providerOK {
+			p, providerID = resolvedProvider, resolvedProviderID
+		} else {
+			writeError(w, http.StatusBadRequest, "unknown provider_id: "+pid)
+			return
+		}
+	}
+	if p != nil && !requireProviderAction(w, p, provider.ActionSendPrompt) {
 		return
 	}
 	// A native Codex preview can resolve to an existing logical session by its
@@ -1110,6 +1143,9 @@ func (s *Server) rewindUserMessage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider_id: "+pid)
 		return
 	}
+	if !requireProviderAction(w, p, provider.ActionRewind) {
+		return
+	}
 	if found && recordString(rec, "provider_id") != "" && !sameProviderID(recordString(rec, "provider_id"), providerID) {
 		writeError(w, http.StatusConflict, "session_id belongs to provider "+recordString(rec, "provider_id")+", not "+providerID)
 		return
@@ -1287,6 +1323,12 @@ func (s *Server) resumeNativeSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider_id: "+body.ProviderID)
 		return
 	}
+	// A read-only source may expose a native row for preview without granting
+	// authority to turn that row into any mutable owner, including a different
+	// target provider. Gate the source before resolving or copying its identity.
+	if !requireProviderAction(w, src, provider.ActionResume) {
+		return
+	}
 	native, found := s.nativeSessionByID(srcID, src, body.NativeSessionID)
 	if !found {
 		writeError(w, http.StatusNotFound, "unknown native_session_id: "+body.NativeSessionID)
@@ -1304,6 +1346,9 @@ func (s *Server) resumeNativeSession(w http.ResponseWriter, r *http.Request) {
 	target, targetID, ok := s.getProvider(targetID)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "unknown target_provider_id: "+targetID)
+		return
+	}
+	if !requireProviderAction(w, target, provider.ActionResume) {
 		return
 	}
 	resumer, ok := target.(interface {
@@ -1910,6 +1955,10 @@ func (s *Server) sessionPreview(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"provider_id": providerID, "session_id": sessionID, "total": total, "sig": sig})
 		return
 	}
+	if err := s.persistSessionArtifacts(p, providerID, sessionID, messages); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
 	offset := -1
 	if raw := r.URL.Query().Get("offset"); raw != "" {
 		offset = parseIntDefault(raw, 0)
@@ -2115,6 +2164,9 @@ func (s *Server) interrupt(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider_id")
 		return
 	}
+	if !requireProviderAction(w, p, provider.ActionInterrupt) {
+		return
+	}
 	if err := s.hydrateControlSession(p, providerID, body.SessionID); err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -2161,6 +2213,9 @@ func (s *Server) keys(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider_id")
 		return
 	}
+	if !requireProviderAction(w, p, provider.ActionRawKeys) {
+		return
+	}
 	if err := s.hydrateControlSession(p, providerID, body.SessionID); err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -2194,6 +2249,9 @@ func (s *Server) setModel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "unknown provider_id")
 		return
 	}
+	if !requireProviderAction(w, p, provider.ActionSetModel) {
+		return
+	}
 	if err := s.hydrateControlSession(p, providerID, body.SessionID); err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -2223,6 +2281,9 @@ func (s *Server) steer(w http.ResponseWriter, r *http.Request) {
 	p, providerID, ok := s.getProvider(body.ProviderID)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "unknown provider_id")
+		return
+	}
+	if !requireProviderAction(w, p, provider.ActionSteer) {
 		return
 	}
 	if err := s.hydrateControlSession(p, providerID, body.SessionID); err != nil {
@@ -2308,6 +2369,9 @@ func (s *Server) approval(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	providerID = resolvedProviderID
+	if !requireProviderAction(w, p, provider.ActionApproval) {
+		return
+	}
 	if err := s.hydrateControlSession(p, providerID, sessionID); err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -2377,6 +2441,9 @@ func (s *Server) questionAnswer(w http.ResponseWriter, r *http.Request) {
 	p, providerID, ok := s.getProvider(body.ProviderID)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "unknown provider_id")
+		return
+	}
+	if !requireProviderAction(w, p, provider.ActionQuestion) {
 		return
 	}
 	if err := s.hydrateControlSession(p, providerID, body.SessionID); err != nil {
@@ -2855,6 +2922,9 @@ func (s *Server) closeSession(w http.ResponseWriter, r *http.Request) {
 	}
 	logicalID := recordString(rec, "session_id")
 	if providerToClose != nil {
+		if !requireProviderAction(w, providerToClose, provider.ActionClose) {
+			return
+		}
 		if err := s.hydrateControlSession(providerToClose, providerID, logicalID); err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
