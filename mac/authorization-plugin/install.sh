@@ -291,6 +291,22 @@ if kind == "rule":
     if not isinstance(rules, list) or "use-login-window-ui" not in rules:
         sys.stderr.write("rule-class right has no use-login-window-ui password fallback\n")
         sys.exit(2)
+    # A missing k-of-n is ambiguous as soon as more than the one stock
+    # password fallback is present. The one shape we can prove is equivalent
+    # to 1-of-n is the pristine [use-login-window-ui] list; make that implicit
+    # default explicit before adding our branch. Do not coerce strings,
+    # booleans, or other plist number types into an integer: authd evaluation
+    # is a security boundary, so anything except the exact integer 1 is an
+    # unsupported live shape.
+    if "k-of-n" not in right:
+        if rules != ["use-login-window-ui"]:
+            sys.stderr.write(
+                "rule-class right is missing k-of-n and is not the single password fallback; refusing ambiguous multi-rule evaluation\n")
+            sys.exit(2)
+        right["k-of-n"] = 1
+    elif type(right.get("k-of-n")) is not int or right.get("k-of-n") != 1:
+        sys.stderr.write("rule-class right must have exact integer k-of-n=1\n")
+        sys.exit(2)
     # k-of-n=1 is evaluated in list order. AgentHalo is the product's primary
     # Computer Use + Locked Use path, so remove every stale duplicate and put
     # the exact rule first. The comprehension preserves every other plug-in and
@@ -343,10 +359,20 @@ kind = right.get("class")
 if kind == "rule":
     rules = right.get("rule", [])
     original_rules = original.get("rule", [])
+    original_k_missing_safe = (
+        "k-of-n" not in original
+        and original_rules == ["use-login-window-ui"])
+    original_k_explicit_safe = (
+        type(original.get("k-of-n")) is int
+        and original.get("k-of-n") == 1)
     expected = ([rule_name]
                 + [value for value in original_rules if value != rule_name])
-    ok = (isinstance(rules, list)
+    ok = (right.get("class") == original.get("class")
+          and isinstance(rules, list)
           and isinstance(original_rules, list)
+          and type(right.get("k-of-n")) is int
+          and right.get("k-of-n") == 1
+          and (original_k_missing_safe or original_k_explicit_safe)
           and rules.count(rule_name) == 1
           and rules[0] == rule_name
           and "use-login-window-ui" in rules

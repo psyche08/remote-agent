@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -92,20 +93,41 @@ func installerPythonBlock(t *testing.T, script, invocation string) string {
 
 func writeAuthorizationRightFixture(t *testing.T, path, class, key string, values []string) {
 	t.Helper()
-	body, err := json.Marshal(values)
+	fixture := map[string]any{"class": class, key: values}
+	if class == "rule" {
+		fixture["k-of-n"] = 1
+	}
+	writeAuthorizationFixture(t, path, fixture)
+}
+
+func writeAuthorizationFixture(t *testing.T, path string, fixture map[string]any) {
+	t.Helper()
+	body, err := json.Marshal(fixture)
 	if err != nil {
 		t.Fatal(err)
 	}
 	python := `import json, plistlib, sys
-values = json.loads(sys.argv[4])
+fixture = json.loads(sys.argv[2])
 with open(sys.argv[1], "wb") as f:
-    plistlib.dump({"class": sys.argv[2], sys.argv[3]: values}, f)
+    plistlib.dump(fixture, f)
 `
-	command := exec.Command("python3", "-", path, class, key, string(body))
+	command := exec.Command("python3", "-", path, string(body))
 	command.Stdin = strings.NewReader(python)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("write authorization fixture: %v: %s", err, output)
 	}
+}
+
+func authorizationFixtureHasExactIntegerKOfN(t *testing.T, path string, want int) bool {
+	t.Helper()
+	python := `import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    value = plistlib.load(f).get("k-of-n")
+raise SystemExit(0 if type(value) is int and value == int(sys.argv[2]) else 1)
+`
+	command := exec.Command("python3", "-", path, strconv.Itoa(want))
+	command.Stdin = strings.NewReader(python)
+	return command.Run() == nil
 }
 
 func readAuthorizationList(t *testing.T, path, key string) []string {
@@ -187,6 +209,85 @@ func TestAuthorizationPluginInstallerMakesAgentHaloFirstWithoutDeletingOtherRule
 	}
 	if got := readAuthorizationList(t, second, "rule"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("rule transform is not idempotent:\n got %#v\nwant %#v", got, want)
+	}
+}
+
+func TestAuthorizationPluginInstallerNormalizesOnlySinglePasswordFallback(t *testing.T) {
+	script := readAuthorizationPluginFile(t, "install.sh")
+	python := installerPythonBlock(
+		t, script,
+		`if ! /usr/bin/python3 - "$TMP" "$TMP.new" "$RULE_NAME" "$MECHANISM" <<'PYEOF'`)
+	directory := t.TempDir()
+	source := filepath.Join(directory, "right.plist")
+	first := filepath.Join(directory, "first.plist")
+	second := filepath.Join(directory, "second.plist")
+	writeAuthorizationFixture(t, source, map[string]any{
+		"class": "rule",
+		"rule":  []string{"use-login-window-ui"},
+	})
+
+	if err := runAuthorizationTransformer(t, python, source, first); err != nil {
+		t.Fatalf("single password fallback was not safely normalized: %v", err)
+	}
+	want := []string{authorizationRuleName, "use-login-window-ui"}
+	if got := readAuthorizationList(t, first, "rule"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("normalized rule list = %#v, want %#v", got, want)
+	}
+	if !authorizationFixtureHasExactIntegerKOfN(t, first, 1) {
+		t.Fatal("normalization did not write exact integer k-of-n=1")
+	}
+
+	if err := runAuthorizationTransformer(t, python, first, second); err != nil {
+		t.Fatalf("normalized shape is not idempotent: %v", err)
+	}
+	firstBody, err := os.ReadFile(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondBody, err := os.ReadFile(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(firstBody) != string(secondBody) {
+		t.Fatal("second transform changed the already-normalized authorization right")
+	}
+}
+
+func TestAuthorizationPluginInstallerRejectsUnsafeKOfNShapes(t *testing.T) {
+	script := readAuthorizationPluginFile(t, "install.sh")
+	python := installerPythonBlock(
+		t, script,
+		`if ! /usr/bin/python3 - "$TMP" "$TMP.new" "$RULE_NAME" "$MECHANISM" <<'PYEOF'`)
+	directory := t.TempDir()
+
+	tests := []struct {
+		name    string
+		fixture map[string]any
+	}{
+		{name: "missing with multiple rules", fixture: map[string]any{
+			"class": "rule",
+			"rule":  []string{"com.example.third-party", "use-login-window-ui"},
+		}},
+		{name: "string one", fixture: map[string]any{
+			"class": "rule", "k-of-n": "1", "rule": []string{"use-login-window-ui"},
+		}},
+		{name: "boolean true", fixture: map[string]any{
+			"class": "rule", "k-of-n": true, "rule": []string{"use-login-window-ui"},
+		}},
+		{name: "integer two", fixture: map[string]any{
+			"class": "rule", "k-of-n": 2, "rule": []string{"use-login-window-ui"},
+		}},
+	}
+
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := filepath.Join(directory, "unsafe-"+strconv.Itoa(index)+".plist")
+			destination := source + ".new"
+			writeAuthorizationFixture(t, source, test.fixture)
+			if err := runAuthorizationTransformer(t, python, source, destination); err == nil {
+				t.Fatal("unsafe k-of-n shape was accepted")
+			}
+		})
 	}
 }
 
@@ -286,6 +387,125 @@ func TestAuthorizationPluginLiveReadbackRequiresFirstUniqueRuleAndPreservedFallb
 			}
 			if !test.valid && err == nil {
 				t.Fatal("unsafe live readback accepted")
+			}
+		})
+	}
+}
+
+func TestAuthorizationPluginLiveReadbackRequiresNormalizedKOfN(t *testing.T) {
+	script := readAuthorizationPluginFile(t, "install.sh")
+	python := installerPythonBlock(
+		t, script,
+		`if ! /usr/bin/python3 - "$TMP.current" "$TMP" "$RULE_NAME" "$MECHANISM" <<'PYEOF'`)
+	directory := t.TempDir()
+	originalPath := filepath.Join(directory, "original.plist")
+	currentPath := filepath.Join(directory, "current.plist")
+	writeAuthorizationFixture(t, originalPath, map[string]any{
+		"class": "rule",
+		"rule":  []string{"use-login-window-ui"},
+	})
+	valid := map[string]any{
+		"class":  "rule",
+		"k-of-n": 1,
+		"rule":   []string{authorizationRuleName, "use-login-window-ui"},
+	}
+	writeAuthorizationFixture(t, currentPath, valid)
+	if err := runAuthorizationReadback(t, python, currentPath, originalPath); err != nil {
+		t.Fatalf("normalized live readback rejected: %v", err)
+	}
+
+	unsafe := []struct {
+		name    string
+		fixture map[string]any
+	}{
+		{name: "missing", fixture: map[string]any{
+			"class": "rule", "rule": []string{authorizationRuleName, "use-login-window-ui"},
+		}},
+		{name: "string one", fixture: map[string]any{
+			"class": "rule", "k-of-n": "1", "rule": []string{authorizationRuleName, "use-login-window-ui"},
+		}},
+		{name: "integer two", fixture: map[string]any{
+			"class": "rule", "k-of-n": 2, "rule": []string{authorizationRuleName, "use-login-window-ui"},
+		}},
+	}
+	for _, test := range unsafe {
+		t.Run(test.name, func(t *testing.T) {
+			writeAuthorizationFixture(t, currentPath, test.fixture)
+			if err := runAuthorizationReadback(t, python, currentPath, originalPath); err == nil {
+				t.Fatal("readback accepted an unsafe live k-of-n")
+			}
+		})
+	}
+
+	writeAuthorizationFixture(t, originalPath, map[string]any{
+		"class": "rule",
+		"rule":  []string{"com.example.third-party", "use-login-window-ui"},
+	})
+	writeAuthorizationFixture(t, currentPath, map[string]any{
+		"class":  "rule",
+		"k-of-n": 1,
+		"rule": []string{
+			authorizationRuleName, "com.example.third-party", "use-login-window-ui",
+		},
+	})
+	if err := runAuthorizationReadback(t, python, currentPath, originalPath); err == nil {
+		t.Fatal("readback accepted an ambiguously missing original k-of-n with multiple rules")
+	}
+}
+
+func TestAuthorizationPreflightAcceptsOnlyCanonicalOrSafelyNormalizableRule(t *testing.T) {
+	preflight, err := os.ReadFile(filepath.Join("..", "..", "mac", "preflight.sh"))
+	if err != nil {
+		t.Fatalf("read preflight.sh: %v", err)
+	}
+	python := installerPythonBlock(
+		t, string(preflight),
+		`RIGHT_SHAPE="$(/usr/bin/python3 - "$RIGHT_PLIST" <<'PYEOF'`)
+	directory := t.TempDir()
+
+	tests := []struct {
+		name       string
+		fixture    map[string]any
+		wantOutput string
+	}{
+		{name: "canonical multi rule", fixture: map[string]any{
+			"class": "rule", "k-of-n": 1,
+			"rule": []string{"com.example.third-party", "use-login-window-ui"},
+		}, wantOutput: "canonical-1-of-n\n"},
+		{name: "normalizable single fallback", fixture: map[string]any{
+			"class": "rule", "rule": []string{"use-login-window-ui"},
+		}, wantOutput: "normalizable-single-password-fallback\n"},
+		{name: "missing with multiple rules", fixture: map[string]any{
+			"class": "rule", "rule": []string{"com.example.third-party", "use-login-window-ui"},
+		}},
+		{name: "string one", fixture: map[string]any{
+			"class": "rule", "k-of-n": "1", "rule": []string{"use-login-window-ui"},
+		}},
+		{name: "boolean true", fixture: map[string]any{
+			"class": "rule", "k-of-n": true, "rule": []string{"use-login-window-ui"},
+		}},
+		{name: "integer two", fixture: map[string]any{
+			"class": "rule", "k-of-n": 2, "rule": []string{"use-login-window-ui"},
+		}},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(directory, "preflight-"+strconv.Itoa(index)+".plist")
+			writeAuthorizationFixture(t, path, test.fixture)
+			command := exec.Command("python3", "-", path)
+			command.Stdin = strings.NewReader(python)
+			output, err := command.CombinedOutput()
+			if test.wantOutput == "" {
+				if err == nil {
+					t.Fatalf("unsafe preflight shape accepted: %s", output)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("safe preflight shape rejected: %v: %s", err, output)
+			}
+			if string(output) != test.wantOutput {
+				t.Fatalf("preflight result = %q, want %q", output, test.wantOutput)
 			}
 		})
 	}

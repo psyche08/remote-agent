@@ -308,21 +308,35 @@ fi
 
 step "screensaver authorization right has a safe branch shape"
 # Reading authorizationdb is non-mutating.  The installer only understands the
-# rule/k-of-n form used by modern macOS; discovering a different shape before
-# installation is much safer than guessing how authd will evaluate it.
+# exact rule/k-of-n form used by modern macOS, plus the one unambiguous stock
+# shape where the sole password fallback has an omitted default. Discovering a
+# different shape before installation is much safer than guessing how authd
+# will evaluate it.
 RIGHT_PLIST="$(mktemp -t agenthalo-screensaver-right)"
 if security authorizationdb read system.login.screensaver >"$RIGHT_PLIST" 2>/dev/null; then
-  if /usr/bin/python3 - "$RIGHT_PLIST" <<'PYEOF'
+  RIGHT_SHAPE="$(/usr/bin/python3 - "$RIGHT_PLIST" <<'PYEOF'
 import plistlib, sys
 with open(sys.argv[1], "rb") as f:
     right = plistlib.load(f)
-ok = (right.get("class") == "rule"
-      and int(right.get("k-of-n", 0)) == 1
-      and "use-login-window-ui" in right.get("rule", []))
-raise SystemExit(0 if ok else 1)
+rules = right.get("rule")
+if right.get("class") != "rule" or not isinstance(rules, list):
+    sys.exit(1)
+if "use-login-window-ui" not in rules:
+    sys.exit(1)
+if "k-of-n" not in right:
+    if rules != ["use-login-window-ui"]:
+        sys.exit(1)
+    print("normalizable-single-password-fallback")
+elif type(right.get("k-of-n")) is int and right.get("k-of-n") == 1:
+    print("canonical-1-of-n")
+else:
+    sys.exit(1)
 PYEOF
-  then
+  )" || RIGHT_SHAPE="unsupported"
+  if [ "$RIGHT_SHAPE" = "canonical-1-of-n" ]; then
     pass "system.login.screensaver is a 1-of-n rule with the normal password fallback"
+  elif [ "$RIGHT_SHAPE" = "normalizable-single-password-fallback" ]; then
+    pass "system.login.screensaver is the single password fallback; installer can safely make k-of-n=1 explicit"
   else
     fail "system.login.screensaver has an unsupported shape; do not install the plug-in"
   fi
