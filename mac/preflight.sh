@@ -156,7 +156,7 @@ if grep -q 'UserPasswordTextField' "$INTERACTOR" 2>/dev/null && \
    grep -q 'kAXFocusedUIElementAttribute' "$INTERACTOR" 2>/dev/null && \
    grep -q 'kAXFocusedWindowAttribute' "$INTERACTOR" 2>/dev/null && \
    grep -q 'kAXWindowsAttribute' "$INTERACTOR" 2>/dev/null && \
-   grep -q 'discoveryTimeout: TimeInterval = 8' "$INTERACTOR" 2>/dev/null && \
+   grep -q 'discoveryTimeout: TimeInterval = 15' "$INTERACTOR" 2>/dev/null && \
    grep -q 'try prepareGrant()' "$INTERACTOR" 2>/dev/null && \
    grep -q 'submissionDeadline' "$INTERACTOR" 2>/dev/null && \
    grep -q 'preflightEmptySubmission' "$INTERACTOR" 2>/dev/null && \

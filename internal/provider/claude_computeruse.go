@@ -66,7 +66,10 @@ func (c *Claude) claudeFallbackRoute() string {
 }
 
 func (c *Claude) claudeUIOperationTimeout() time.Duration {
-	timeout := durationExtra(c.cfg.Extra, "ui_operation_timeout_seconds", 30*time.Second)
+	// Leave enough room for a cold loginwindow/display wake before Claude UI
+	// inspection begins. Locked Use grant lifetime is independently bounded and
+	// starts only after the authority-free wake/readiness phase completes.
+	timeout := durationExtra(c.cfg.Extra, "ui_operation_timeout_seconds", 60*time.Second)
 	if timeout < time.Second {
 		return time.Second
 	}

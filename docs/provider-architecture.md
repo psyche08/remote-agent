@@ -270,7 +270,7 @@ canonical `claude` 内部有两条 route，但每个 logical session 只能绑�
   "desktop_bundle_id": "com.anthropic.claudefordesktop",
   "desktop_team_id": "Q6L2SF6YDW",
   "desktop_app_path": "/Applications/Claude.app",
-  "ui_operation_timeout_seconds": 30,
+  "ui_operation_timeout_seconds": 60,
   "interaction_dir": "~/.claude/agenthalo-interactions",
   "turnstate_dir": "~/.claude/agenthalo-turnstate"
 }

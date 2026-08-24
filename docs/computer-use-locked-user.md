@@ -374,7 +374,7 @@ signed UDS peer pin 也不会自动覆盖系统事件流。因此当前目标是
     "desktop_bundle_id": "com.anthropic.claudefordesktop",
     "desktop_team_id": "Q6L2SF6YDW",
     "desktop_app_path": "/Applications/Claude.app",
-    "ui_operation_timeout_seconds": 30,
+    "ui_operation_timeout_seconds": 60,
     "interaction_dir": "~/.claude/agenthalo-interactions",
     "turnstate_dir": "~/.claude/agenthalo-turnstate"
   }

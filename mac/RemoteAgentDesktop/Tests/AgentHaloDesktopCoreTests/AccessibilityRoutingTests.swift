@@ -424,8 +424,8 @@ final class AccessibilityRoutingTests: XCTestCase {
 
         XCTAssertLessThan(SystemLockScreenAuthorizationInteractor.messagingTimeout, 2)
         XCTAssertEqual(
-            SystemLockScreenAuthorizationInteractor.discoveryTimeout, 8,
-            "wake-to-field discovery must be bounded without consuming grant TTL")
+            SystemLockScreenAuthorizationInteractor.discoveryTimeout, 15,
+            "cold-display wake-to-field discovery must be bounded without consuming grant TTL")
         XCTAssertThrowsError(try SystemLockScreenAuthorizationInteractor.requireResponsive(
             .cannotComplete, operation: "test loginwindow read")) { error in
             XCTAssertTrue(error is LockScreenAuthorizationError)

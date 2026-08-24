@@ -53,7 +53,11 @@ public final class SystemLockScreenAuthorizationInteractor:
     /// Wake-to-ready is not instantaneous on real hardware. Discovery/focus is
     /// a non-authorizing, pre-submission phase and deliberately runs before the
     /// controller publishes a grant, so this wait consumes none of its TTL.
-    static let discoveryTimeout: TimeInterval = 8
+    // A cold dual-display wake can take slightly more than eight seconds
+    // before loginwindow publishes its password field. This phase is still
+    // authority-free: the remote-activity lease is released and the grant is
+    // minted only after every exact-field readiness check succeeds.
+    static let discoveryTimeout: TimeInterval = 15
     /// Once the exact field is focused and the grant has been published, the
     /// empty assignment plus field-local AXConfirm remain one short,
     /// single-attempt boundary.
