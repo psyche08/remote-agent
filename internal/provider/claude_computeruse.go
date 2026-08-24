@@ -189,6 +189,7 @@ func (o claudeComputerUseOutcome) canFallback() bool {
 }
 
 var errClaudeComputerUseUnavailable = errors.New("Claude Desktop computer use is unavailable")
+var errClaudeDesktopStartUnavailable = errors.New("Claude Desktop could not start before UI mutation")
 
 type claudeComputerUseDependencies struct {
 	verifyApp         func(context.Context, string, string, string) error
@@ -1745,18 +1746,6 @@ func (c *Claude) claudeComputerUseSendPrompt(
 		outcome.FallbackAllowed = true
 		return outcome
 	}
-	// Background launch is capability preflight only: it carries no session,
-	// prompt, or decision and deliberately does not steal foreground focus.
-	if err := deps.launchApp(ctx, appPath); err != nil {
-		outcome.Err = errors.New("Claude Desktop could not start in the background")
-		outcome.FallbackAllowed = true
-		return outcome
-	}
-	if err := deps.waitApp(ctx, appPath); err != nil {
-		outcome.Err = err
-		outcome.FallbackAllowed = true
-		return outcome
-	}
 	startedAt := deps.now().UTC()
 	baselineRecords := map[string]bool{}
 	if target.cliID != "" {
@@ -1766,6 +1755,18 @@ func (c *Claude) claudeComputerUseSendPrompt(
 	var promptAttempt turnstatehook.InteractionAttempt
 	err = handler(ctx, sessionID, func(operationCtx context.Context, tool ComputerUseToolHandler) error {
 		tx = &claudeDesktopTransaction{tool: tool, bundleID: bundleID, target: &target}
+		// Enter the broker's shielded Locked Use window before launching Claude.
+		// Claude stores authentication state in protected Keychain access groups;
+		// starting it while the device is still locked can make an ordinary
+		// unavailable-while-locked credential look like a logged-out session.
+		// Background launch still carries no session, prompt, or decision.
+		if err := deps.launchApp(operationCtx, appPath); err != nil {
+			return fmt.Errorf("%w: Claude Desktop could not start in the background",
+				errClaudeDesktopStartUnavailable)
+		}
+		if err := deps.waitApp(operationCtx, appPath); err != nil {
+			return fmt.Errorf("%w: %v", errClaudeDesktopStartUnavailable, err)
+		}
 		// Establish the helper's shield/input guard before any navigation can
 		// activate Claude or alter visible UI. A failure here remains eligible for
 		// a brand-new session's CLI fallback because no application mutation ran.
@@ -1868,8 +1869,9 @@ func (c *Claude) claudeComputerUseSendPrompt(
 	}
 	if err != nil {
 		outcome.Err = err
-		capabilityAbsent := claudeComputerUseCapabilityAbsence(err) && !claudeComputerUseSecurityRefusal(err) &&
-			tx != nil && !tx.mutated && !tx.noFallback
+		capabilityAbsent := !claudeComputerUseSecurityRefusal(err) && tx != nil &&
+			!tx.mutated && !tx.noFallback &&
+			(errors.Is(err, errClaudeDesktopStartUnavailable) || claudeComputerUseCapabilityAbsence(err))
 		if capabilityAbsent {
 			outcome.FallbackAllowed = true
 		} else {
@@ -2559,19 +2561,19 @@ func (c *Claude) claudeComputerUseControl(
 		outcome.Err = err
 		return outcome
 	}
-	if err := deps.launchApp(ctx, appPath); err != nil {
-		outcome.Err = errors.New("Claude Desktop could not start in the background")
-		return outcome
-	}
-	if err := deps.waitApp(ctx, appPath); err != nil {
-		outcome.Err = err
-		return outcome
-	}
 	var tx *claudeDesktopTransaction
 	var interactionAttempt turnstatehook.InteractionAttempt
 	err = handler(ctx, sessionID, func(operationCtx context.Context, tool ComputerUseToolHandler) error {
 		tx = &claudeDesktopTransaction{
 			tool: tool, bundleID: bundleID, target: &target, validate: validate,
+		}
+		// Permission and question controls have the same credential boundary as
+		// prompt delivery: acquire the Locked Use window before Claude starts.
+		if err := deps.launchApp(operationCtx, appPath); err != nil {
+			return errors.New("Claude Desktop could not start in the background")
+		}
+		if err := deps.waitApp(operationCtx, appPath); err != nil {
+			return err
 		}
 		initial, inspectErr := tx.inspect(operationCtx)
 		if claudeComputerUseSecurityRefusal(inspectErr) {

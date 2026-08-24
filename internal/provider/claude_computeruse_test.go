@@ -596,6 +596,57 @@ func TestClaudeComputerUsePromptUsesExactBundleAndFreshInspection(t *testing.T) 
 	}
 }
 
+func TestClaudeComputerUseOpensWindowBeforeLaunchingCredentialBackedDesktop(t *testing.T) {
+	fake := &fakeClaudeComputerUse{opened: true}
+	c := testClaudeComputerUse(t, fake)
+	var mu sync.Mutex
+	events := make([]string, 0, 3)
+	record := func(event string) {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+	}
+	c.SetComputerUseAutomationHandler(func(
+		ctx context.Context, sessionID string, callback ComputerUseAutomationCallback,
+	) error {
+		record("window")
+		return fake.handler(ctx, sessionID, callback)
+	})
+	c.claudeComputerUseSetDependencies(claudeComputerUseDependencies{
+		launchApp: func(context.Context, string) error { record("launch"); return nil },
+		waitApp:   func(context.Context, string) error { record("wait"); return nil },
+	})
+
+	outcome := c.claudeComputerUseSendPrompt(context.Background(), "logical-1", "private prompt")
+	if outcome.Err != nil || outcome.Disposition != claudeComputerUseConfirmed {
+		t.Fatalf("prompt outcome=%#v", outcome)
+	}
+	mu.Lock()
+	gotPrompt := strings.Join(events, ",")
+	events = events[:0]
+	mu.Unlock()
+	if gotPrompt != "window,launch,wait" {
+		t.Fatalf("prompt order=%q, want window,launch,wait", gotPrompt)
+	}
+
+	control := c.claudeComputerUseControl(
+		context.Background(), "logical-1", nil, nil,
+		func(_ context.Context, tx *claudeDesktopTransaction, _ claudeComputerUseDependencies) error {
+			tx.confirmed = true
+			return nil
+		},
+	)
+	if control.Err != nil || control.Disposition != claudeComputerUseConfirmed {
+		t.Fatalf("control outcome=%#v", control)
+	}
+	mu.Lock()
+	gotControl := strings.Join(events, ",")
+	mu.Unlock()
+	if gotControl != "window,launch,wait" {
+		t.Fatalf("control order=%q, want window,launch,wait", gotControl)
+	}
+}
+
 func TestClaudeNewSessionAutoModeBindsAfterRelockAndConfirmsTranscript(t *testing.T) {
 	fake := &fakeClaudeNewComputerUse{requireAutoConfirm: true}
 	c := NewClaude("claude", config.ProviderConfig{Extra: map[string]any{
@@ -660,6 +711,21 @@ func TestClaudeNewSessionAutoModeBindsAfterRelockAndConfirmsTranscript(t *testin
 }
 
 func TestClaudeComputerUseFailureClassificationPreAndPostMutation(t *testing.T) {
+	t.Run("windowed background launch failure may fall back", func(t *testing.T) {
+		fake := &fakeClaudeComputerUse{}
+		c := testClaudeComputerUse(t, fake)
+		c.claudeComputerUseSetDependencies(claudeComputerUseDependencies{
+			launchApp: func(context.Context, string) error { return errors.New("launch unavailable") },
+		})
+		outcome := c.claudeComputerUseSendPrompt(context.Background(), "logical-1", "do not log me")
+		if outcome.Disposition != claudeComputerUseNotAttempted || !outcome.canFallback() {
+			t.Fatalf("outcome=%#v", outcome)
+		}
+		if calls := fake.calls(); len(calls) != 0 {
+			t.Fatalf("launch failure reached application inspection or mutation: %#v", calls)
+		}
+	})
+
 	t.Run("preflight may fall back", func(t *testing.T) {
 		fake := &fakeClaudeComputerUse{readErr: computeruse.ErrHelperUnavailable}
 		c := testClaudeComputerUse(t, fake)
