@@ -178,6 +178,13 @@ func TestComputerUseAutomationSuccessBindsIdentityAndRelocks(t *testing.T) {
 			!strings.HasPrefix(lease.TurnID, computerUseAutomationTurnPrefix) {
 			t.Fatalf("bad callback-scoped automation lease: %#v", lease)
 		}
+		prepared, err := tool(ctx, provider.ComputerUseToolRequest{Tool: "prepare_app"})
+		if err != nil || !strings.Contains(prepared.Text, `"prepare_app"`) {
+			t.Fatalf("automation prepare result=%#v err=%v", prepared, err)
+		}
+		if seen := helper.seen(); len(seen) != 1 || seen[0]["op"] != "window_open" {
+			t.Fatalf("prepare_app read or mutated the target application: %#v", seen)
+		}
 
 		result, err := tool(ctx, provider.ComputerUseToolRequest{
 			ProviderID: "forged", SessionID: "forged", ThreadID: "forged",

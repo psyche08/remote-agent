@@ -1759,6 +1759,12 @@ func (c *Claude) claudeComputerUseSendPrompt(
 		// Claude stores authentication state in protected Keychain access groups;
 		// starting it while the device is still locked can make an ordinary
 		// unavailable-while-locked credential look like a logged-out session.
+		if _, err := tx.tool(operationCtx, ComputerUseToolRequest{Tool: "prepare_app"}); err != nil {
+			if claudeComputerUseSecurityRefusal(err) {
+				tx.noFallback = true
+			}
+			return err
+		}
 		// Background launch still carries no session, prompt, or decision.
 		if err := deps.launchApp(operationCtx, appPath); err != nil {
 			return fmt.Errorf("%w: Claude Desktop could not start in the background",
@@ -2569,6 +2575,12 @@ func (c *Claude) claudeComputerUseControl(
 		}
 		// Permission and question controls have the same credential boundary as
 		// prompt delivery: acquire the Locked Use window before Claude starts.
+		if _, err := tx.tool(operationCtx, ComputerUseToolRequest{Tool: "prepare_app"}); err != nil {
+			if claudeComputerUseSecurityRefusal(err) {
+				tx.noFallback = true
+			}
+			return err
+		}
 		if err := deps.launchApp(operationCtx, appPath); err != nil {
 			return errors.New("Claude Desktop could not start in the background")
 		}

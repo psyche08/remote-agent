@@ -59,6 +59,8 @@ func (s *Server) handleComputerUseTool(
 
 	tool := strings.TrimSpace(req.Tool)
 	switch tool {
+	case "prepare_app":
+		return s.computerUsePrepareApp(ctl, lease)
 	case "get_app_state":
 		return s.computerUseGetAppState(ctl, lease, req)
 	case "press", "focus":
@@ -107,6 +109,37 @@ func (s *Server) handleComputerUseTool(
 	default:
 		return provider.ComputerUseToolResult{}, fmt.Errorf("unknown computer-use tool %q", tool)
 	}
+}
+
+// computerUsePrepareApp acquires the operation's safe desktop window without
+// reading or launching a target application. Desktop-backed providers use it
+// before process launch so an app cannot observe protected Keychain state while
+// the console is still locked. The lease cleanup remains responsible for the
+// synchronous close/relock on every return path.
+func (s *Server) computerUsePrepareApp(
+	ctl *computeruse.Controller, lease computerUseTurnLease,
+) (provider.ComputerUseToolResult, error) {
+	window, err := ctl.OpenWindow(lease.OwnerID)
+	mode := "locked_use"
+	if errors.Is(err, computeruse.ErrLockedUseNotEnabled) {
+		mode = "normal_unlocked"
+		window.Phase = computeruse.WindowPhaseClosed
+		err = nil
+	}
+	if err != nil {
+		return provider.ComputerUseToolResult{}, err
+	}
+	payload, err := json.Marshal(map[string]any{
+		"ok": true, "tool": "prepare_app",
+		"window": map[string]any{
+			"registered": window.Registered, "phase": window.Phase,
+			"open": window.Open, "closing": window.Closing, "mode": mode,
+		},
+	})
+	if err != nil {
+		return provider.ComputerUseToolResult{}, err
+	}
+	return provider.ComputerUseToolResult{Text: string(payload)}, nil
 }
 
 func (s *Server) computerUseToolTarget(providerID, sessionID, threadID string) (string, error) {

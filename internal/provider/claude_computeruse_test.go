@@ -323,6 +323,9 @@ func (f *fakeClaudeNewComputerUse) tool(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, request)
+	if request.Tool == "prepare_app" {
+		return ComputerUseToolResult{Text: `{"ok":true,"tool":"prepare_app"}`}, nil
+	}
 	if request.BundleID != claudeDesktopDefaultBundleID {
 		return ComputerUseToolResult{}, errors.New("wrong bundle")
 	}
@@ -468,6 +471,9 @@ func (f *fakeClaudeComputerUse) tool(
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, request)
+	if request.Tool == "prepare_app" {
+		return ComputerUseToolResult{Text: `{"ok":true,"tool":"prepare_app"}`}, nil
+	}
 	if request.BundleID != claudeDesktopDefaultBundleID {
 		return ComputerUseToolResult{}, errors.New("wrong bundle")
 	}
@@ -609,8 +615,15 @@ func TestClaudeComputerUseOpensWindowBeforeLaunchingCredentialBackedDesktop(t *t
 	c.SetComputerUseAutomationHandler(func(
 		ctx context.Context, sessionID string, callback ComputerUseAutomationCallback,
 	) error {
-		record("window")
-		return fake.handler(ctx, sessionID, callback)
+		if sessionID != "logical-1" {
+			return errors.New("wrong logical session")
+		}
+		return callback(ctx, func(toolCtx context.Context, request ComputerUseToolRequest) (ComputerUseToolResult, error) {
+			if request.Tool == "prepare_app" {
+				record("window")
+			}
+			return fake.tool(toolCtx, request)
+		})
 	})
 	c.claudeComputerUseSetDependencies(claudeComputerUseDependencies{
 		launchApp: func(context.Context, string) error { record("launch"); return nil },
@@ -721,7 +734,7 @@ func TestClaudeComputerUseFailureClassificationPreAndPostMutation(t *testing.T) 
 		if outcome.Disposition != claudeComputerUseNotAttempted || !outcome.canFallback() {
 			t.Fatalf("outcome=%#v", outcome)
 		}
-		if calls := fake.calls(); len(calls) != 0 {
+		if calls := fake.calls(); len(calls) != 1 || calls[0].Tool != "prepare_app" {
 			t.Fatalf("launch failure reached application inspection or mutation: %#v", calls)
 		}
 	})
@@ -745,7 +758,7 @@ func TestClaudeComputerUseFailureClassificationPreAndPostMutation(t *testing.T) 
 		if outcome.Disposition != claudeComputerUseDeliveryUnknown || outcome.canFallback() {
 			t.Fatalf("outcome=%#v", outcome)
 		}
-		if calls := fake.calls(); len(calls) != 1 || calls[0].Tool != "get_app_state" {
+		if calls := fake.calls(); len(calls) != 2 || calls[0].Tool != "prepare_app" || calls[1].Tool != "get_app_state" {
 			t.Fatalf("generic failure retried or mutated: %#v", calls)
 		}
 	})
@@ -811,7 +824,7 @@ func TestClaudeRouteCommitBarrierPrecedesDesktopAndCLISideEffects(t *testing.T) 
 		opened := fake.opened
 		fake.mu.Unlock()
 		calls := fake.calls()
-		if opened || len(calls) != 1 || calls[0].Tool != "get_app_state" {
+		if opened || len(calls) != 2 || calls[0].Tool != "prepare_app" || calls[1].Tool != "get_app_state" {
 			t.Fatalf("Desktop side effect escaped blocked commit: opened=%v calls=%#v", opened, calls)
 		}
 		if _, err := turnstatehook.ReadInteractionAttempt(
@@ -991,7 +1004,7 @@ func TestClaudeSecurityRefusalNeverAllowsCLIFallback(t *testing.T) {
 			if outcome.canFallback() || outcome.Disposition != claudeComputerUseDeliveryUnknown {
 				t.Fatalf("security refusal outcome=%#v", outcome)
 			}
-			if calls := fake.calls(); len(calls) != 1 || calls[0].Tool != "get_app_state" {
+			if calls := fake.calls(); len(calls) != 2 || calls[0].Tool != "prepare_app" || calls[1].Tool != "get_app_state" {
 				t.Fatalf("security refusal was retried or mutated: %#v", calls)
 			}
 		})
@@ -1127,7 +1140,7 @@ func TestClaudeComputerUseCleanupFailureNeverFallsBack(t *testing.T) {
 	if outcome.Disposition != claudeComputerUseDeliveryUnknown || outcome.canFallback() {
 		t.Fatalf("cleanup outcome=%#v", outcome)
 	}
-	if calls := fake.calls(); len(calls) != 1 || calls[0].Tool != "get_app_state" {
+	if calls := fake.calls(); len(calls) != 2 || calls[0].Tool != "prepare_app" || calls[1].Tool != "get_app_state" {
 		t.Fatalf("cleanup failure retried or mutated: %#v", calls)
 	}
 

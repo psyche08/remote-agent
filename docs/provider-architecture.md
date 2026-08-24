@@ -329,6 +329,13 @@ transaction：
 5. 对 prompt/答案确认 exact composer/request card，再写入并提交一次；
 6. 同步停止 admission、等待在途操作、撤 grant、重锁并 read back，最后才返回。
 
+凭据型 Desktop App 的进程启动也属于 transaction，而不是 capability preflight。
+provider 必须先通过内部 `prepare_app` 完成同一 turn 的 Locked Use window，再启动或
+等待 Claude Desktop，最后才能调用 `get_app_state`。session 创建与 readiness 只能做
+文件、签名和静态身份检查，不得在屏幕仍锁定时启动应用；否则应用可能把 Data
+Protection Keychain 的暂时不可用误判为退出登录。`prepare_app` 本身不得截图、读取
+Accessibility 或接收目标 bundle，只负责建立可由 transaction cleanup 同步关闭的窗口。
+
 Claude 的 `/send_prompt` 还要求客户端提供稳定 `operation_id`。PWA 必须先把
 `operation_id` 与请求 digest 写入持久存储并读回；server 在任何 Desktop/CLI side
 effect 前写入不可变 attempt ledger。进程或页面重启后，同一 operation 只允许恢复结果，
